@@ -37,7 +37,6 @@ Results from other GPUs are very welcome: add a card folder under [`configs/card
 | **[Quick start: Linux](#quick-start-linux)** | Build, presets, serve |
 | **[Quick start: Windows](#quick-start-windows)** | Build and run on Windows 10/11 |
 | **[Presets: replicate our numbers](#presets-replicate-our-numbers)** | The exact production configs |
-| **[How Speedy differs from Strata](#how-speedy-differs-from-strata)** | What changed and why |
 | **[Documentation](#documentation)** | Where everything lives |
 | **[Contributing](#contributing)** | Evidence-first pull requests |
 
@@ -216,22 +215,6 @@ What every flag does: [docs/CONFIGS.md](docs/CONFIGS.md). Built-in defaults: [do
 **About `parallel: 2`:** on 2× 10 GB, two clients sending at once finished in **42-48 s** with batch slots, against **33 s**
 when the requests simply queue (Q2_0). With slots on, a single user also loses 15-19 % decode. The two conversations route to
 different experts, so batching saves little while the slots take expert-cache VRAM. It may pay off on cards with more VRAM.
-
-## How Speedy differs from Strata
-
-| | Strata v0.2.7.1 | Speedy |
-|---|---|---|
-| **Two GPUs** | layer split | split + per-stage weight trim + decode overlap + prompt help on the second card + stage-local HC_Q8 upload (#3559). Prefill +44-185 % over one card. |
-| Smaller prompt scratch (PR #4039) | open PR | **on**: prefill IQ4_XS +29-33 %, IQ3_S +22-24 %, Q2_0 +5 % |
-| Routed prompt stream (PR #4283) | open PR | on for UD-IQ4_XS (+41-44 % together with #4039) |
-| Two-pass QSA select (PR #4119) | open PR | **on** (+1-2.5 % prefill) |
-| Deferred light CPU rows in verify (PR #2689/#2690) | opt-in | **on**. This changes decode arithmetic, so it is quality-gated rather than bitwise. Off: `STRATA_VERIFY_DEFER_CPU=0` |
-| IMMA INT8 prompt attention, KV prefetch | opt-in | **on** (+2 %, +1.5 %) |
-| Tuned defaults | upstream | built in; `STRATA_UPSTREAM_DEFAULTS=1` restores upstream behaviour |
-| 1M tier | single GPU | all quants on two GPUs (YaRN ×4) |
-| Presets, benchmark and eval harness | - | `configs/`, `bench/`, `evals/` |
-
-The full patch ledger, with tests and A/B numbers, is in [SPEEDY.md](SPEEDY.md) and [CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation
 
