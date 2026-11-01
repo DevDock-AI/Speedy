@@ -1,0 +1,79 @@
+name: Release
+
+# Builds the ready-made engines that setup.py downloads (strata-<os>-x64.zip: the engine + BUILD.json) and attaches
+# them to the release of the pushed tag. CUDA 13.0 matches the CUDA wheels setup.py installs next to the engine.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag to (re)build, e.g. v0.3.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  ARCHS: "75-real;80-real;86-real;89-real;120"
+  FLAGS: -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_PORTABLE=ON -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_MMQ_TQ_OVERLAY=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_Q6K_EXPERTS=ON
+
+jobs:
+  linux:
+    name: Linux engine
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:13.0.3-devel-ubuntu22.04
+    timeout-minutes: 340
+    steps:
+      - run: apt-get update && apt-get install -y cmake ninja-build git python3 zip curl
+      - run: |
+          curl -fsSL https://github.com/cli/cli/releases/download/v2.63.2/gh_2.63.2_linux_amd64.tar.gz | tar xz
+          cp gh_*/bin/gh /usr/local/bin/
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - run: cmake -S . -B build -G Ninja $FLAGS "-DCMAKE_CUDA_ARCHITECTURES=$ARCHS"
+      - run: cmake --build build --target strata -j 4
+      - name: Package
+        run: |
+          mkdir pkg && cp build/strata pkg/
+          python3 - <<'PY'
+          import json, os
+          json.dump({"version": os.environ["TAG"].lstrip("v"), "backend": "cuda", "toolkit": 13, "archs": [75, 80, 86, 89, 120],
+                     "ptx": True, "source": "release", "isa_floor": "avx2", "vision": False}, open("pkg/BUILD.json", "w"), indent=1)
+          PY
+          cd pkg && zip -9 ../strata-linux-x64.zip strata BUILD.json
+      - run: gh release upload "$TAG" strata-linux-x64.zip --clobber -R "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  windows:
+    name: Windows engine
+    runs-on: windows-2022
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "13.0.3"
+          method: local
+      - uses: ilammy/msvc-dev-cmd@v1
+      - run: cmake -S . -B build -G Ninja ${{ env.FLAGS }} "-DCMAKE_CUDA_ARCHITECTURES=${{ env.ARCHS }}" -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared
+      - run: cmake --build build --target strata -j 4
+      - name: Package
+        shell: bash
+        run: |
+          mkdir pkg && cp build/strata.exe pkg/
+          python - <<'PY'
+          import json, os
+          json.dump({"version": os.environ["TAG"].lstrip("v"), "backend": "cuda", "toolkit": 13, "archs": [75, 80, 86, 89, 120],
+                     "ptx": True, "source": "release", "isa_floor": "avx2", "vision": False}, open("pkg/BUILD.json", "w"), indent=1)
+          PY
+          cd pkg && 7z a -tzip -mx=9 ../strata-windows-x64.zip strata.exe BUILD.json
+      - shell: bash
+        run: gh release upload "$TAG" strata-windows-x64.zip --clobber -R "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}
