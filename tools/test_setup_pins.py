@@ -394,6 +394,7 @@ class Requirements(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             if stamp is not None:
                 (Path(d) / ".strata-pip.json").write_text(json.dumps(stamp))
+                (Path(d) / ".strata-pip.json.os").write_text(setup.sys.platform)   # #3634: a stamp from this system
             with mock.patch.object(setup.sys, "prefix", d), \
                     mock.patch.object(setup, "run", lambda cmd, **kw: ran.append(cmd)), \
                     mock.patch.object(setup, "_installed", lambda name: name in installed):

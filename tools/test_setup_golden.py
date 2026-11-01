@@ -98,6 +98,7 @@ def install(ram, found, argv, answers=None, extra=(), avx512=False, configs=()):
         patches = [
             mock.patch.object(setup, "ROOT", t),
             mock.patch.object(setup, "GPU_PICK", None),
+            mock.patch.object(setup, "vision_threads", lambda *a, **k: 6),   # the baseline was recorded on a 12-thread CPU; keep it host-independent
             mock.patch.object(setup, "data_folder", lambda d, *a, **k: (t / "data", [])),
             mock.patch.object(setup, "load_settings", lambda: {}),
             mock.patch.object(setup, "save_settings", lambda s: None),
