@@ -36,39 +36,41 @@ it was adopted only after a same-window A/B and a quality gate.
 
 ## Results at a glance
 
-**Prefill** = cold prompt read, tokens per second, unique prompts of about 60K / 120K / 200K tokens.
-**Decode** = generation tokens per second (with MTP speculative decoding).
-**Follow-up turn** = time to read a short follow-up (about 1-2K new tokens) after a 120K-token conversation, where 99 % of the prompt is cached.
-All runs use medium reasoning and real prompts.
+Each value is the **average ± half the spread** across the measured runs. All runs use medium reasoning and real prompts.
+
+- **Prefill** is a cold prompt read at about 60K / 120K / 200K tokens.
+- **Decode** is generation speed with MTP speculative decoding.
+- **Cold 200K** is the time to read a fresh 200K-token prompt.
+- **Follow-up** is the time to read a short follow-up (1-2K new tokens) in a 120K-token conversation where 99 % of the prompt is cached.
 
 ### One RTX 3080 10 GB
 
-| Quant | Prefill 60K / 120K / 200K | Decode | Cold 200K prompt | Follow-up turn |
-|---|---|---|---|---|
-| **Q2_0** (fastest) | 2,824 / 2,689 / 2,562 | 139-164 | 78 s | 1.5-2.3 s |
-| **IQ3_S** | 2,347 / 2,303 / 2,248 | 119-140 | 89 s | 1.7-1.8 s |
-| **UD-IQ4_XS** (quality) | 1,820 / 1,802 / 1,806 | 92-122 | 111 s | 2.5-3.0 s |
-| **UD-Q4_K_XL** (best quality) | 1,134 / 1,125 / 1,090 | 76-109 | 183 s | 2.9 s |
+| Quant | Prefill 60K<br>(tok/s) | Prefill 120K<br>(tok/s) | Prefill 200K<br>(tok/s) | Decode<br>(tok/s) | Cold 200K<br>(s) | Follow-up<br>(s) |
+|:---|---:|---:|---:|---:|---:|---:|
+| **Q2_0** <sub>fastest</sub> | 2,824 | 2,689 | 2,562 | **152** ±13 | 78 | 1.9 ±0.4 |
+| **IQ3_S** | 2,347 | 2,303 | 2,248 | **130** ±11 | 89 | 1.75 ±0.05 |
+| **UD-IQ4_XS** <sub>quality</sub> | 1,820 | 1,802 | 1,806 | **107** ±15 | 111 | 2.75 ±0.25 |
+| **UD-Q4_K_XL** <sub>best</sub> | 1,134 | 1,125 | 1,090 | **93** ±17 | 183 | 2.9 |
 
 ### Two RTX 3080 10 GB (layer split)
 
-| Quant | Prefill 60K / 120K / 200K | Decode | Cold 200K prompt | Follow-up turn |
-|---|---|---|---|---|
-| **Q2_0** (fastest) | 4,151 / 4,270 / 4,138 | 163-211 | 49 s | 1.6-2.0 s |
-| **IQ3_S** | 4,074 / 4,284 / 4,264 | 155-170 | 47 s | 1.6 s |
-| **UD-IQ4_XS** (quality) | 3,297 / 3,400 / 3,397 | 127-154 | 59 s | 1.8-2.3 s |
-| **UD-Q4_K_XL** (best quality) | 2,994 / 3,118 / 3,115 | 101-120 | 65 s | 2.7-2.8 s |
+| Quant | Prefill 60K<br>(tok/s) | Prefill 120K<br>(tok/s) | Prefill 200K<br>(tok/s) | Decode<br>(tok/s) | Cold 200K<br>(s) | Follow-up<br>(s) |
+|:---|---:|---:|---:|---:|---:|---:|
+| **Q2_0** <sub>fastest</sub> | 4,151 | 4,270 | 4,138 | **187** ±24 | 49 | 1.8 ±0.2 |
+| **IQ3_S** | 4,074 | 4,284 | 4,264 | **163** ±8 | 47 | 1.6 |
+| **UD-IQ4_XS** <sub>quality</sub> | 3,297 | 3,400 | 3,397 | **141** ±14 | 59 | 2.05 ±0.25 |
+| **UD-Q4_K_XL** <sub>best</sub> | 2,994 | 3,118 | 3,115 | **111** ±10 | 65 | 2.75 ±0.05 |
 
 ### Against the starting point
 
 These compare Strata 0.1.45 on the same machine with Speedy on two GPUs.
 
-| Quant | Prefill | Decode |
-|---|---|---|
-| Q2_0 | +57-73 % | +35-50 % |
-| IQ3_S | +130-145 % | +45 % |
-| UD-IQ4_XS | +145-166 % | +50-60 % |
-| UD-Q4_K_XL | +205-219 % | about +20 % |
+| Quant | Prefill gain | Decode gain |
+|:---|---:|---:|
+| **Q2_0** | +65 % ±8 | +43 % ±8 |
+| **IQ3_S** | +138 % ±8 | +45 % |
+| **UD-IQ4_XS** | +156 % ±11 | +55 % ±5 |
+| **UD-Q4_K_XL** | +212 % ±7 | +20 % |
 
 **1M-token context (two GPUs).** A growing coding session reached **1,017,288 tokens in 26 turns (18 min)** with no
 errors. It passed all 9 recall checks, with facts planted early and asked about at 163K to 976K tokens. 93-96 % of each turn was served from cache.
