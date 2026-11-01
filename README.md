@@ -15,6 +15,7 @@ it was adopted only after a same-window A/B and a quality gate.
 ![Context](https://img.shields.io/badge/context-229K%20native%20%7C%201M%20tier-blue)
 ![gpu-unlock](https://img.shields.io/badge/measured%20with-gpu--unlock-orange)
 ![IFBench](https://img.shields.io/badge/IFBench-81.0%20(Q4__K__XL)-8A63D2)
+[![Support](https://img.shields.io/badge/support-ko--fi-ff5e5b)](https://ko-fi.com/devdock)
 
 </div>
 
@@ -252,3 +253,8 @@ Optional: <a href="https://github.com/Zagitta/gpu-unlock">gpu-unlock</a> (Zagitt
 Models: <a href="https://huggingface.co/Qwen">Qwen</a>, <a href="https://huggingface.co/unsloth">Unsloth</a> UD quants,
 <a href="https://huggingface.co/ISTA-DASLab">ISTA-DASLab</a> GSQ-RCO quants. Benchmarks: <a href="https://github.com/allenai/IFBench">IFBench</a>, LiveCodeBench.
 Full attribution: <a href="NOTICE">NOTICE</a>.</sub>
+
+<div align="center">
+<br>
+If Speedy saved you some GPU money, <a href="https://ko-fi.com/devdock">buy me a coffee</a> ☕
+</div>
