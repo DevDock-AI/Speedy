@@ -8,6 +8,13 @@ Speedy runs **Qwen3.8-Flash-Next** (125B MoE) with a **229K-token native context
 **RTX 3080 10 GB** cards. It is a measured, tuned fork of [Strata](https://github.com/Niko1221/Strata). Every change in
 it was adopted only after a same-window A/B and a quality gate.
 
+**Developed and tested on RTX 3080s, likely fine on many other NVIDIA cards.** Every number below comes from RTX 3080
+10 GB cards, because that is the hardware we own. The engine itself needs any NVIDIA GPU with compute capability 8.0+
+(Ampere or newer: RTX 30xx, 40xx, 50xx, A-series / workstation cards), so other cards should work. Set
+`-DCMAKE_CUDA_ARCHITECTURES` to your card (80 A100, 86 RTX 30xx, 89 RTX 40xx, 120 RTX 50xx). Cards with more VRAM will fit
+more experts and likely run faster, but the presets are tuned for 10 GB and haven't been measured elsewhere.
+Results from other GPUs are very welcome in a PR or issue.
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![GPU](https://img.shields.io/badge/GPU-RTX%203080%2010%20GB%20(1%20or%202)-76B900)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey)
