@@ -13,7 +13,7 @@ it was adopted only after a same-window A/B and a quality gate.
 (Ampere or newer: RTX 30xx, 40xx, 50xx, A-series / workstation cards), so other cards should work. Set
 `-DCMAKE_CUDA_ARCHITECTURES` to your card (80 A100, 86 RTX 30xx, 89 RTX 40xx, 120 RTX 50xx). Cards with more VRAM will fit
 more experts and likely run faster, but the presets are tuned for 10 GB and haven't been measured elsewhere.
-Results from other GPUs are very welcome: add a card folder under [`configs/cards/`](configs/README.md#add-a-card).
+**AMD** (RX 7900 / RDNA3, RDNA4) builds from source through Strata's HIP backend ([docs/AMD_HIP.md](docs/AMD_HIP.md)); it compiles in our CI but we have not run it. Results from other GPUs are very welcome: add a card folder under [`configs/cards/`](configs/README.md#add-a-card).
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![GPU](https://img.shields.io/badge/GPU-RTX%203080%2010%20GB%20(1%20or%202)-76B900)
