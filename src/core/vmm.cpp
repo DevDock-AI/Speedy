@@ -240,10 +240,10 @@ const Api& api() {
 bool vmm_available() { return api().ok; }
 uint64_t vmm_granularity() { return api().ok ? api().gran : 0; }
 
-VmmChunk vmm_chunk_new() {
+VmmChunk vmm_chunk_new(int dev) {
     const Api& a = api();
     if (!a.ok) return 0;
-    const hipMemAllocationProp prop = alloc_prop(a.dev);
+    const hipMemAllocationProp prop = alloc_prop(dev >= 0 ? dev : a.dev);   // the peer card's chunks on the peer, as on CUDA
     hipMemGenericAllocationHandle_t h = nullptr;
     if (const hipError_t e = hipMemCreate(&h, (size_t) a.gran, &prop, 0); e != hipSuccess) { fail("hipMemCreate", e); return 0; }
     return (VmmChunk) (uintptr_t) h;
@@ -327,7 +327,7 @@ VmmChunk VmmRange::unmap(int64_t i) {
 namespace strata::core {
 bool vmm_available() { return false; }
 uint64_t vmm_granularity() { return 0; }
-VmmChunk vmm_chunk_new() { return 0; }
+VmmChunk vmm_chunk_new(int) { return 0; }
 void vmm_chunk_free(VmmChunk) {}
 bool VmmRange::reserve(uint64_t) { return false; }
 void VmmRange::release() {}

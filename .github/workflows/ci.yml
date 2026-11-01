@@ -10,6 +10,10 @@ on:
         description: "Also compile the CUDA engine (sm_86, no GPU tests: hosted runners have no GPU)"
         type: boolean
         default: false
+      hip:
+        description: "Also compile the AMD HIP engine (gfx1100, RX 7900; no GPU tests)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -69,3 +73,14 @@ jobs:
         with:
           name: strata-windows-x64-sm86
           path: build/strata.exe
+
+  hip:
+    name: HIP build (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.hip
+    runs-on: ubuntu-24.04
+    container: rocm/dev-ubuntu-24.04:7.1-complete
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update && apt-get install -y cmake ninja-build git python3
+      - run: cmake -S . -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DCMAKE_HIP_ARCHITECTURES=gfx1100
+      - run: cmake --build build-hip --target strata -j 4
