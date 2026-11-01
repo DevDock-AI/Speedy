@@ -233,7 +233,21 @@ PREBUILT_URL = "https://github.com/DevDock-AI/Speedy/releases/latest/download/"
 # from somewhere the download does not.
 REPO = "DevDock-AI/Speedy"
 PREBUILT_TAG_URL = "https://github.com/DevDock-AI/Speedy/releases/download/v{version}/"
-PREBUILT_ASSET = "strata-windows-x64-rtx30.zip" if WIN else "strata-linux-x64-rtx30.zip"   # RTX 30 (sm_86) only for now; other cards compile
+PREBUILT_ASSET = "strata-windows-x64-rtx30.zip" if WIN else "strata-linux-x64-rtx30.zip"   # the RTX 30 engine (the reference card)
+# One ready-made engine per card family (compute capability -> release asset suffix). A card whose family has no zip in
+# the release yet compiles the engine here instead (the HEAD request fails and get_prebuilt returns None).
+PREBUILT_FAMILY = {86: "rtx30", 89: "rtx40", 120: "rtx50"}   # the kernels need sm_80+ (CMakeLists.txt)
+
+
+def prebuilt_asset(gpu) -> str | None:
+    """The release zip for these cards: every card must be of one family that has a ready-made engine."""
+    try:
+        fams = {PREBUILT_FAMILY.get(int(a)) for a in gpu.get("archs", [gpu.get("arch")])}
+    except (TypeError, ValueError):
+        return None
+    if len(fams) != 1 or None in fams:
+        return None
+    return f"strata-{'windows' if WIN else 'linux'}-x64-{fams.pop()}.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
 MIN_DRIVER = 580                       # CUDA 13.0
@@ -5246,7 +5260,9 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
     toolkit 12: the experimental CUDA 12 engine (CUDA12_ASSET) in engine-cuda12/."""
     acquisition.require("the ready-made engine")
     eng = engine_dir(toolkit)
-    asset = CUDA12_ASSET if int(toolkit) == 12 else PREBUILT_ASSET
+    asset = CUDA12_ASSET if int(toolkit) == 12 else prebuilt_asset(gpu)
+    if asset is None:                                  # no ready-made engine for this card family (yet): compile
+        return None
     info = eng / "BUILD.json"
     if info.exists() and (eng / EXE).exists() and json.loads(info.read_text(encoding="utf-8")).get("backend") != "hip":
         meta = json.loads(info.read_text(encoding="utf-8"))

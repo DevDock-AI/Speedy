@@ -280,13 +280,13 @@ class Engine(unittest.TestCase):
         tag = "https://github.com/DevDock-AI/Speedy/releases/download/v0.1.31/"
         eng, out, heads, got = self.run_get([tag, setup.PREBUILT_URL])
         self.assertEqual(eng, self.root / "engine")
-        self.assertEqual(got, [tag + setup.PREBUILT_ASSET])
+        self.assertEqual(got, [tag + setup.prebuilt_asset({"arch": 89})])
         self.assertEqual(len(heads), 1)
 
     def test_latest_when_it_is_not_published(self):
         eng, out, heads, got = self.run_get([setup.PREBUILT_URL])
         self.assertEqual(eng, self.root / "engine")
-        self.assertEqual(got, [setup.PREBUILT_URL + setup.PREBUILT_ASSET])
+        self.assertEqual(got, [setup.PREBUILT_URL + setup.prebuilt_asset({"arch": 89})])
         self.assertIn("No ready-made engine for v0.1.31", out)
 
     def test_a_refused_archive_is_not_kept(self):
@@ -309,7 +309,7 @@ class Engine(unittest.TestCase):
                         mock.patch.object(setup, "engine_digest", self.fake_digest(wrote)):
                     eng, _ = quiet(setup.get_prebuilt, setup.PREBUILT_URL, {"arch": 89}, "gpu")
                 self.assertIsNone(eng)
-                z = self.root / "engine" / setup.PREBUILT_ASSET
+                z = self.root / "engine" / setup.prebuilt_asset({"arch": 89})
                 self.assertFalse(z.exists())
                 self.assertFalse(z.with_name(z.name + ".done").exists())
 
@@ -317,7 +317,7 @@ class Engine(unittest.TestCase):
         """#397, for an archive that does not unpack (not a zip, or a damaged one): it kept its zip and .done mark,
         so every later run failed on it, even after the right one was published."""
         with tempfile.TemporaryDirectory() as folder:  # a --prebuilt folder, through the real download()
-            asset = Path(folder) / setup.PREBUILT_ASSET
+            asset = Path(folder) / setup.prebuilt_asset({"arch": 89})
             asset.write_bytes(b"<html>not a zip</html>")
             with self.assertRaises(zipfile.BadZipFile):
                 quiet(setup.get_prebuilt, folder, {"arch": 89}, "gpu")

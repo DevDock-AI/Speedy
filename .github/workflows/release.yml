@@ -1,6 +1,6 @@
 name: Release
 
-# Builds the ready-made engines that setup.py downloads (strata-<os>-x64-rtx30.zip: the engine + BUILD.json, RTX 30 / sm_86 only for now) and attaches
+# Builds the ready-made engines that setup.py downloads (strata-<os>-x64-<family>.zip: the engine + BUILD.json, one card family per run; a tag push builds rtx30) and attaches
 # them to the release of the pushed tag. CUDA 13.0 matches the CUDA wheels setup.py installs next to the engine.
 on:
   push:
@@ -13,13 +13,17 @@ on:
       os:
         description: "which engines: all, linux or windows"
         default: all
+      family:
+        description: "card family: rtx30, rtx40 or rtx50"
+        default: rtx30
 
 permissions:
   contents: write
 
 env:
   TAG: ${{ inputs.tag || github.ref_name }}
-  ARCHS: "86"
+  FAM: ${{ inputs.family || 'rtx30' }}
+  ARCHS: ${{ fromJSON('{"rtx30":"86","rtx40":"89","rtx50":"120"}')[inputs.family || 'rtx30'] }}
   FLAGS: -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_PORTABLE=ON -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_MMQ_TQ_OVERLAY=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_Q6K_EXPERTS=ON
 
 jobs:
@@ -44,11 +48,11 @@ jobs:
           mkdir pkg && cp build/strata pkg/
           python3 - <<'PY'
           import json, os
-          json.dump({"version": os.environ["TAG"].lstrip("v"), "backend": "cuda", "toolkit": 13, "archs": [86],
+          json.dump({"version": os.environ["TAG"].lstrip("v"), "backend": "cuda", "toolkit": 13, "archs": [int(os.environ["ARCHS"])],
                      "ptx": False, "source": "release", "isa_floor": "avx2", "vision": False}, open("pkg/BUILD.json", "w"), indent=1)
           PY
-          cd pkg && zip -9 ../strata-linux-x64-rtx30.zip strata BUILD.json
-      - run: gh release upload "$TAG" strata-linux-x64-rtx30.zip --clobber -R "$GITHUB_REPOSITORY"
+          cd pkg && zip -9 ../strata-linux-x64-$FAM.zip strata BUILD.json
+      - run: gh release upload "$TAG" strata-linux-x64-$FAM.zip --clobber -R "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}
 
@@ -74,11 +78,11 @@ jobs:
           mkdir pkg && cp build/strata.exe pkg/
           python - <<'PY'
           import json, os
-          json.dump({"version": os.environ["TAG"].lstrip("v"), "backend": "cuda", "toolkit": 13, "archs": [86],
+          json.dump({"version": os.environ["TAG"].lstrip("v"), "backend": "cuda", "toolkit": 13, "archs": [int(os.environ["ARCHS"])],
                      "ptx": False, "source": "release", "isa_floor": "avx2", "vision": False}, open("pkg/BUILD.json", "w"), indent=1)
           PY
-          cd pkg && 7z a -tzip -mx=9 ../strata-windows-x64-rtx30.zip strata.exe BUILD.json
+          cd pkg && 7z a -tzip -mx=9 ../strata-windows-x64-$FAM.zip strata.exe BUILD.json
       - shell: bash
-        run: gh release upload "$TAG" strata-windows-x64-rtx30.zip --clobber -R "$GITHUB_REPOSITORY"
+        run: gh release upload "$TAG" strata-windows-x64-$FAM.zip --clobber -R "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}
