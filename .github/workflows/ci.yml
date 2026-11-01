@@ -27,7 +27,7 @@ jobs:
       # Serial (-j 1): stage_pool_test is timing-sensitive. expert_parity and pool_test need a real model pack
       # (pack/full/experts.bin, several GB, not in git): run them locally where a pack exists.
       # isa_guard_check is excluded: an upstream lint that flags two unlisted AVX-512 helpers (docs/BUILD-LINUX.md).
-      - run: ctest --test-dir build -j 1 --output-on-failure -E "isa_guard_check|expert_parity|pool_test"
+      - run: ctest --test-dir build -j 1 --output-on-failure -E "^(isa_guard_check|expert_parity|pool_test)$"
 
   cuda:
     name: CUDA build (manual)
@@ -48,7 +48,7 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
       - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_TESTS=ON
       - run: cmake --build build -j 4 -- -k 0
-      - run: ctest --test-dir build -j 1 --output-on-failure -E "isa_guard_check|expert_parity|pool_test"
+      - run: ctest --test-dir build -j 1 --output-on-failure -E "^(isa_guard_check|expert_parity|pool_test)$"
 
   windows-cuda:
     name: Windows CUDA build (manual)
