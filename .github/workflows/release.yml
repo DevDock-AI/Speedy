@@ -10,6 +10,9 @@ on:
       tag:
         description: "existing tag to (re)build, e.g. v0.3.0"
         required: true
+      os:
+        description: "which engines: all, linux or windows"
+        default: all
 
 permissions:
   contents: write
@@ -22,11 +25,12 @@ env:
 jobs:
   linux:
     name: Linux engine
+    if: inputs.os != 'windows'
     runs-on: ubuntu-24.04
     container: nvidia/cuda:13.0.3-devel-ubuntu22.04
     timeout-minutes: 340
     steps:
-      - run: apt-get update && apt-get install -y cmake ninja-build git python3 zip curl
+      - run: apt-get update && apt-get install -y ninja-build git python3 python3-pip zip curl && pip3 install cmake==3.31.6
       - run: |
           curl -fsSL https://github.com/cli/cli/releases/download/v2.63.2/gh_2.63.2_linux_amd64.tar.gz | tar xz
           cp gh_*/bin/gh /usr/local/bin/
@@ -50,6 +54,7 @@ jobs:
 
   windows:
     name: Windows engine
+    if: inputs.os != 'linux'
     runs-on: windows-2022
     timeout-minutes: 340
     steps:
