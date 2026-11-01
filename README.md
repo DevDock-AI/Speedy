@@ -167,6 +167,8 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON 
       -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_MMQ_TQ_OVERLAY=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_Q6K_EXPERTS=ON
 cmake --build build --target strata
 ```
+With a CUDA **12.x** toolkit, add `-DCMAKE_CUDA_RUNTIME_LIBRARY=Shared`: MSVC refuses the default static runtime there.
+
 3. Copy a preset from `configs/production-1gpu/` or `configs/production-2gpu/`. Replace the placeholders with Windows paths (use forward slashes or escaped backslashes in JSON), set `"exe"` to `build/strata.exe`, and start it with `python serve\server.py --engine strata --config <preset> --port 8080`.
 
 **Windows notes:**
