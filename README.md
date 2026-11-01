@@ -57,6 +57,18 @@ Each value is the **average ± half the spread** across the measured runs. All r
 > Output is bit-identical locked and unlocked. Without the module, expect correspondingly lower prefill. Setup and
 > caveats are in [docs/GPU-UNLOCK.md](docs/GPU-UNLOCK.md).
 
+**Measured on:** Lenovo ThinkStation P620
+
+| Part | Spec |
+|:---|:---|
+| GPUs | 2× RTX 3080 10 GB, PCIe 4.0 x16 each, no NVLink, caps 320 W / 280 W, both unlocked |
+| CPU | AMD Threadripper PRO 5975WX, 32 cores / 64 threads |
+| RAM | 128 GB DDR4-3200, 8 channels (8× 16 GB) |
+| Storage | 2 TB Samsung PM9A1 NVMe (PCIe 4.0) |
+| OS | Debian 13, kernel 6.12, NVIDIA 615.71, CUDA 13.4 |
+
+Full details in [Reference machine](#reference-machine).
+
 ### One RTX 3080 10 GB
 
 | Quant | Prefill 60K<br>(tok/s) | Prefill 120K<br>(tok/s) | Prefill 200K<br>(tok/s) | Decode<br>(tok/s) | Cold 200K<br>(s) | Follow-up<br>(s) |
