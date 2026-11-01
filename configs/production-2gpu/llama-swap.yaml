@@ -1,0 +1,52 @@
+# llama-swap in front of Strata: the request's "model" picks the quant; one loaded at a time, unloaded after 10 min idle (ttl 600), reloaded on next request.
+healthCheckTimeout: 600
+logLevel: info
+startPort: 18080
+models:
+  q2_0:
+    name: "Qwen3.8 Flash-Next Q2_0"
+    cmd: <LLAMA_SWAP_DIR>/serve.sh <CONFIG_DIR>/strata-q2_0-2gpu-pw2.json ${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+    aliases: [qwen3.8-flash-next-q2_0, worker]
+  iq3_s:
+    name: "Qwen3.8 Flash-Next IQ3_S"
+    cmd: <LLAMA_SWAP_DIR>/serve.sh <CONFIG_DIR>/strata-iq3_s-2gpu-pw2.json ${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+    aliases: [qwen3.8-flash-next-iq3_s, q3_s]
+  ud-q4_k_xl:
+    name: "Qwen3.8 Flash-Next UD-Q4_K_XL"
+    cmd: <LLAMA_SWAP_DIR>/serve.sh <CONFIG_DIR>/strata-ud-q4_k_xl-2gpu-pw2.json ${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+    aliases: [qwen3.8-flash-next-ud-q4_k_xl, q4_xl]
+  ud-iq4_xs:
+    name: "Qwen3.8 Flash-Next UD-IQ4_XS"
+    cmd: <LLAMA_SWAP_DIR>/serve.sh <CONFIG_DIR>/strata-ud-iq4_xs-2gpu-pw2.json ${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+    aliases: [qwen3.8-flash-next-ud-iq4_xs, q4_xs]
+  q2_0-1m:
+    name: "Qwen3.8 Flash-Next Q2_0 1M (yarn x4 overflow tier, 2 GPUs)"
+    cmd: <LLAMA_SWAP_DIR>/serve.sh <CONFIG_DIR>/strata-q2_0-1m-2gpu.json ${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+  iq3_s-1m:
+    name: "Qwen3.8 Flash-Next IQ3_S 1M (yarn x4 overflow tier)"
+    cmd: <LLAMA_SWAP_DIR>/serve.sh <CONFIG_DIR>/strata-iq3_s-1m-2gpu.json ${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+  ud-q4_k_xl-1m:
+    name: "Qwen3.8 Flash-Next UD-Q4_K_XL 1M (yarn x4 overflow tier)"
+    cmd: <LLAMA_SWAP_DIR>/serve.sh <CONFIG_DIR>/strata-ud-q4_k_xl-1m-2gpu.json ${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+  ud-iq4_xs-1m:
+    name: "Qwen3.8 Flash-Next UD-IQ4_XS 1M (yarn x4 overflow tier, 2 GPUs)"
+    cmd: <LLAMA_SWAP_DIR>/serve.sh <CONFIG_DIR>/strata-ud-iq4_xs-1m-2gpu.json ${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+hooks:
+  on_startup:
+    preload: [q2_0]

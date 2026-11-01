@@ -1,7 +1,9 @@
+> **Note:** this is upstream Strata's README, kept for reference. Speedy's README is [../../README.md](../../README.md).
+
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
-    <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
+    <source media="(prefers-color-scheme: dark)" srcset="../../apps/host/public/brand/strata-lockup-dark.svg">
+    <img src="../../apps/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
   </picture>
 </p>
 
@@ -29,30 +31,30 @@
 Nous recommandons **d'abord ISTA-DASLab**, puis **Unsloth** et d'autres fournisseurs, lorsqu'un modèle compatible tient en mémoire.
 
 <details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
+<summary><img src="../../docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
 
 | Fournisseur | Choix |
 | --- | --- |
-| **ISTA-DASLab · recommandé** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S. [Coder : IQ1\_M](docs/MODELS.md#coder) pour programmer. |
+| **ISTA-DASLab · recommandé** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S. [Coder : IQ1\_M](../../docs/MODELS.md#coder) pour programmer. |
 | **Unsloth** | UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0 |
 | **Gyro · agentionai** | [Gyro-S, Gyro-M](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF). Utilise moins de mémoire, mais plus lent. |
-| **Autres options** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md) |
+| **Autres options** | [Swift 1.5](../../docs/MODELS.md#swift-15), [NVFP4](../../docs/NVFP4.md), [OrcaRouter](../../docs/ORCA.md) |
 
-[Comparer les tailles, la mémoire nécessaire et la compatibilité](docs/MODELS.md).
+[Comparer les tailles, la mémoire nécessaire et la compatibilité](../../docs/MODELS.md).
 
 </details>
 
 <details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.6-35B-A3B</b></summary>
+<summary><img src="../../docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.6-35B-A3B</b></summary>
 
 **Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0. Ce sont les paquets actuellement documentés pour ce modèle.
 
-[Guide du modèle et compatibilité](docs/QWEN36.md).
+[Guide du modèle et compatibilité](../../docs/QWEN36.md).
 
 </details>
 
 <details>
-<summary><img src="docs/media/models/deepseek.svg" width="22" alt="" align="middle"> &nbsp;<b>DeepSeekV4.1-Flash-1017</b></summary>
+<summary><img src="../../docs/media/models/deepseek.svg" width="22" alt="" align="middle"> &nbsp;<b>DeepSeekV4.1-Flash-1017</b></summary>
 
 Dans l'**application de bureau** et dans le **Terminal**. Ce qui ne tient pas en mémoire est lu depuis votre SSD : il faut donc beaucoup d'espace disque libre.
 
@@ -77,13 +79,13 @@ Mesuré avec le jeu 2.00 bpw sur Strata 0.2.5. « Sortie » est la vitesse de la
 | 1x Radeon AI PRO R9700, 251 GB de RAM | 21 à 25 tokens/s | 320 à 360 tokens/s (8K) |
 | 4x Radeon AI PRO R9700 | 74 à 77 tokens/s | 400 à 450 tokens/s (8K) |
 
-[Mémoire, disque et détails](docs/DEEPSEEK41.md) · [Notes de version](https://github.com/Niko1221/Strata/releases)
+[Mémoire, disque et détails](../../docs/DEEPSEEK41.md) · [Notes de version](https://github.com/Niko1221/Strata/releases)
 
 </details>
 
 <a id="the-other-sizes"></a>
 
-Vous ne savez pas ce qui tient ? [Choisir un modèle pour votre ordinateur](docs/MODELS.md#pick-by-memory).
+Vous ne savez pas ce qui tient ? [Choisir un modèle pour votre ordinateur](../../docs/MODELS.md#pick-by-memory).
 
 ## Installation
 
@@ -93,12 +95,12 @@ Vous ne savez pas ce qui tient ? [Choisir un modèle pour votre ordinateur](docs
 
 **[Télécharger Strata pour Windows, Linux ou Mac →](https://github.com/Niko1221/Strata/releases/latest)**
 
-Installez l'application, choisissez un modèle et commencez à discuter. Il y a un seul installateur par système. Au premier lancement, l'application télécharge le moteur de votre carte graphique. [Aide pour l'installateur](docs/INSTALL.md#the-app).
+Installez l'application, choisissez un modèle et commencez à discuter. Il y a un seul installateur par système. Au premier lancement, l'application télécharge le moteur de votre carte graphique. [Aide pour l'installateur](../../docs/INSTALL.md#the-app).
 
 <sub>Fichiers: `Strata-0.2.7-windows-x64-setup.exe` · `Strata-0.2.7-linux-x86_64.AppImage` · `Strata-0.2.7-macos-arm64.dmg`</sub>
 
 <p align="center">
-  <img src="docs/media/app-chat.png" width="900" alt="Application de bureau Strata avec une discussion et un aperçu du code en direct côte à côte">
+  <img src="../../docs/media/app-chat.png" width="900" alt="Application de bureau Strata avec une discussion et un aperçu du code en direct côte à côte">
   <br><sub>Discussion, fichiers et aperçu en direct dans une seule fenêtre.</sub>
 </p>
 
@@ -129,18 +131,18 @@ Sous Windows, ouvrez ensuite un nouveau terminal. Puis :
 strata launch
 ```
 
-Suivez les invites pour télécharger et démarrer un modèle. [Guide du Terminal](docs/TERMINAL_LAUNCH.md).
+Suivez les invites pour télécharger et démarrer un modèle. [Guide du Terminal](../../docs/TERMINAL_LAUNCH.md).
 
 </details>
 
 <p align="center">
-  <img src="docs/media/terminal-monitor.png" width="900" alt="Application Terminal de Strata affichant l'activité du modèle, la vitesse, la mémoire et les requêtes récentes">
+  <img src="../../docs/media/terminal-monitor.png" width="900" alt="Application Terminal de Strata affichant l'activité du modèle, la vitesse, la mémoire et les requêtes récentes">
   <br><sub>Suivez votre modèle et votre matériel pendant qu'il tourne.</sub>
 </p>
 
 <a id="build-from-source"></a>
 
-[Compiler depuis les sources](docs/SOURCE_INSTALL.md) · [Docker](docs/DOCKER.md) · [Guide d'installation complet](docs/INSTALL.md)
+[Compiler depuis les sources](../../docs/SOURCE_INSTALL.md) · [Docker](../../docs/DOCKER.md) · [Guide d'installation complet](../../docs/INSTALL.md)
 
 <a id="what-you-need"></a>
 
@@ -148,12 +150,12 @@ Suivez les invites pour télécharger et démarrer un modèle. [Guide du Termina
 
 | Matériel pris en charge | Guide |
 | --- | --- |
-| **NVIDIA GeForce RTX 20 / 30 / 40 / 50** | [Installation NVIDIA](docs/INSTALL.md#what-you-need) |
-| **AMD Radeon RX 7700 / 7800 / 7900, RX 9060 / 9070, AI PRO R9700** | [Installation AMD](docs/AMD_HIP.md) |
-| **AMD Radeon RX 6800 / 6900 · expérimental** | [Installation RX 6000](docs/AMD_HIP.md#rdna2-gfx1030) |
-| **Intel Arc · Linux** | [Installation Intel](docs/INTEL_ARC.md) |
-| **Apple Silicon · M1 ou plus récent** | [Installation sur Mac](docs/MAC.md) |
-| **AMD Ryzen AI Max · Strix Halo** | [Installation Strix Halo](docs/STRIX_HALO.md) |
+| **NVIDIA GeForce RTX 20 / 30 / 40 / 50** | [Installation NVIDIA](../../docs/INSTALL.md#what-you-need) |
+| **AMD Radeon RX 7700 / 7800 / 7900, RX 9060 / 9070, AI PRO R9700** | [Installation AMD](../../docs/AMD_HIP.md) |
+| **AMD Radeon RX 6800 / 6900 · expérimental** | [Installation RX 6000](../../docs/AMD_HIP.md#rdna2-gfx1030) |
+| **Intel Arc · Linux** | [Installation Intel](../../docs/INTEL_ARC.md) |
+| **Apple Silicon · M1 ou plus récent** | [Installation sur Mac](../../docs/MAC.md) |
+| **AMD Ryzen AI Max · Strix Halo** | [Installation Strix Halo](../../docs/STRIX_HALO.md) |
 
 <a id="using-it"></a>
 
@@ -161,7 +163,7 @@ Suivez les invites pour télécharger et démarrer un modèle. [Guide du Termina
 
 **Claude Code · Codex CLI · OpenCode · oh-my-pi · pi.dev · Hermes Agent · OpenClaw**, et d'autres via les API compatibles OpenAI et Anthropic.
 
-Lancez **`strata connect`** pour voir la configuration de votre outil. [Guide de connexion](docs/TERMINAL_LAUNCH.md#connect-your-apps-strata-connect).
+Lancez **`strata connect`** pour voir la configuration de votre outil. [Guide de connexion](../../docs/TERMINAL_LAUNCH.md#connect-your-apps-strata-connect).
 
 <a id="guides"></a>
 <a id="how-fast-is-it"></a>
@@ -170,8 +172,8 @@ Lancez **`strata connect`** pour voir la configuration de votre outil. [Guide de
 
 ## Aide
 
-[Tous les guides](docs) · [Dépannage](docs/TROUBLESHOOTING.md) · [Signaler un bogue](https://github.com/Niko1221/Strata/issues/new/choose) ·
-[Benchmarks](docs/COMMUNITY_BENCHMARKS.md) · [Comment ça marche](docs/HOW_IT_WORKS.md) · [Contribuer](CONTRIBUTING.md)
+[Tous les guides](../../docs) · [Dépannage](../../docs/TROUBLESHOOTING.md) · [Signaler un bogue](https://github.com/Niko1221/Strata/issues/new/choose) ·
+[Benchmarks](../../docs/COMMUNITY_BENCHMARKS.md) · [Comment ça marche](../../docs/HOW_IT_WORKS.md) · [Contribuer](../../CONTRIBUTING.md)
 
 ## Soutenir Strata
 
@@ -179,7 +181,7 @@ Lancez **`strata connect`** pour voir la configuration de votre outil. [Guide de
 
 <a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee : soutenir Strata" height="48"></a>
 
-[Licence MIT](LICENSE) · [Crédits et licences des modèles](docs/HOW_IT_WORKS.md#credits) · [Confidentialité](docs/SAFETY.md)
+[Licence MIT](../../LICENSE) · [Crédits et licences des modèles](../../docs/HOW_IT_WORKS.md#credits) · [Confidentialité](../../docs/SAFETY.md)
 
 <a id="option-c-let-your-ai-set-it-up"></a>
 

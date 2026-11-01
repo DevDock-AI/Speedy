@@ -129,6 +129,14 @@ public:
     /// #583: the auto chunk scan's byte-budget ring, for chunks above `small_max` (0.1.39's auto chunk: a prompt that
     /// fits it keeps 0.1.39's ring).  0 slots = none.  A layer split's set_ring_override and STRATA_PREFILL_RING win.
     static void set_ring_budget(int slots, int64_t small_max);
+    /// Speedy K1 (opt-in, STRATA_KV_STAGE_REQ=<cells>): with KV streaming the prompt path stages one layer's K/V in its
+    /// borrowed buffers.  Upstream sizes that pool for every page of --max-context (~1 GB at 1M cells), which shrinks the
+    /// auto chunk to 512 tokens.  With the switch the pool holds stage_cells() cells instead: <cells> at start (the
+    /// chunk scan), and per request at least the request's end (set_stage_cells before its loan).  0: the whole context.
+    static int64_t stage_cells();
+    static void set_stage_cells(int64_t cells);
+    static bool stage_req_enabled();
+    int64_t stage_cells_laid() const;   ///< the stage_cells() this instance's buffers were last carved with
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).  `src`: init gets an
     /// ExpertSource (carve picks the fused MoE layout only then).

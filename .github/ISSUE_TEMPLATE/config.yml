@@ -1,5 +1,14 @@
-blank_issues_enabled: true
+blank_issues_enabled: false
 contact_links:
-  - name: Troubleshooting and known issues
-    url: https://github.com/Niko1221/Strata/blob/main/docs/TROUBLESHOOTING.md
-    about: Symptom-to-fix table for crashes, out of memory, hangs, and port problems.
+  - name: Build and runtime environment (docs/BUILD-LINUX.md)
+    url: https://github.com/DevDock-AI/Speedy/blob/main/docs/BUILD-LINUX.md
+    about: Build steps, tests and the runtime environment Speedy is measured in.
+  - name: Presets and flags (docs/CONFIGS.md)
+    url: https://github.com/DevDock-AI/Speedy/blob/main/docs/CONFIGS.md
+    about: Which preset fits your pack and card, and what every flag does.
+  - name: Built-in defaults (docs/SPEEDY_DEFAULTS.md)
+    url: https://github.com/DevDock-AI/Speedy/blob/main/docs/SPEEDY_DEFAULTS.md
+    about: The STRATA_* defaults Speedy sets, and STRATA_UPSTREAM_DEFAULTS=1 to compare with upstream Strata.
+  - name: Engine bugs that also happen on upstream Strata
+    url: https://github.com/Niko1221/Strata/issues
+    about: If STRATA_UPSTREAM_DEFAULTS=1 on upstream Strata shows the same bug, report it upstream.

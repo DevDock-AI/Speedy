@@ -48,7 +48,7 @@ missing combination.
 **An update says it succeeded but `strata --version` is still old.**
 The Terminal switches to the updated Control on the next command, so run `strata --version` again. If it is still old,
 run the one-line installer once more; it keeps models and settings. The app, Control and engine have separate version
-numbers; see [updating](INSTALL.md#updating) and the [release notes](https://github.com/Niko1221/Strata/releases).
+numbers; see [updating](INSTALL.md#updating) and the [release notes](https://github.com/DevDock-AI/Speedy/releases).
 
 **A new engine misbehaves after an update.**
 Stop the model, then use the app's rollback control or `strata components rollback`. An update keeps the engine it

@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      cuda:
+        description: "Also compile the CUDA engine (sm_86, no GPU tests: hosted runners have no GPU)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    name: CPU build + CPU tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_TESTS=ON
+      - run: cmake --build build -j 4
+      # tests that need a GPU or a model file are not built or skip in a CPU-only build.
+      # isa_guard_check is excluded: an upstream lint that flags two unlisted AVX-512 helpers (docs/BUILD-LINUX.md).
+      - run: ctest --test-dir build -j 4 --output-on-failure -E isa_guard_check
+
+  cuda:
+    name: CUDA build (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.cuda
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update && apt-get install -y cmake ninja-build git python3
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_MMQ_TQ_OVERLAY=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_Q6K_EXPERTS=ON
+      - run: cmake --build build --target strata -j 4
+
+  windows-cpu:
+    name: Windows CPU build + CPU tests
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_TESTS=ON
+      - run: cmake --build build -j 4
+      - run: ctest --test-dir build -j 4 --output-on-failure -E isa_guard_check
+
+  windows-cuda:
+    name: Windows CUDA build (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.cuda
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: "12.8.0"
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "visual_studio_integration"]'
+      - uses: ilammy/msvc-dev-cmd@v1
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_MMQ_TQ_OVERLAY=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_Q6K_EXPERTS=ON
+      - run: cmake --build build --target strata -j 4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: strata-windows-x64-sm86
+          path: build/strata.exe

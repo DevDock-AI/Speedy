@@ -3748,7 +3748,7 @@ void Verifier::raise_partial(void* ctx) {
     Verifier* v = (Verifier*) ctx;
     if (v->h_pflag_ == nullptr) return;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    _mm_sfence();
+    strata_store_fence();
     raise_flag(v->h_pflag_, v->cur_layer_ + 1);
 }
 
@@ -3822,8 +3822,9 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
     return true;
 }
 
-namespace { bool g_commit_async = false; }
+namespace { bool g_commit_async = false, g_split_commit_async = false; }
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
+void Verifier::set_split_commit_async(bool on) { g_split_commit_async = on; }
 
 bool Verifier::commit(int n_keep, std::string& err) {
 #if defined(STRATA_GPU_METAL)
@@ -3866,7 +3867,11 @@ bool Verifier::commit(int n_keep, std::string& err) {
         // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
         // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
         // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
-        if (!g_commit_async || next_ != nullptr) {
+        // A layer split's stages too when set_split_commit_async (STRATA_SPLIT_COMMIT_ASYNC=1): a stage's graph writes
+        // only its own layers' state (and the PLE history, on the stage with layer 1), never a hand-off or the final
+        // rows, on the stage's own stream - which its next window follows, and run() syncs before the next stage
+        // starts.  Each stage records its own event; wait_commit walks them all.
+        if (!g_commit_async || (next_ != nullptr && !g_split_commit_async)) {
             const cudaError_t se = cudaStreamSynchronize(cs_);
             if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
         } else {
@@ -5280,4 +5285,27 @@ void Verifier::absorb_stats(Verifier& o) {
     o.prof_windows_ = 0;
 }
 
+}  // namespace strata::core
+
+namespace strata::core {
+bool Verifier::pl_set_history_rows(const int32_t* rows, int T, std::string& err) {
+    if (hist_d_ == nullptr || hist_len_ <= 0) { err = "pipelined penalties: no history buffer is set"; return false; }
+    if (fl_active_) { err = "pipelined penalties: a window is in flight on this verifier"; return false; }
+    const size_t n = (size_t) T * (size_t) hist_len_;
+    if (hist_pin_n_ < n) {
+        if (hist_pin_) cudaFreeHost(hist_pin_);
+        hist_pin_ = nullptr; hist_pin_n_ = 0;
+        if (cudaHostAlloc((void**) &hist_pin_, n * sizeof(int32_t), cudaHostAllocDefault) != cudaSuccess) {
+            cudaGetLastError(); hist_pin_ = nullptr; err = "pipelined penalties: no pinned staging"; return false;
+        }
+        hist_pin_n_ = n;
+    }
+    // the previous window on this stream has been synced in pl_finish (its sampler read hist_d_ and the staging is free)
+    std::memcpy(hist_pin_, rows, n * sizeof(int32_t));
+    if (cudaMemcpyAsync((void*) hist_d_, hist_pin_, n * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+        err = std::string("pipelined penalties: history upload: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
+}
 }  // namespace strata::core

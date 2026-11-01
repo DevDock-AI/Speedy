@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: "If you use Speedy, please cite it as below, and cite Strata, the engine it is built on."
+title: "Speedy: a tuned Strata fork for Qwen3.8-Flash-Next on one or two consumer Ampere GPUs"
+type: software
+authors:
+  - name: "The Speedy contributors"
+repository-code: "https://github.com/DevDock-AI/Speedy"
+version: "0.3.0"
+date-released: "2026-11-01"
+license: MIT
+keywords: [llm, inference, mixture-of-experts, cuda, qwen, long-context]
+references:
+  - type: software
+    title: "Strata"
+    authors:
+      - name: "Niko1221 and the Strata contributors"
+    url: "https://github.com/Niko1221/Strata"
+    license: MIT
+    version: "0.2.7.1"
+  - type: software
+    title: "gpu-unlock"
+    authors:
+      - name: "Zagitta"
+    url: "https://github.com/Zagitta/gpu-unlock"
+  - type: software
+    title: "Basalt"
+    authors:
+      - name: "Jesus Gulfo"
+    url: "https://github.com/jesdga95/basalt"
+    license: MIT

@@ -1,30 +1,36 @@
-**The title must start with its area: [Engine], [GUI], [TUI], [Benchmark], [Docs] or [Other], for example "[Engine] fix decode stop on long prompts" or "[GUI] keep the model list after a tab switch".**
+<!-- Read CONTRIBUTING.md first. A PR without numbers is closed until they are added. -->
+## What changes
+<!-- One or two sentences, from the user's side. -->
 
-<!--
-Read CONTRIBUTING.md first. Lead with the problem and the result, not a file-by-file list.
-Placeholders below are not test results: replace them with what you observed, or write "none".
--->
+## Why
+<!-- The problem or hypothesis; link an issue if there is one. -->
 
-## Problem and result
-<!-- What triggered this change. How it behaves before and after. -->
+## Type
+- [ ] perf (measured speed change)   - [ ] fix   - [ ] feat   - [ ] docs / tooling only (skip Evidence and Quality)
 
-## Related discussion
-<!-- The issue URL and the maintainer's agreement on scope, when the change needs one (features, refactors, defaults). Write "none" if not applicable. -->
+## Hardware and setup
+<!-- GPU(s) + VRAM + power limit, CPU, RAM, PCIe, OS (Linux / Windows), driver, CUDA, commit, pack/quant, preset, STRATA_* vars. -->
 
-## Approach
-<!-- Why this fix. Compatibility effects. Keep unrelated cleanup out of the PR. -->
+## Evidence (same-window ABBA)
+<!-- Arms (control vs candidate), run order, number of blocks, prompt sizes. Paste bench/speedbench.py output. -->
 
-## Validation
-<!-- Exact commands, the revision and the environment tested, what you saw. Keep the three lists apart. -->
+| Metric | Control | Candidate | Change |
+|---|---|---|---|
+| Prefill 60K / 120K / 200K (t/s) | | | |
+| Decode (t/s) | | | |
+| Warm turn after 120K (s) | | | |
+| VRAM / expert slots per GPU | | | |
 
-**Passed:**
-<!-- command, revision/environment, observed result, log -->
+## Quality
+<!-- One of: bitwise (how checked, same engine launch) / tolerance gate v2 + coding gate results / needle test results. -->
 
-**Failed:**
-<!-- command and failure, or "none observed" -->
+## Tests
+<!-- ctest / pytest commands run and their results; what you could not run and why. -->
 
-**Not run:**
-<!-- check, why, and what stays unverified (for example CUDA, HIP, SYCL or Metal builds you could not do) -->
-
-## Limits
-<!-- Known limitations or remaining work. -->
+## Checklist
+- [ ] Off by default, or the A/B and quality gate above justify a new default
+- [ ] One hypothesis in this PR
+- [ ] Builds on Linux; Windows impact considered (say if built/run there)
+- [ ] SPEEDY.md / CHANGELOG.md / docs/TUNING-HISTORY.md updated (including if rejected)
+- [ ] Upstream authors credited (cherry-pick -x, NOTICE)
+- [ ] No secrets, personal data, machine paths, GPU UUIDs or assistant/tool attribution in code, configs, commits or screenshots

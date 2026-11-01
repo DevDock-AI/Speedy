@@ -9,7 +9,7 @@ bench/micro/*.bin
 bench/micro/*.dll
 bench/micro/*.txt
 *.log
-build*/
+/build*/
 pack/
 logs/
 __pycache__/
@@ -95,3 +95,21 @@ node_modules/
 /build-spark/
 /build-vision-spark/
 /.venv-build/
+
+# Speedy
+bench/results-local/
+configs/local/
+
+# Speedy: local outputs that must never be committed
+/build-*/
+*.out
+/results/
+bench/results/runs/
+bench/eng/
+data/local/
+*.env
+.env*
+*.key
+*.pem
+api_key*
+clients.json

@@ -1,0 +1,36 @@
+name: Performance report
+description: Speed numbers from your machine (faster, slower, or a regression between versions)
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Numbers are only comparable with the same pack, preset, context and power limit. A/B on one machine
+        (e.g. Speedy vs `STRATA_UPSTREAM_DEFAULTS=1`, or two commits) is the most useful; docs/BENCHMARKS.md shows the method.
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware
+      description: GPU(s) and VRAM, power limit / clocks, driver and CUDA version, CPU, RAM, PCIe generation and width, OS.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Version and configuration
+      description: Speedy commit(s), model pack, preset or command line, STRATA_* variables, context size.
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Results
+      description: Prefill and decode tok/s per arm and context, number of runs, order (e.g. ABBA). Paste `bench/speedbench.py` JSON if you have it.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything unusual (thermal throttling, other GPU load, swap).

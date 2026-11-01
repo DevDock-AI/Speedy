@@ -1,0 +1,65 @@
+Speedy
+Copyright (c) 2026 Niko1221 and the Strata contributors
+Copyright (c) 2026 the Speedy contributors (changes in this fork)
+Licensed under the MIT License (see LICENSE).
+
+Speedy is a fork of Strata (https://github.com/Niko1221/Strata, MIT, (c) Niko1221 and the Strata contributors),
+based on Strata v0.2.7.1 (upstream commit 46c152a1). All of Strata's files keep that copyright. Code under
+third_party/ keeps its own license files.
+
+-------------------------------------------------------------------------------------------------------------------
+Upstream Strata pull requests carried before an upstream merge
+-------------------------------------------------------------------------------------------------------------------
+All of these are contributions to the same MIT-licensed project and keep their authors' copyright. Cherry-picked
+commits keep the original author (git author field); ports name the PR in the commit message and in SPEEDY.md.
+
+In main:
+  #2689 / #2690  STRATA_VERIFY_DEFER_CPU, _BELOW (defer light CPU expert rows in verify)   lask3802                         port
+  #4283          STRATA_PREFILL_ROUTED_STREAM (routed prompt stream)                       Stefano Sinden (bitaccesscomau)  cherry-pick
+  #4039          STRATA_PF_GROUP_SCRATCH, STRATA_PF_HC_REGION (smaller prompt scratch)     merbanan                         cherry-pick
+
+On integration branches (integ/v02-prs, integ/v02-prs2): opt-in, not in main until they pass an A/B:
+  #4119          STRATA_SELECT_TWO_PASS (two-pass QSA prompt select)                       Stefano Sinden (bitaccesscomau)
+  #4567          STRATA_QSA_ATTN_VARIANT=2 (32-cell QSA decode chunks)                     Jackwwg83
+  #3919          STRATA_KV_RING_ADAPT (KV ring sized from depth)                           Zac Chen (xyzzing)
+  #2968          resident-arena staging ring                                               sergqwer (sergiywith)
+  #2964          STRATA_ADAPT_FETCH                                                        sergqwer
+  #3307          STRATA_MTP_ROOM_MIN (MTP drafter memory lent to the prompt)               gopinath87607
+  #3310          STRATA_PREFILL_KEEP                                                       gopinath87607
+  #3309          STRATA_WARM_PROMPT                                                        gopinath87607
+  #4226          persistent disk conversation cache                                        G0-0000
+
+-------------------------------------------------------------------------------------------------------------------
+Ideas adapted (re-implemented, no code copied)
+-------------------------------------------------------------------------------------------------------------------
+- Basalt (https://github.com/jesdga95/basalt), MIT, Copyright (c) 2026 Jesus Gulfo: slot-budget alignment
+  (Basalt PR #120 -> Speedy J13), PSI-driven cache shedding (PR #113 -> C4), the pinned bounce buffer (PR #66 -> C3,
+  later dropped), per-expert pool readiness (J02, rejected). License text: licenses/Basalt-MIT.txt.
+- StrataFast (a Strata fork with a second-GPU prompt split): studied for the dual-GPU roadmap; no code taken.
+- architectds/Strata branch "best" (MIT): INT8 tensor-core (IMMA) prompt attention. It is already in upstream
+  Strata as STRATA_PROMPT_ATTN_IMMA; Speedy only turns it on by default.
+- Cloudflare "Code Mode" (pattern only): tools/codemode_mcp.py.
+
+-------------------------------------------------------------------------------------------------------------------
+Not bundled
+-------------------------------------------------------------------------------------------------------------------
+- gpu-unlock (https://github.com/Zagitta/gpu-unlock): an optional, separately installed third-party kernel module
+  used on the reference machine. No part of it is in this repository; it keeps its own license.
+  See docs/GPU-UNLOCK.md.
+- Model weights (Qwen3.8-Flash-Next and its quantisations) are not part of this repository and keep their own
+  licenses.
+
+The Speedy logo (docs/assets/speedy-logo.webp, docs/assets/speedy-logo-small.png) and the older mascot and icon
+(docs/assets/logo.svg, docs/assets/icon.svg) are artwork made for this project.
+
+-------------------------------------------------------------------------------------------------------------------
+Dual-GPU edition: code from other Strata forks and pull requests (MIT, authors keep their copyright)
+-------------------------------------------------------------------------------------------------------------------
+  Per-card weight trim, slower-stage split pricing, draft-head room on the last card: from Hardin22's
+    Strata-DualGPU (a fork of Strata, MIT license), ported by cobra91 (upstream PRs #4522, #4534, #4549)
+  #3821 STRATA_PREFILL_PIPE_FLOOR, #3819 STRATA_SPLIT_COMMIT_ASYNC                          ruibeikaa
+  #4020 peer-device VMM / context fixes                                                    chimpera
+  #3648 STRATA_PF_PEER_PIECES                                                              Klaus Friedel
+  #3742 per-GPU copy threads (STRATA_STAGE_COPY_PARALLEL)                                  wannagoxuf
+  #4380 fused-ring layer check per CUDA device                                             moses-sun
+  #3306 STRATA_PREFILL_MAX                                                                 gopinath87607

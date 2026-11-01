@@ -1,0 +1,434 @@
+{
+ "release": "release_v6",
+ "start": "2025-02-01",
+ "end": "2025-05-01",
+ "seed": 20261031,
+ "quota": {
+  "easy": 16,
+  "medium": 21,
+  "hard": 33
+ },
+ "window_size": 131,
+ "problems": [
+  {
+   "id": "3709",
+   "difficulty": "easy",
+   "date": "2025-02-15",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3723",
+   "difficulty": "easy",
+   "date": "2025-02-15",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3736",
+   "difficulty": "easy",
+   "date": "2025-02-01",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3768",
+   "difficulty": "easy",
+   "date": "2025-02-22",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3773",
+   "difficulty": "easy",
+   "date": "2025-04-05",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3778",
+   "difficulty": "easy",
+   "date": "2025-03-01",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3788",
+   "difficulty": "easy",
+   "date": "2025-03-15",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3799",
+   "difficulty": "easy",
+   "date": "2025-03-15",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3832",
+   "difficulty": "easy",
+   "date": "2025-03-29",
+   "platform": "leetcode"
+  },
+  {
+   "id": "abc392_a",
+   "difficulty": "easy",
+   "date": "2025-02-08",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc392_b",
+   "difficulty": "easy",
+   "date": "2025-02-08",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc395_a",
+   "difficulty": "easy",
+   "date": "2025-03-01",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc396_a",
+   "difficulty": "easy",
+   "date": "2025-03-08",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc396_b",
+   "difficulty": "easy",
+   "date": "2025-03-08",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc399_a",
+   "difficulty": "easy",
+   "date": "2025-03-29",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc400_a",
+   "difficulty": "easy",
+   "date": "2025-04-05",
+   "platform": "atcoder"
+  },
+  {
+   "id": "3743",
+   "difficulty": "medium",
+   "date": "2025-02-01",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3750",
+   "difficulty": "medium",
+   "date": "2025-03-15",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3759",
+   "difficulty": "medium",
+   "date": "2025-03-08",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3776",
+   "difficulty": "medium",
+   "date": "2025-03-01",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3779",
+   "difficulty": "medium",
+   "date": "2025-02-15",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3785",
+   "difficulty": "medium",
+   "date": "2025-03-01",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3786",
+   "difficulty": "medium",
+   "date": "2025-03-01",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3791",
+   "difficulty": "medium",
+   "date": "2025-03-08",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3793",
+   "difficulty": "medium",
+   "date": "2025-03-29",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3795",
+   "difficulty": "medium",
+   "date": "2025-03-15",
+   "platform": "leetcode"
+  },
+  {
+   "id": "abc391_d",
+   "difficulty": "medium",
+   "date": "2025-02-01",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc394_c",
+   "difficulty": "medium",
+   "date": "2025-02-22",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc394_d",
+   "difficulty": "medium",
+   "date": "2025-02-22",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc396_c",
+   "difficulty": "medium",
+   "date": "2025-03-08",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc397_b",
+   "difficulty": "medium",
+   "date": "2025-03-15",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc398_b",
+   "difficulty": "medium",
+   "date": "2025-03-22",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc398_c",
+   "difficulty": "medium",
+   "date": "2025-03-22",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc400_c",
+   "difficulty": "medium",
+   "date": "2025-04-05",
+   "platform": "atcoder"
+  },
+  {
+   "id": "arc192_a",
+   "difficulty": "medium",
+   "date": "2025-02-09",
+   "platform": "atcoder"
+  },
+  {
+   "id": "arc194_a",
+   "difficulty": "medium",
+   "date": "2025-03-09",
+   "platform": "atcoder"
+  },
+  {
+   "id": "arc195_a",
+   "difficulty": "medium",
+   "date": "2025-03-23",
+   "platform": "atcoder"
+  },
+  {
+   "id": "3696",
+   "difficulty": "hard",
+   "date": "2025-02-08",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3697",
+   "difficulty": "hard",
+   "date": "2025-02-01",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3717",
+   "difficulty": "hard",
+   "date": "2025-03-29",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3733",
+   "difficulty": "hard",
+   "date": "2025-02-15",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3762",
+   "difficulty": "hard",
+   "date": "2025-02-08",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3765",
+   "difficulty": "hard",
+   "date": "2025-03-29",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3777",
+   "difficulty": "hard",
+   "date": "2025-04-05",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3781",
+   "difficulty": "hard",
+   "date": "2025-02-22",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3783",
+   "difficulty": "hard",
+   "date": "2025-03-01",
+   "platform": "leetcode"
+  },
+  {
+   "id": "3801",
+   "difficulty": "hard",
+   "date": "2025-03-15",
+   "platform": "leetcode"
+  },
+  {
+   "id": "abc391_e",
+   "difficulty": "hard",
+   "date": "2025-02-01",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc391_f",
+   "difficulty": "hard",
+   "date": "2025-02-01",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc391_g",
+   "difficulty": "hard",
+   "date": "2025-02-01",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc393_f",
+   "difficulty": "hard",
+   "date": "2025-02-15",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc394_e",
+   "difficulty": "hard",
+   "date": "2025-02-22",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc394_f",
+   "difficulty": "hard",
+   "date": "2025-02-22",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc395_e",
+   "difficulty": "hard",
+   "date": "2025-03-01",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc397_d",
+   "difficulty": "hard",
+   "date": "2025-03-15",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc397_g",
+   "difficulty": "hard",
+   "date": "2025-03-15",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc398_g",
+   "difficulty": "hard",
+   "date": "2025-03-22",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc399_e",
+   "difficulty": "hard",
+   "date": "2025-03-29",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc399_f",
+   "difficulty": "hard",
+   "date": "2025-03-29",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc400_e",
+   "difficulty": "hard",
+   "date": "2025-04-05",
+   "platform": "atcoder"
+  },
+  {
+   "id": "abc400_g",
+   "difficulty": "hard",
+   "date": "2025-04-05",
+   "platform": "atcoder"
+  },
+  {
+   "id": "arc192_b",
+   "difficulty": "hard",
+   "date": "2025-02-09",
+   "platform": "atcoder"
+  },
+  {
+   "id": "arc192_e",
+   "difficulty": "hard",
+   "date": "2025-02-09",
+   "platform": "atcoder"
+  },
+  {
+   "id": "arc193_a",
+   "difficulty": "hard",
+   "date": "2025-02-23",
+   "platform": "atcoder"
+  },
+  {
+   "id": "arc193_b",
+   "difficulty": "hard",
+   "date": "2025-02-23",
+   "platform": "atcoder"
+  },
+  {
+   "id": "arc195_c",
+   "difficulty": "hard",
+   "date": "2025-03-23",
+   "platform": "atcoder"
+  },
+  {
+   "id": "arc195_e",
+   "difficulty": "hard",
+   "date": "2025-03-23",
+   "platform": "atcoder"
+  },
+  {
+   "id": "arc196_a",
+   "difficulty": "hard",
+   "date": "2025-04-06",
+   "platform": "atcoder"
+  },
+  {
+   "id": "arc196_b",
+   "difficulty": "hard",
+   "date": "2025-04-06",
+   "platform": "atcoder"
+  },
+  {
+   "id": "arc196_d",
+   "difficulty": "hard",
+   "date": "2025-04-06",
+   "platform": "atcoder"
+  }
+ ]
+}

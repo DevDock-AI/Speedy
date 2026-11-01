@@ -285,8 +285,11 @@ public:
     /// the session from another stream or the host afterwards (a new request, a checkpoint, a snapshot, the prompt
     /// path, the end of a run) calls wait_commit() first.  STRATA_COMMIT_SYNC=1 keeps the wait.
     static void set_commit_async(bool on);
-    /// Waits for the last commit graph when commit() did not (an event recorded after it, not the whole device);
-    /// false with `err` when it failed.  Free when nothing is pending.
+    /// The stages of a layer split commit without the wait as well (with set_commit_async on; off by default, so a
+    /// split waits after every stage's commit).  STRATA_SPLIT_COMMIT_ASYNC=1 in generate.
+    static void set_split_commit_async(bool on);
+    /// Waits for the last commit graph when commit() did not (an event recorded after it, not the whole device), on
+    /// this stage and every later one; false with `err` when it failed.  Free when nothing is pending.
     bool wait_commit(std::string& err);
 
     // ---- PIPELINED WINDOWS (--pipeline-windows, a layer split on two GPUs).  One conversation's windows with the
@@ -321,6 +324,10 @@ public:
     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
     bool capture_all(std::string& err);
     bool pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err);
+    /// Speedy (STRATA_PIPELINE_PENALTIES): the next window's penalty-history rows (T x history_len), copied into the
+    /// pinned staging of this verifier and up to hist_d_ on this stage's stream (ordered before the next pl_launch,
+    /// no host wait).  False when no history is set or a window is in flight on this verifier.
+    bool pl_set_history_rows(const int32_t* rows, int T, std::string& err);
     /// Stage a window ahead of its launch (positions, and the PLE rows from `ple_prev` = the two tokens before the
     /// window as they WILL be, their pages prefetched).  A later `pl_launch` of the same window (T, pos0, tokens, and
     /// `ss.ple_prev` equal to `ple_prev` by then) skips the staging; anything else stages again.
@@ -592,6 +599,8 @@ private:
     int32_t last_tokens_[8] = {};
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;
+    int32_t* hist_pin_ = nullptr;   ///< pl_set_history_rows' pinned staging (lazily allocated)
+    size_t hist_pin_n_ = 0;
     cudaStream_t sh_cs_ = nullptr;
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
     // STRATA_DF_BRANCH: a layer's mixer work that reads only the layer's input, captured as parallel graph branches

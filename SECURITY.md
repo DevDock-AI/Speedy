@@ -3,16 +3,23 @@
 ## Reporting a vulnerability
 
 Please report anything that should not be public until it is fixed **privately**, through GitHub's private
-vulnerability reporting: the repository's **Security** tab, **Report a vulnerability**
-([direct link](https://github.com/Niko1221/Strata/security/advisories/new)). Say what you found, how to reproduce it
-(the request, the config keys involved, the Strata version), and what an attacker gains. We answer there, fix it in
-a release, and credit you in the advisory unless you ask us not to.
+vulnerability reporting on **this repository**: the **Security** tab, **Report a vulnerability**. Include what you
+found, how to reproduce it (the request, the config keys or environment variables involved, the Speedy commit or
+version), and what an attacker gains. We aim to acknowledge a report within 7 days, fix it in the next release, and
+credit you in the advisory unless you ask us not to. Please do not open a public issue for it.
 
-Ordinary hardening ideas and findings that are safe to discuss in public are welcome as an
-[issue](https://github.com/Niko1221/Strata/issues) (#544 collects audit findings) or as a pull request, which we
-review like our own code.
+If the problem is in code Speedy shares unchanged with Strata, it most likely affects upstream too: we forward it to
+the Strata maintainers through their private reporting
+([Niko1221/Strata security advisories](https://github.com/Niko1221/Strata/security/advisories/new)), or you can
+report it there directly.
 
-Supported: the latest release. Fixes go into the next release, not into older ones.
+Supported: the latest Speedy release and `main`. Fixes are not backported.
+
+Speedy-specific notes:
+- Never put API keys in a preset or a config you commit. `examples/serving/serve.sh` reads the key from a file
+  (`STRATA_API_KEY_FILE`, mode 600) into `STRATA_API_KEY` at start.
+- The optional [gpu-unlock](docs/GPU-UNLOCK.md) module is third-party kernel code; it is not part of Speedy and is
+  not covered by this policy. Report issues with it to its authors.
 
 ## What the server exposes
 
@@ -75,8 +82,8 @@ the model. The section above is about the engine's HTTP server. This is what the
 The Terminal installs with one line:
 
 ```sh
-curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
-irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
+curl -fsSL https://github.com/DevDock-AI/Speedy/releases/latest/download/install.sh -o install.sh && sh install.sh
+irm https://github.com/DevDock-AI/Speedy/releases/latest/download/install.ps1 | iex
 ```
 
 Piping a script into a shell runs whatever the server sends, so it deserves the same care as running any downloaded program.
@@ -89,8 +96,8 @@ that archive, so for the first install all trust rests on HTTPS and on the `Niko
 damaged or half-finished download and a feed that was not signed by the release key; they do not protect you if the release has been replaced
 by someone who controls it. Later updates are checked against the key already on your PC, which is a stronger position.
 
-If that is not enough: save the script (`curl -fsSLO https://github.com/Niko1221/Strata/releases/latest/download/install.sh`), read it, and
+If that is not enough: save the script (`curl -fsSLO https://github.com/DevDock-AI/Speedy/releases/latest/download/install.sh`), read it, and
 run it from the file; or install the desktop app or build from source instead and check the code you build.
 
-Strata has not had an outside security audit yet.
+Neither Strata nor Speedy has had an outside security audit yet.
 What Strata downloads, when it uses the internet, what stays on your PC and how downloads are checked is written up in [docs/SAFETY.md](docs/SAFETY.md).
