@@ -1,6 +1,6 @@
-# Speedy — single-GPU edition (1GPU 0.2.0)
+# Speedy on one GPU
 
-The best configuration measured on **one RTX 3080 10 GB** (reference machine: Threadripper PRO 5975WX, 128 GB DDR4-3200, gpu-unlock on, ReBAR + Preferred IO, `iommu=pt`). It is frozen here so it can be published on its own; the dual-GPU work lives on `edition/2gpu`.
+The best configuration measured on **one RTX 3080 10 GB** (reference machine: Threadripper PRO 5975WX, 128 GB DDR4-3200, gpu-unlock on, ReBAR + Preferred IO, `iommu=pt`). The same engine runs on two GPUs when the preset has `--layer-split` ([EDITION-2GPU.md](EDITION-2GPU.md)).
 
 ## What is in it
 - Engine: Speedy on Strata v0.2.7.1, plus K1 (`STRATA_KV_STAGE_REQ`, per-request KV staging for the 1M tier) and #4119 (two-pass attention select).

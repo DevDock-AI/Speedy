@@ -51,7 +51,7 @@ Windows/Linux.
 | SMT off, C2 idle state off | no gain |
 | `--vram-reserve-mib` 400-450 | prefill +15 % on a 16K benchmark only (chunk 7680 -> 7936), but OOM at 127K context -> rejected; 256 fails at start |
 | `--ple-io ram --no-ple-prefetch` | no gain, -26 GB RAM |
-| `nvidia-drm.modeset=0` (console off the GPU) | not tested (owner decision: risk > gain) |
+| `nvidia-drm.modeset=0` (console off the GPU) | not tested (risk > gain) |
 | `pcie_aspm=off` | moot (ASPM already disabled in BIOS) |
 
 Adopted at the platform level (2026-10-29): 8th DIMM (decode +22-55 %), BIOS ReBAR + PreferredIO (prefill +1.5 %),

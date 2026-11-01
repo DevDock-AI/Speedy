@@ -103,9 +103,8 @@ First public release.
 - Public layout: README with logo, NOTICE, licenses/, CONTRIBUTING, CODE_OF_CONDUCT, SECURITY, CITATION.cff, docs
   (BUILD-LINUX, BENCHMARKS, CONFIGS, ARCHITECTURE, GPU-UNLOCK, ROADMAP, TUNING-HISTORY, SPEEDY_DEFAULTS). Strata's
   READMEs moved to docs/upstream/. Private hostnames and paths replaced with placeholders.
-- Published history (branch `publish/v0.1.0`, [docs/PUBLISHING.md](docs/PUBLISHING.md)): a fresh history of the
-  Strata v0.2.7.1 import, one commit per cherry-picked upstream PR with its original author, and one "Speedy 0.1.0"
-  commit; its tree equals the development tree. The development history is not published.
+- Published history: the Strata v0.2.7.1 import, then one commit for each cherry-picked upstream PR under its original
+  author, then one "Speedy" commit.
 - `.github/`: Speedy CI (CPU build + CPU tests; CUDA build on manual dispatch) and issue templates; Strata's bots,
   templates and FUNDING.yml removed (kept for reference in docs/upstream/github/).
 

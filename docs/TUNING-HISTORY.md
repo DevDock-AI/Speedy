@@ -37,7 +37,7 @@ The fused INT8 paths stay the default.
 
 ## Rejected (do not re-propose without a new reason)
 Platform: `-march=znver3`+LTO, governor, GPU clock lock, hugetlbfs, mimalloc/jemalloc, SMT off, C2 off,
-vram-reserve < 700, `--ple-io ram`, display-off arm (owner decision).
+vram-reserve < 700, `--ple-io ram`, display-off arm (not tested: risk > gain).
 Engine: `native_mma` INT8 tensor-core decode (+0.0 %), low-sync handoff (<= 2.5 % ceiling), arena placement,
 SLRU flags, rerank/adapt-every 1, prefill head alias (-28 %), route prior / tail skip (lossy), spec 3/5/6, no MTP,
 llama.cpp-based engines (no GDN+QSA+PLE at 200K on sm_86).

@@ -157,7 +157,7 @@ Speedy keeps Strata's Windows support: the same engine source, the same `serve/`
 **Option A, setup does everything:**
 1. Clone the repository, or download and extract a release.
 2. Run `START-HERE.bat`. In PowerShell, run `.\START-HERE.bat`.
-3. Pick the model and quant. Setup downloads a ready-made engine from this repository's releases when one fits your card, and builds one from source otherwise.
+3. Pick the model and quant. Setup compiles the Speedy engine from source, so the build tools in option B must be installed. Ready-made engine downloads will come with the GitHub releases.
 
 **Option B, build the engine yourself:**
 1. Install the **Visual Studio 2022 Build Tools** (C++ workload) and **CUDA 13.x** (13.3 or newer also works with VS 2026).
@@ -175,6 +175,7 @@ cmake --build build --target strata
 - Pinned host memory is limited by Windows itself, not by `ulimit`. If the engine warns about pinned memory, lower `--kv-resident` or `--conversation-cache-mib`.
 - Windows results are welcome: open an issue with the **Performance report** template.
 
+Strata's desktop app and its auto-update channel are not published for Speedy; use the source install.
 Full Windows steps: [docs/SOURCE_INSTALL.md](docs/SOURCE_INSTALL.md#from-source-windows) and
 [docs/INSTALL.md](docs/INSTALL.md).
 
