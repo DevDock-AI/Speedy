@@ -26,7 +26,6 @@ it was adopted only after a same-window A/B and a quality gate.
 |---|---|
 | **[Results at a glance](#results-at-a-glance)** | Speed per quant, one GPU and two GPUs |
 | **[Quality](#quality)** | IFBench, long-context recall, quality gates |
-| **[Reference machine](#reference-machine)** | The hardware every number was measured on |
 | **[Quick start: Linux](#quick-start-linux)** | Build, presets, serve |
 | **[Quick start: Windows](#quick-start-windows)** | Build and run on Windows 10/11 |
 | **[Presets: replicate our numbers](#presets-replicate-our-numbers)** | The exact production configs |
@@ -56,20 +55,21 @@ Each value is the **average ± half the spread** across the measured runs. All r
 >
 > Output is bit-identical locked and unlocked. Without the module, expect correspondingly lower prefill. Setup and
 > caveats are in [docs/GPU-UNLOCK.md](docs/GPU-UNLOCK.md).
+>
+> **Measured on:** Lenovo ThinkStation P620
+>
+> | Part | Spec |
+> |:---|:---|
+> | GPUs | 2× RTX 3080 10 GB, PCIe 4.0 x16 each, no NVLink, caps 320 W / 280 W, both unlocked |
+> | CPU | AMD Threadripper PRO 5975WX, 32 cores / 64 threads |
+> | RAM | 128 GB DDR4-3200, 8 channels (8× 16 GB) |
+> | Storage | 2 TB Samsung PM9A1 NVMe (PCIe 4.0) |
+> | OS | Debian 13, kernel 6.12, NVIDIA 615.71, CUDA 13.4 |
+> | <ins>One</ins>-GPU numbers | same machine, first card only |
+>
+> You need about **128 GB of RAM** for the Q4-class quants (Q2_0 needs less) and 60-120 GB of disk per quant.
 
-**Measured on:** Lenovo ThinkStation P620
-
-| Part | Spec |
-|:---|:---|
-| GPUs | 2× RTX 3080 10 GB, PCIe 4.0 x16 each, no NVLink, caps 320 W / 280 W, both unlocked |
-| CPU | AMD Threadripper PRO 5975WX, 32 cores / 64 threads |
-| RAM | 128 GB DDR4-3200, 8 channels (8× 16 GB) |
-| Storage | 2 TB Samsung PM9A1 NVMe (PCIe 4.0) |
-| OS | Debian 13, kernel 6.12, NVIDIA 615.71, CUDA 13.4 |
-
-Full details in [Reference machine](#reference-machine).
-
-### One RTX 3080 10 GB
+### <ins>One</ins> RTX 3080 10 GB
 
 | Quant | Prefill 60K<br>(tok/s) | Prefill 120K<br>(tok/s) | Prefill 200K<br>(tok/s) | Decode<br>(tok/s) | Cold 200K<br>(s) | Follow-up<br>(s) |
 |:---|---:|---:|---:|---:|---:|---:|
@@ -78,7 +78,7 @@ Full details in [Reference machine](#reference-machine).
 | **UD-IQ4_XS** <sub>quality</sub> | 1,820 | 1,802 | 1,806 | **107** ±15 | 111 | 2.75 ±0.25 |
 | **UD-Q4_K_XL** <sub>best</sub> | 1,134 | 1,125 | 1,090 | **93** ±17 | 183 | 2.9 |
 
-### Two RTX 3080 10 GB (layer split)
+### <ins>Two</ins> RTX 3080 10 GB (layer split)
 
 | Quant | Prefill 60K<br>(tok/s) | Prefill 120K<br>(tok/s) | Prefill 200K<br>(tok/s) | Decode<br>(tok/s) | Cold 200K<br>(s) | Follow-up<br>(s) |
 |:---|---:|---:|---:|---:|---:|---:|
@@ -119,18 +119,6 @@ Every adopted engine change also had to pass:
 - **Tolerance gate v2:** token-by-token comparison against the reference across 60K and 120K prompts.
 - **Coding gate:** 8 delegation tasks and 4 real-repository bug fixes.
 - **Needle recall** at 90K to 1M tokens, for any change that touches attention.
-
-## Reference machine
-
-| | |
-|---|---|
-| GPUs | 2× NVIDIA RTX 3080 10 GB (sm_86), PCIe 4.0 x16 each, no NVLink or P2P. Power caps 320 W and 280 W. **Both cards unlocked with [gpu-unlock](docs/GPU-UNLOCK.md)** (FP16 tensor rate +70 %). |
-| CPU | AMD Threadripper PRO 5975WX, 32 cores, AVX2 (no AVX-512) |
-| RAM | 128 GB DDR4-3200, 8 channels |
-| OS | Debian 13 (kernel 6.12), NVIDIA driver 615.71, CUDA 13.4 |
-| Single-GPU numbers | the same machine, using only the first card |
-
-You need about **128 GB of RAM** for the Q4-class quants (Q2_0 needs less) and 60-120 GB of disk per quant.
 
 ## Quick start: Linux
 
