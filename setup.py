@@ -233,7 +233,7 @@ PREBUILT_URL = "https://github.com/DevDock-AI/Speedy/releases/latest/download/"
 # from somewhere the download does not.
 REPO = "DevDock-AI/Speedy"
 PREBUILT_TAG_URL = "https://github.com/DevDock-AI/Speedy/releases/download/v{version}/"
-PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
+PREBUILT_ASSET = "strata-windows-x64-rtx30.zip" if WIN else "strata-linux-x64-rtx30.zip"   # RTX 30 (sm_86) only for now; other cards compile
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
 MIN_DRIVER = 580                       # CUDA 13.0
