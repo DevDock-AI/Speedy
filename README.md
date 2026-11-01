@@ -31,7 +31,6 @@ it was adopted only after a same-window A/B and a quality gate.
 | **[Quick start: Windows](#quick-start-windows)** | Build and run on Windows 10/11 |
 | **[Presets: replicate our numbers](#presets-replicate-our-numbers)** | The exact production configs |
 | **[How Speedy differs from Strata](#how-speedy-differs-from-strata)** | What changed and why |
-| **[What we tried and rejected](#what-we-tried-and-rejected)** | So you don't have to |
 | **[Documentation](#documentation)** | Where everything lives |
 | **[Contributing](#contributing)** | Evidence-first pull requests |
 
@@ -217,21 +216,6 @@ different experts, so batching saves little while the slots take expert-cache VR
 | Presets, benchmark and eval harness | - | `configs/`, `bench/`, `evals/` |
 
 The full patch ledger, with tests and A/B numbers, is in [SPEEDY.md](SPEEDY.md) and [CHANGELOG.md](CHANGELOG.md).
-
-## What we tried and rejected
-
-Measured on the reference machine; details are in [docs/TUNING-HISTORY.md](docs/TUNING-HISTORY.md).
-
-| Change | Result |
-|---|---|
-| `"parallel": 2` batch slots | slower: 42-48 s against 33 s for two clients; −15-19 % single-user decode |
-| `STRATA_MMQ_DIRECT` (read cached experts in place) | neutral; only about 5 % of cold-prefill expert uses are cache hits |
-| Split QSA attention, #2427 | failed the tolerance gate, even though one gave +8 % decode |
-| `EXP_MODE=8`, `HELP_FRAC 0.45`, `NT=256`, Talus union-KV | slower |
-| StrataFast-style second-GPU prompt split, Code Mode as the default | no gain |
-
-Cold prefill on 10 GB cards is limited by streaming experts from RAM: about 95 % of expert uses miss the VRAM cache.
-More VRAM per card is the lever that is left.
 
 ## Documentation
 
