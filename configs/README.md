@@ -17,6 +17,17 @@ one (same VRAM first, then same architecture) and fill the placeholders ([docs/C
 
 ## Add a card
 
+Short version of how to tune a new card:
+
+1. **Build for your card:** set `-DCMAKE_CUDA_ARCHITECTURES` (86 RTX 30xx, 89 RTX 40xx, 120 RTX 50xx, 80 A100).
+2. **Start from the closest card's presets** (same VRAM first). On a card with more VRAM, the knobs that usually
+   matter are `--kv-resident`, `--vram-reserve-mib`, `--resident-budget-gib` and, on two cards, `--layer-split`.
+   [docs/CONFIGS.md](../docs/CONFIGS.md) says what every flag does.
+3. **Change one thing at a time** and measure it against the previous preset with `bench/speedbench.py`
+   (same session, alternate the two: A, B, B, A). `tools/ab_engine.py` automates this.
+4. **Check it still works at full context** (a long prompt near your `--max-context`) before you publish.
+
+
 1. `cp -r configs/cards/_template configs/cards/<model>-<vram>gb` (lower case, e.g. `rtx4090-24gb`, `rtx3090-24gb`, `a6000-48gb`).
 2. Put your presets in `1x/`, `2x/`, ... (one folder per GPU count). Start from the closest existing card and change
    only what you measured. Keep the placeholders; never commit real paths, GPU UUIDs or hostnames.
