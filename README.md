@@ -13,7 +13,7 @@ it was adopted only after a same-window A/B and a quality gate.
 (Ampere or newer: RTX 30xx, 40xx, 50xx, A-series / workstation cards), so other cards should work. Set
 `-DCMAKE_CUDA_ARCHITECTURES` to your card (80 A100, 86 RTX 30xx, 89 RTX 40xx, 120 RTX 50xx). Cards with more VRAM will fit
 more experts and likely run faster, but the presets are tuned for 10 GB and haven't been measured elsewhere.
-Results from other GPUs are very welcome in a PR or issue.
+Results from other GPUs are very welcome: add a card folder under [`configs/cards/`](configs/README.md#add-a-card).
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![GPU](https://img.shields.io/badge/GPU-RTX%203080%2010%20GB%20(1%20or%202)-76B900)
@@ -143,7 +143,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ./setup.sh
 
 # 3. Take a production preset and fill in your paths (docs/CONFIG-PLACEHOLDERS.md)
-mkdir -p configs/mine && cp configs/production-2gpu/strata-ud-iq4_xs-2gpu-pw2.json configs/mine/
+mkdir -p configs/mine && cp configs/cards/rtx3080-10gb/2x/strata-ud-iq4_xs-2gpu-pw2.json configs/mine/
 sed -i -e "s#<SPEEDY_DIR>#$PWD#g" -e "s#<MODELS_DIR>#/models/qwen38#g" -e "s#<STRATA_DATA>#/models/strata-data#g" \
        -e "s#<LOG_DIR>#$HOME/speedy-logs#g" \
        -e "s#<GPU1_UUID>#$(nvidia-smi -i 0 --query-gpu=uuid --format=csv,noheader)#g" \
@@ -154,7 +154,7 @@ ulimit -l unlimited
 .venv/bin/python serve/server.py --engine strata --config configs/mine/strata-ud-iq4_xs-2gpu-pw2.json --port 8080
 ```
 
-With **one GPU**, use the presets in `configs/production-1gpu/` instead. Several quants can share one port through
+With **one GPU**, use the presets in `configs/cards/rtx3080-10gb/1x/` instead. Several quants can share one port through
 llama-swap; see `configs/production-*/llama-swap.yaml` and [docs/LLAMA_SWAP.md](docs/LLAMA_SWAP.md).
 Set an API key before you listen on anything other than `127.0.0.1` ([SECURITY.md](SECURITY.md)).
 
@@ -177,7 +177,7 @@ cmake --build build --target strata
 ```
 With a CUDA **12.x** toolkit, add `-DCMAKE_CUDA_RUNTIME_LIBRARY=Shared`: MSVC refuses the default static runtime there.
 
-3. Copy a preset from `configs/production-1gpu/` or `configs/production-2gpu/`. Replace the placeholders with Windows paths (use forward slashes or escaped backslashes in JSON), set `"exe"` to `build/strata.exe`, and start it with `python serve\server.py --engine strata --config <preset> --port 8080`.
+3. Copy a preset from `configs/cards/rtx3080-10gb/1x/` or `configs/cards/rtx3080-10gb/2x/`. Replace the placeholders with Windows paths (use forward slashes or escaped backslashes in JSON), set `"exe"` to `build/strata.exe`, and start it with `python serve\server.py --engine strata --config <preset> --port 8080`.
 
 **Windows notes:**
 - The reference numbers above are from Linux. Under Windows (WDDM), expect somewhat lower prefill.
@@ -191,13 +191,18 @@ Full Windows steps: [docs/SOURCE_INSTALL.md](docs/SOURCE_INSTALL.md#from-source-
 
 ## Presets: replicate our numbers
 
-The production configs are published exactly as they ran. Only machine paths and GPU UUIDs are replaced by placeholders.
+Presets live in **one folder per GPU model** under [`configs/cards/`](configs/cards/), with a `CARD.md` holding that
+card's hardware, build flags and measured numbers. The RTX 3080 presets are the production configs exactly as they ran;
+only machine paths and GPU UUIDs are replaced by placeholders.
+
+**Tuned Speedy on another card?** Copy [`configs/cards/_template/`](configs/cards/_template/), add your presets and
+numbers, and open a PR. See [configs/README.md](configs/README.md#add-a-card).
 
 | Folder | Contents |
 |---|---|
-| [`configs/production-2gpu/`](configs/production-2gpu/) | `strata-<quant>-2gpu-pw2.json` (229K native) and `strata-<quant>-1m-2gpu.json` (1M tier) for Q2_0, IQ3_S, UD-IQ4_XS, UD-Q4_K_XL, plus `llama-swap.yaml` |
-| [`configs/production-1gpu/`](configs/production-1gpu/) | the single-GPU production presets, plus `llama-swap.yaml` |
-| [`configs/production-2gpu/parallel2/`](configs/production-2gpu/parallel2/) | `"parallel": 2` variants (two requests decoded together). **Slower on 2× 10 GB**, see below |
+| [`configs/cards/rtx3080-10gb/2x/`](configs/cards/rtx3080-10gb/2x/) | `strata-<quant>-2gpu-pw2.json` (229K native) and `strata-<quant>-1m-2gpu.json` (1M tier) for Q2_0, IQ3_S, UD-IQ4_XS, UD-Q4_K_XL, plus `llama-swap.yaml` |
+| [`configs/cards/rtx3080-10gb/1x/`](configs/cards/rtx3080-10gb/1x/) | the single-GPU production presets, plus `llama-swap.yaml` |
+| [`configs/cards/rtx3080-10gb/2x/parallel2/`](configs/cards/rtx3080-10gb/2x/parallel2/) | `"parallel": 2` variants (two requests decoded together). **Slower on 2× 10 GB**, see below |
 
 The key two-GPU settings are:
 - `--layer-split 26`

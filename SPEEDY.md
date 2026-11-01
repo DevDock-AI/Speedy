@@ -17,7 +17,7 @@ Debian 13, CUDA 13.4.
 | C4 | PSI-driven shedding of parked conversations | idea: Basalt PR #113 (MIT) | `STRATA_PSI_SHED=<avg10 %>`, off | memory_pressure_test | robustness |
 | F2 | Code Mode MCP tool | pattern: Cloudflare Code Mode | client opt-in | tools/test_codemode_mcp.py | - |
 | harness | `bench/speedbench.py` and `bench/suffix.py` (90 % reuse gate) | Speedy | - | mock-server check | - |
-| presets | `configs/make_configs.py`, `configs/presets/` (5 packs) | Speedy | - | - | see docs/BENCHMARKS.md |
+| presets | `configs/make_configs.py`, `configs/generic/` (5 packs) | Speedy | - | - | see docs/BENCHMARKS.md |
 
 ## Upstream PRs in main (A/B on Q2_0, IQ3_S and UD-IQ4_XS at 60/120/200K; docs/BENCHMARKS.md)
 | PR | Author | Switch | Port notes | A/B | Status |

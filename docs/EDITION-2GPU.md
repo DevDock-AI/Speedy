@@ -5,7 +5,7 @@ Speedy on **two GPUs**: GPU1 is the main card (RTX 3080 10 GB, 320 W), listed fi
 ## Extra in this edition
 - J01 fix (stale pinned_share in the split planner).
 - #4549 draft-head room and #4380 fused ring per device (on); #4534 slower-stage pricing (needs `--pipeline-windows 2`); #4522 stage trim (default OFF, `--trim-stage-weights` / `STRATA_STAGE_TRIM=1`); #3306 per-GPU prefill ceiling (`STRATA_PREFILL_MAX`, opt-in).
-- `configs/production-2gpu/` holds the production presets: `strata-<quant>-2gpu-pw2.json` (229K) and `strata-<quant>-1m-2gpu.json` (1M tier). Devices are pinned by UUID with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, with GPU1 listed first. Replace the `<GPU1_UUID>`/`<GPU2_UUID>` placeholders ([CONFIG-PLACEHOLDERS.md](CONFIG-PLACEHOLDERS.md)).
+- `configs/cards/rtx3080-10gb/2x/` holds the production presets: `strata-<quant>-2gpu-pw2.json` (229K) and `strata-<quant>-1m-2gpu.json` (1M tier). Devices are pinned by UUID with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, with GPU1 listed first. Replace the `<GPU1_UUID>`/`<GPU2_UUID>` placeholders ([CONFIG-PLACEHOLDERS.md](CONFIG-PLACEHOLDERS.md)).
 - #3559 (stage-local HC_Q8 upload) gives UD-IQ4_XS and UD-Q4_K_XL +7-11 % expert slots per card. `STRATA_PREFILL_STREAM_MIN=512` on UD-IQ4_XS cuts short follow-up turns: 730 tokens 2.15 -> 1.86 s.
 - `tools/dual_ab.sh`: the ABBA harness used for every number below.
 

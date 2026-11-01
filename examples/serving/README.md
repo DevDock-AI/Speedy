@@ -7,7 +7,7 @@ Request path: client (OpenCode, Claude Code local-worker, curl) -> **stats proxy
   the 10 GB card, so llama-swap stops the old one first. `preload` loads Q2_0 at start.
 - `serve.sh <config> <port>`: what llama-swap runs. Reads the API key from `~/.config/strata-llm/api_key`
   (mode 600) into `STRATA_API_KEY`; keys are never written into configs or this repo.
-- Configs: `configs/presets/*.json` (reference machine, /opt paths) or generate your own with `configs/make_configs.py`.
+- Configs: `configs/generic/*.json` (reference machine, /opt paths) or generate your own with `configs/make_configs.py`.
 
 ## Stats proxy (not included)
 The reference machine runs a small aiohttp proxy (private, not part of this repo) in front of llama-swap:

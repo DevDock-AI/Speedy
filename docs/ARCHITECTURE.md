@@ -18,7 +18,7 @@ page lists only what Speedy adds.
 | Prefill | INT8-KV prompt attention on IMMA tensor cores and KV prefetch: upstream code, turned on by default. | `STRATA_PROMPT_ATTN_IMMA=1`, `STRATA_KV_PREFETCH=1` (defaults) | upstream |
 | Memory planning | J13: the pin-by-need resident estimate uses `ExpertCache::slot_stride` (guard included), the same stride the cache lays out. Byte-identical when the guard is off. | always | `src/program/generate.cpp`, `tests/core/slot_budget_test.cpp` |
 | Conversation cache | C4: under memory pressure (`/proc/pressure/memory` "some avg10" above the threshold), up to half of the parked conversations are shed, oldest first. | `STRATA_PSI_SHED=<percent>`, off | `include/strata/core/memory_pressure.hpp`, `src/program/generate.cpp`, `tests/core/memory_pressure_test.cpp` |
-| Presets | `configs/make_configs.py` writes serve configs for five presets from your paths; `configs/presets/` holds them with `/opt` placeholders. | - | `configs/` |
+| Presets | `configs/make_configs.py` writes serve configs for five presets from your paths; `configs/generic/` holds them with `/opt` placeholders. | - | `configs/` |
 | Benchmarks | `bench/speedbench.py` (exact token counts, warm mode, provenance JSON), `bench/suffix.py` (agent-faithful warm turns, 90 % reuse gate). | - | `bench/` |
 | Tools | Code Mode MCP server: one `run_python` tool with read/grep/ls/sh helpers and bounded output. | client opt-in | `tools/codemode_mcp.py`, [CODE_MODE.md](CODE_MODE.md) |
 

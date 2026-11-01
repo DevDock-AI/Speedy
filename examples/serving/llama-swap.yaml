@@ -6,25 +6,25 @@ startPort: 18080
 models:
   q2_0:
     name: "Qwen3.8 Flash-Next Q2_0 (Speedy)"
-    cmd: /opt/speedy/examples/serving/serve.sh /opt/speedy/configs/presets/speedy-q2_0-med.json ${PORT}
+    cmd: /opt/speedy/examples/serving/serve.sh /opt/speedy/configs/generic/speedy-q2_0-med.json ${PORT}
     checkEndpoint: /health
     ttl: 600
     aliases: [qwen3.8-flash-next-q2_0, worker]
   iq3_s:
     name: "Qwen3.8 Flash-Next IQ3_S (Speedy)"
-    cmd: /opt/speedy/examples/serving/serve.sh /opt/speedy/configs/presets/speedy-iq3_s.json ${PORT}
+    cmd: /opt/speedy/examples/serving/serve.sh /opt/speedy/configs/generic/speedy-iq3_s.json ${PORT}
     checkEndpoint: /health
     ttl: 600
     aliases: [qwen3.8-flash-next-iq3_s, q3_s]
   ud-iq4_xs:
     name: "Qwen3.8 Flash-Next UD-IQ4_XS (Speedy, quality)"
-    cmd: /opt/speedy/examples/serving/serve.sh /opt/speedy/configs/presets/speedy-ud-iq4_xs.json ${PORT}
+    cmd: /opt/speedy/examples/serving/serve.sh /opt/speedy/configs/generic/speedy-ud-iq4_xs.json ${PORT}
     checkEndpoint: /health
     ttl: 600
     aliases: [qwen3.8-flash-next-ud-iq4_xs, q4_xs]
   ud-q4_k_xl:
     name: "Qwen3.8 Flash-Next UD-Q4_K_XL (Speedy)"
-    cmd: /opt/speedy/examples/serving/serve.sh /opt/speedy/configs/presets/speedy-ud-q4_k_xl.json ${PORT}
+    cmd: /opt/speedy/examples/serving/serve.sh /opt/speedy/configs/generic/speedy-ud-q4_k_xl.json ${PORT}
     checkEndpoint: /health
     ttl: 600
     aliases: [qwen3.8-flash-next-ud-q4_k_xl, q4_xl]

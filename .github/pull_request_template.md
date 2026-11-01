@@ -44,6 +44,7 @@
 
 ## Checklist
 - [ ] Hardware and setup table fully filled in
+- [ ] New or changed card presets: `configs/cards/<card>/CARD.md` filled and `python3 tools/check_card_configs.py` passes
 - [ ] Off by default, or the A/B and quality gate above justify a new default
 - [ ] One hypothesis in this PR
 - [ ] Builds on Linux; Windows impact considered (say if built/run there)

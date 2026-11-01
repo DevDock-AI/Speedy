@@ -53,6 +53,12 @@ ctest --test-dir build -j 1 --output-on-failure      # serial: GPU parity tests 
 On Windows, use the same CMake lines from an **x64 Native Tools Command Prompt** (VS 2022 Build Tools + CUDA 13.x).
 See [docs/SOURCE_INSTALL.md](docs/SOURCE_INSTALL.md#from-source-windows). Stop any running server before the GPU tests.
 
+## Adding a GPU card
+
+Tuned presets for a card you own are welcome even if they change nothing in the engine. Follow
+[configs/README.md](configs/README.md#add-a-card): one folder per card under `configs/cards/`, a filled `CARD.md`
+with measured numbers, and `python3 tools/check_card_configs.py` passing.
+
 ## Commit messages
 
 Use [Conventional Commits](https://www.conventionalcommits.org): `<type>(<scope>): <subject>`. The subject is the changelog entry.

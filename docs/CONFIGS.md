@@ -1,8 +1,8 @@
-# Presets (configs/presets) and their flags
+# Presets (configs/generic) and their flags
 
 `configs/make_configs.py` writes one serve config (`serve/server.py --config <file>`) per preset. Paths come from the
 command line or from `SPEEDY_*` environment variables (`SPEEDY_ROOT`, `SPEEDY_EXE`, `SPEEDY_DATA`, `SPEEDY_PACKS`,
-`SPEEDY_MODELS`, `SPEEDY_Q2_DIR`, `SPEEDY_LOGS`). `configs/presets/` holds the files generated with the default
+`SPEEDY_MODELS`, `SPEEDY_Q2_DIR`, `SPEEDY_LOGS`). `configs/generic/` holds the files generated with the default
 placeholder paths (`/opt/speedy`, `/opt/models/...`, `/var/log/speedy`); generate your own instead of editing them:
 
 ```bash

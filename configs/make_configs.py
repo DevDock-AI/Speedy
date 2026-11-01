@@ -9,7 +9,7 @@ Every path comes from the command line (or the environment), so the same presets
       --models /opt/models/gguf --q2-dir /opt/models/gguf/q38-ista-q20 --out configs/local
 
 Writes speedy-q2_0-med.json, speedy-q2_0-1m.json, speedy-q2_0-low.json, speedy-iq3_s.json, speedy-ud-iq4_xs.json, speedy-ud-q4_k_xl.json.
-configs/presets/ holds them generated with the default (/opt/...) paths.
+configs/generic/ holds them generated with the default (/opt/...) paths.
 Adapted from the reference machine's own config generator.
 """
 import argparse, copy, json, os

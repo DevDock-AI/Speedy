@@ -1,6 +1,6 @@
 # Placeholders in the edition configs
 
-The configs in `configs/production-*gpu/` (and the harness in `tools/`) are the exact files used on the reference
+The configs in `configs/cards/<card>/<N>x/` (and the harness in `tools/`) are the exact files used on the reference
 machine, with that machine's paths and GPU UUIDs replaced by placeholders. Fill them in before use.
 
 | Placeholder | Meaning | Example |
