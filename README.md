@@ -13,6 +13,7 @@ it was adopted only after a same-window A/B and a quality gate.
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey)
 ![CUDA](https://img.shields.io/badge/CUDA-13.x-76B900)
 ![Context](https://img.shields.io/badge/context-229K%20native%20%7C%201M%20tier-blue)
+![gpu-unlock](https://img.shields.io/badge/measured%20with-gpu--unlock-orange)
 ![IFBench](https://img.shields.io/badge/IFBench-81.0%20(Q4__K__XL)-8A63D2)
 
 </div>
@@ -42,6 +43,20 @@ Each value is the **average ± half the spread** across the measured runs. All r
 - **Decode** is generation speed with MTP speculative decoding.
 - **Cold 200K** is the time to read a fresh 200K-token prompt.
 - **Follow-up** is the time to read a short follow-up (1-2K new tokens) in a 120K-token conversation where 99 % of the prompt is cached.
+
+> [!IMPORTANT]
+> **All numbers were measured with both RTX 3080 cards unlocked by [gpu-unlock](https://github.com/Zagitta/gpu-unlock)**
+> (Zagitta). This is a third-party Linux kernel module that removes the LHR limit on the FP16/BF16 tensor rate. Speedy
+> doesn't bundle or require it.
+>
+> | Unlock effect | Locked | Unlocked |
+> |:---|---:|---:|
+> | FP16 GEMM | 62 TFLOPS | **106 TFLOPS** (+70 %) |
+> | Prefill | baseline | **+10-12 %** (Q2_0), more on FP16 prompt paths such as UD-Q4_K_XL |
+> | Decode | unchanged | unchanged (bandwidth-bound) |
+>
+> Output is bit-identical locked and unlocked. Without the module, expect correspondingly lower prefill. Setup and
+> caveats are in [docs/GPU-UNLOCK.md](docs/GPU-UNLOCK.md).
 
 ### One RTX 3080 10 GB
 
@@ -98,7 +113,7 @@ Every adopted engine change also had to pass:
 
 | | |
 |---|---|
-| GPUs | 2× NVIDIA RTX 3080 10 GB (sm_86), PCIe 4.0 x16 each, no NVLink or P2P. Power caps 320 W and 280 W. The FP16 tensor rate is unlocked with the optional third-party [gpu-unlock](docs/GPU-UNLOCK.md) module. |
+| GPUs | 2× NVIDIA RTX 3080 10 GB (sm_86), PCIe 4.0 x16 each, no NVLink or P2P. Power caps 320 W and 280 W. **Both cards unlocked with [gpu-unlock](docs/GPU-UNLOCK.md)** (FP16 tensor rate +70 %). |
 | CPU | AMD Threadripper PRO 5975WX, 32 cores, AVX2 (no AVX-512) |
 | RAM | 128 GB DDR4-3200, 8 channels |
 | OS | Debian 13 (kernel 6.12), NVIDIA driver 615.71, CUDA 13.4 |
