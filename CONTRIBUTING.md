@@ -31,8 +31,9 @@ upstream first; Speedy carries them until they are merged there. Please follow t
    - **Bitwise:** an exact token and logprob comparison within the same engine launch.
    - **Otherwise:** tolerance gate v2 (token-level against the control at 60K and 120K) and the coding gate (8 delegation tasks plus 4 real-repository bug fixes).
    - **Changes to KV, attention or long context:** also the needle test (90K to 1M).
-4. **Numbers in the PR**, filled into the template: hardware, pack, preset, arms, runs, and every table before and after.
-5. **Docs in the same PR.** Record the result, including rejections, in [SPEEDY.md](SPEEDY.md),
+4. **Numbers in the PR**, filled into the template: pack, preset, arms, runs, and every table before and after.
+5. **Full hardware listed.** The template's hardware table is mandatory: GPU model, VRAM, power limit and unlock state, PCIe gen/width per GPU, CPU, RAM size/speed/channels, storage, OS, driver and CUDA. Speed numbers mean nothing without it.
+6. **Docs in the same PR.** Record the result, including rejections, in [SPEEDY.md](SPEEDY.md),
    [CHANGELOG.md](CHANGELOG.md) and [docs/TUNING-HISTORY.md](docs/TUNING-HISTORY.md). A new default also updates
    `src/program/speedy_defaults.hpp` (with `speedy_defaults_test`), the presets in `configs/`, and
    [docs/SPEEDY_DEFAULTS.md](docs/SPEEDY_DEFAULTS.md).
