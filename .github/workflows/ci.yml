@@ -24,8 +24,9 @@ jobs:
       - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_TESTS=ON
       - run: cmake --build build -j 4
       # tests that need a GPU or a model file are not built or skip in a CPU-only build.
+      # Serial (-j 1): expert_parity and pool_test read the pack a fixture test writes, and stage_pool_test is timing-sensitive.
       # isa_guard_check is excluded: an upstream lint that flags two unlisted AVX-512 helpers (docs/BUILD-LINUX.md).
-      - run: ctest --test-dir build -j 4 --output-on-failure -E isa_guard_check
+      - run: ctest --test-dir build -j 1 --output-on-failure -E isa_guard_check
 
   cuda:
     name: CUDA build (manual)
@@ -46,7 +47,7 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
       - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_TESTS=ON
       - run: cmake --build build -j 4 -- -k 0
-      - run: ctest --test-dir build -j 4 --output-on-failure -E isa_guard_check
+      - run: ctest --test-dir build -j 1 --output-on-failure -E isa_guard_check
 
   windows-cuda:
     name: Windows CUDA build (manual)
