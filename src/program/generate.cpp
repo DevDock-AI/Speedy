@@ -32,6 +32,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
+#include "strata/core/auto_cache.hpp"
 #include "strata/core/ple_residency.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -7034,7 +7035,16 @@ int main(int argc, char** argv) {
 #endif
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
         const int64_t blob = (int64_t) nibble_max_slot_bytes();   // max_blob (STRATA_EXPERT_NIBBLE: or a larger 4-bit slot)
-        int64_t slots = ((int64_t) free_b - reserve) / blob;
+        // #496: the least a working cache needs (the verify window cannot start without one, #174): a cache too small to lend the prompt path a
+        // 256-token chunk's buffers (plus the 128 slots a loan leaves; one slot without --prefill) makes it allocate its own on top
+        const int64_t min_slots = (o.prefill_chunk > 0 && pf_borrow)
+            ? ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, 256) + blob - 1) / blob + 128 : 1;
+        // upstream #4474 (cfa197e2): what the load allocates after the cache that no setting prices (cuBLAS and the lazily loaded modules the
+        // prompt path and the verifier warm up, ~245 MiB measured) came out of the reserve.  The cache now leaves it too.  Not on a card that
+        // could not keep min_slots after it, and not under STRATA_DEFAULTS=026.  Single-device sizing only (a layer split prices its stages itself).
+        const strata::core::AutoCacheSlots auto_slots = strata::core::auto_cache_slots(
+            (int64_t) free_b, reserve, blob, min_slots, strata::qwen_defaults_026() ? 0 : strata::core::kLateAllocMib);
+        int64_t slots = auto_slots.slots;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
 #if defined(STRATA_GPU_METAL)
         // Metal: the decode window reads its experts from its own arena (metal/src/engine/window.cpp), and the device copies the shared host
@@ -7051,8 +7061,9 @@ int main(int argc, char** argv) {
 #endif
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
-                             "draft head) -> %d slots\n",
-                     (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20), o.expert_cache);
+                             "draft head%s) -> %d slots\n",
+                     (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20),
+                     auto_slots.late_priced ? ", +256 MiB for what is allocated after the cache" : "", o.expert_cache);
 #if defined(STRATA_USE_HIP) && !defined(_WIN32)
         // An APU's "VRAM" is system RAM: the device-free figure above counts the whole GPU-addressable pool and does not
         // subtract ordinary CPU allocations (the host expert arena), so a cache sized from it alone can ask the OOM killer
@@ -7084,8 +7095,6 @@ int main(int argc, char** argv) {
         // stops, saying what is short and what makes room.  A card the default reserve leaves that much is sized as
         // before.
         constexpr int kSmallReserveMib = 300;
-        const int64_t min_slots = (o.prefill_chunk > 0 && pf_borrow)
-            ? ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, 256) + blob - 1) / blob + 128 : 1;
         if (o.expert_cache < min_slots && !o.vram_reserve_given && o.vram_reserve_mib > kSmallReserveMib) {
             // the largest reserve (in MiB) that still leaves min_slots
             const int64_t fit_mib = ((int64_t) free_b - mtp_bind - pipe_first - min_slots * blob) / (1 << 20) - prefill_mib;
