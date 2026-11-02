@@ -83,6 +83,14 @@ class BundleImports(unittest.TestCase):
         env = {**os.environ, "STRATA_CONTROL_INSTALL": "1", "PYTHONNOUSERSITE": "1"}
         for key in ("PYTHONPATH", "PYTHONHOME"):
             env.pop(key, None)
+        # mtp_pack / mtp_rt / q8_dense_gguf import llama.cpp's gguf-py when imported (setup.py downloads it; a dev tree or
+        # STRATA_GGUF_PY has it). Find it the way the tools do and hand it to the bundle explicitly, so the result does not
+        # depend on where the staged bundle happens to sit; a computer with no gguf-py at all cannot run this check.
+        found = subprocess.run([sys.executable, "-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import _paths; print(_paths.gguf_py())",
+                                str(ROOT / "tools")], env=env, capture_output=True, text=True, timeout=60)
+        if found.returncode != 0:
+            self.skipTest("llama.cpp's gguf-py is not on this computer (run setup.py once, or set STRATA_GGUF_PY)")
+        env["STRATA_GGUF_PY"] = found.stdout.strip().splitlines()[-1]
         done = subprocess.run([sys.executable, "-I", "-c", code], cwd=str(self.root.parent), env=env,
                               capture_output=True, text=True, timeout=120)
         self.assertEqual(done.returncode, 0, (done.stdout or "") + (done.stderr or "")[-1500:])

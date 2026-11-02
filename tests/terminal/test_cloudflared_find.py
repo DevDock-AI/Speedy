@@ -46,7 +46,12 @@ class FindOnPath(unittest.TestCase):
         (self.dir / ".local" / "bin").mkdir(parents=True)
         exe = fake_cloudflared(self.dir / ".local" / "bin")
         with self.env(PATH=str(self.dir / "empty")), mock.patch.object(Path, "home", return_value=self.dir):
-            self.assertEqual(access.find_cloudflared(), str(exe))
+            places = access._cloudflared_places()
+            self.assertIn(str(exe), places)
+            # a system copy on this computer (/usr/bin/cloudflared) would be found first: look only in the test's folders
+            mine = [p for p in places if str(self.dir) in p]
+            with mock.patch.object(access, "_cloudflared_places", return_value=mine):
+                self.assertEqual(access.find_cloudflared(), str(exe))
 
     def test_a_too_old_copy_is_passed_over(self):
         (self.dir / "bin").mkdir()

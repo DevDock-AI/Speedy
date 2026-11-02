@@ -336,11 +336,13 @@ class FolderStep(Base):
             self.assertIn("Not downloaded yet: about 90 GB", t)
             self.assertIn("Free space in that folder's drive", t)
             f = app.screen.query_one("#folderpath")
-            f.value = ""
-            await typed(pilot, str(self.home.base / "Strata-data"))
+            # <install>/../Strata-data is the default data folder (kept as None), so the change is to another folder
             self.assertEqual(f.value, str(self.home.base / "Strata-data"))
+            f.value = ""
+            await typed(pilot, str(self.home.base / "Models-elsewhere"))
+            self.assertEqual(f.value, str(self.home.base / "Models-elsewhere"))
             await press(pilot, "enter")
-            self.assertEqual(ctx.settings.data_dir, str(self.home.base / "Strata-data"))
+            self.assertEqual(ctx.settings.data_dir, str(self.home.base / "Models-elsewhere"))
             self.assertIn("How much text should it remember at once?", text_of(app))
         self.run_app(case)
 
@@ -701,9 +703,10 @@ class AccessStep(Base):
                 self.assertIn("cloudflared is not installed on this computer", t)
                 self.assertIn("quick tunnel", flat(app))
                 await press(pilot, "enter")
+                # still without the helper (a cloudflared installed on this computer must not hide the warning)
+                self.assertTrue(any("cloudflared" in w for w in ctx.warnings()))
             self.assertEqual(ctx.settings.access, "cloudflare")
             self.assertIn("Save as preset, then launch", text_of(app))
-            self.assertTrue(any("cloudflared" in w for w in ctx.warnings()))
         self.run_app(case)
 
     def test_tailscale_found(self):

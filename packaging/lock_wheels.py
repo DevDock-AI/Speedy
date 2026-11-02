@@ -90,6 +90,23 @@ def _dropped_for_target(target: str) -> set[str]:
     return dropped - kept
 
 
+def _host_skipped_for_target(target: str) -> list:
+    """Direct requirements whose marker is true for the target but false on the host pip runs on."""
+    from packaging.requirements import Requirement
+    env = {"python_version": PYTHON, "python_full_version": PYTHON + ".15", "implementation_name": "cpython",
+           "platform_python_implementation": "CPython", **TARGETS[target]["env"]}
+    out = []
+    for name in INPUTS:
+        for line in (ROOT / name).read_text(encoding="utf-8").splitlines():
+            line = line.split(" #")[0].strip()
+            if not line or line.startswith("#"):
+                continue
+            req = Requirement(line)
+            if req.marker is not None and req.marker.evaluate(env) and not req.marker.evaluate():
+                out.append(req)
+    return out
+
+
 def build_lock(target: str) -> str:
     spec = TARGETS[target]
     with tempfile.TemporaryDirectory(prefix="strata-lock-") as tmp:
@@ -100,6 +117,12 @@ def build_lock(target: str) -> str:
         for name in INPUTS:
             cmd += ["-r", str(ROOT / name)]
         subprocess.run(cmd, check=True)
+        # pip skipped the target's marker-gated requirements that are false on this host (colorama on Linux for the
+        # Windows lock): fetch those pins for the target explicitly
+        extra = [str(r) for r in _host_skipped_for_target(target)]
+        if extra:
+            subprocess.run(cmd[:cmd.index("-d")] + ["--no-deps", "-d", tmp] + cmd[cmd.index("-d") + 2:cmd.index("-r")]
+                           + [e.split(";")[0].strip() for e in extra], check=True)
         wheels: dict[str, tuple[str, list[str]]] = {}
         for whl in sorted(Path(tmp).glob("*.whl")):
             name, version = whl.name.split("-")[:2]

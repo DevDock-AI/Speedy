@@ -221,7 +221,11 @@ class Document(unittest.TestCase):
 
 class Publishing(unittest.TestCase):
     """The scripts and the workflow that publish the images (docker/publish.sh, docker/fetch-engines.py, .github/workflows/docker-images.yml)."""
-    WORKFLOW = ROOT / ".github" / "workflows" / "docker-images.yml"
+    # Speedy does not run Strata's image workflow; the reference copy lives in docs/upstream/github/ (it moves back to
+    # .github/ when the images are published again), and it must still be a safe, manual-only workflow either way.
+    WORKFLOW = next((p for p in (ROOT / ".github" / "workflows" / "docker-images.yml",
+                                 ROOT / "docs" / "upstream" / "github" / "workflows" / "docker-images.yml") if p.exists()),
+                    ROOT / ".github" / "workflows" / "docker-images.yml")
 
     @unittest.skipIf(SH is None, "needs sh")
     def test_publish_script_parses_and_defaults_to_not_pushing(self):
