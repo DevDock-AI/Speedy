@@ -86,7 +86,8 @@
     "CUDA_VISIBLE_DEVICES": "<GPU1_UUID>,<GPU2_UUID>",
     "STRATA_PREFILL_HELP": "1",
     "STRATA_PIPELINE_PENALTIES": "1",
-    "STRATA_KV_STAGE_REQ": "131072"
+    "STRATA_KV_STAGE_REQ": "131072",
+    "STRATA_GDN_TC": "0"
   },
   "reasoning_budget_tokens": 16384,
   "reasoning_close_retry": true,

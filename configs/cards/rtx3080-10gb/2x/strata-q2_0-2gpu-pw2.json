@@ -77,7 +77,9 @@
     "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
     "CUDA_VISIBLE_DEVICES": "<GPU1_UUID>,<GPU2_UUID>",
     "STRATA_PREFILL_HELP": "1",
-    "STRATA_PIPELINE_PENALTIES": "1"
+    "STRATA_PIPELINE_PENALTIES": "1",
+    "STRATA_GDN_TC": "1",
+    "STRATA_GDN_CONVL2": "2"
   },
   "reasoning_budget_tokens": 8192,
   "reasoning_close_retry": true,
