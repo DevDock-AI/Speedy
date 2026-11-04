@@ -16663,7 +16663,7 @@ int main(int argc, char** argv) {
                             if ((int64_t) consumed.size() != A.p)   // T3: the history prefix is the committed prefix
                                 return die("pipelined penalties: consumed " + std::to_string(consumed.size()) +
                                            " != window position " + std::to_string(A.p));
-                            strata::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), A.tok, A.T, hist_n,
+                            strata::kernels::penalty_rows(consumed.data() + pen_gen0, (int64_t) (consumed.size() - pen_gen0), A.tok, A.T, hist_n,
                                                           hist_stage.data());
                             const strata::core::OnDevice on_h(hist_dev);
                             if (!V1(A).pl_set_history_rows(hist_stage.data(), A.T, err)) return die(err);
