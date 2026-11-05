@@ -4527,7 +4527,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (m.rflag_m == nullptr && !r_coherent_alloc((void**) &m.rflag_m, 64)) { (void) cudaGetLastError(); m.rflag_m = nullptr; }
                     if (m.rflag_m != nullptr && r_coherent_alloc((void**) &m.rsum_m, tn * sizeof(float))) m.rsum_m_n = tn;
                     else { (void) cudaGetLastError(); m.rsum_m = nullptr; }
-                    if (m.rflag_m) { __atomic_store_n(m.rflag_m, 0u, __ATOMIC_RELEASE); m.rseq = 0; }
+                    if (m.rflag_m) { std::atomic_ref<uint32_t>(*m.rflag_m).store(0u, std::memory_order_release); m.rseq = 0; }
                 }
                 if (cpu_on && m.rsum_dev_n < tn) {
                     if (m.rsum_dev) cudaFree(m.rsum_dev);
@@ -4645,7 +4645,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             uint32_t* const flag = as ? m.rflag_m : nullptr;
             fut = std::async(std::launch::async, [this, &m, cpu, cblob, l, T, tk, tn, out_sum, flag, seq_v, lay_ = &lay0]() -> bool {
                 // the device waits for the flag: it is raised on every path, the result (false: an error) goes by the future
-                struct Raise { uint32_t* f; uint32_t v; ~Raise() { if (f) { std::atomic_thread_fence(std::memory_order_seq_cst); __atomic_store_n(f, v, __ATOMIC_RELEASE); } } } raise{flag, seq_v};
+                struct Raise { uint32_t* f; uint32_t v; ~Raise() { if (f) { std::atomic_thread_fence(std::memory_order_seq_cst); std::atomic_ref<uint32_t>(*f).store(v, std::memory_order_release); } } } raise{flag, seq_v};
                 try {
                 const auto t0 = std::chrono::steady_clock::now();
                 const strata::kernels::cpu::NativeFmt& cf = lay_->fmt[(size_t) l];
