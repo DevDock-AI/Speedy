@@ -133,6 +133,9 @@ void swiglu_scaled(const float* gu, float* h, int64_t rows, int64_t n_ff, const 
 /// sd[r] = the s_down of row r's expert (group-local bounds): the combine applies it as it reads the row.
 void down_row_scales(float* sd, const int32_t* bounds, int n, const float* tails, int64_t nrows, void* stream);
 
+/// Opt-in fused activation; disabled path retains the two original launches.
+void swiglu_quantize(const float* gu, float* h, void* hq, int type, int64_t rows, int64_t cols, bool interleaved, void* stream);
+
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);
 
