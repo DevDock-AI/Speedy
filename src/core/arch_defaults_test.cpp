@@ -421,5 +421,88 @@ int main() {
         CHECK(!prefill_layer_major_resolve(nullptr, false, 2, true));
         CHECK(!prefill_layer_major_resolve(nullptr, true, 2));
     }
+
+    // ---- R17 arch gate: the decode peer tier (sm120_series.hpp peer_tier_decide)
+    {
+        using namespace strata;
+        const double G = 1073741824.0;
+        struct Row { const char* name; PeerTierCard c[3]; int n; bool hip, v026, up, perf; const char* env; bool ls, pd; int emu; bool on, dry, autol; PeerTierWhy why; };
+        const PeerTierCard c5080{12, 0, 84, 15.9 * G}, c5090{12, 0, 170, 31.4 * G}, c5070{12, 0, 48, 11.9 * G}, c3080{8, 6, 68, 9.8 * G},
+                           c5070ti{12, 0, 70, 15.9 * G}, c5060ti{12, 0, 36, 15.6 * G}, pro6k{12, 0, 188, 95.0 * G}, c4090{8, 9, 128, 23.6 * G};
+        const Row rows[] = {
+            {"2x 5080",               {c5080, c5080}, 2,          false, false, false, true, nullptr, false, false, 0,   true,  true,  false, PeerTierWhy::rule_on},
+            {"3x 5080",               {c5080, c5080, c5080}, 3,   false, false, false, true, nullptr, false, false, 0,   true,  true,  false, PeerTierWhy::rule_on},
+            {"2x 5090",               {c5090, c5090}, 2,          false, false, false, true, nullptr, false, false, 0,   true,  true,  false, PeerTierWhy::rule_on},
+            {"1x 5080",               {c5080}, 1,                 false, false, false, true, nullptr, false, false, 0,   false, false, false, PeerTierWhy::one_card},
+            {"2x 3080 (ours)",        {c3080, c3080}, 2,          false, false, false, true, nullptr, false, false, 0,   false, false, false, PeerTierWhy::not_sm120},
+            {"2x 4090",               {c4090, c4090}, 2,          false, false, false, true, nullptr, false, false, 0,   false, false, false, PeerTierWhy::not_sm120},
+            {"5080 + 3080",           {c5080, c3080}, 2,          false, false, false, true, nullptr, false, false, 0,   false, false, false, PeerTierWhy::not_sm120},
+            {"2x 5070 12 GB",         {c5070, c5070}, 2,          false, false, false, true, nullptr, false, false, 0,   false, false, false, PeerTierWhy::small},
+            {"5080 + 5090 unlike",    {c5080, c5090}, 2,          false, false, false, true, nullptr, false, false, 0,   false, false, false, PeerTierWhy::unlike},
+            {"5080 + 5070Ti SMs",     {c5080, c5070ti}, 2,        false, false, false, true, nullptr, false, false, 0,   false, false, false, PeerTierWhy::unlike},
+            {"5070Ti + 5060Ti",       {c5070ti, c5060ti}, 2,      false, false, false, true, nullptr, false, false, 0,   false, false, false, PeerTierWhy::unlike},
+            {"2x PRO 6000",           {pro6k, pro6k}, 2,          false, false, false, true, nullptr, false, false, 0,   true,  true,  false, PeerTierWhy::rule_on},
+            {"HIP gfx1201 as 12.0",   {c5080, c5080}, 2,          true,  false, false, true, nullptr, false, false, 0,   false, false, false, PeerTierWhy::hip},
+            {"026",                   {c5080, c5080}, 2,          false, true,  false, true, nullptr, false, false, 0,   false, false, false, PeerTierWhy::v026},
+            {"upstream defaults",     {c5080, c5080}, 2,          false, false, true,  true, nullptr, false, false, 0,   false, false, false, PeerTierWhy::upstream},
+            {"SM120_PERF=0",          {c5080, c5080}, 2,          false, false, false, false, nullptr, false, false, 0,  false, false, false, PeerTierWhy::sm120_off},
+            {"env 0 on 5080s",        {c5080, c5080}, 2,          false, false, false, true, "0",     false, false, 0,   false, false, false, PeerTierWhy::env_off},
+            {"env 1 on 3080s",        {c3080, c3080}, 2,          false, false, false, true, "1",     false, false, 0,   true,  false, true,  PeerTierWhy::env_on},
+            {"env 1 + --peer-device", {c3080, c3080}, 2,          false, false, false, true, "1",     false, true,  0,   true,  false, false, PeerTierWhy::env_on},
+            {"env 1 + --layer-split", {c3080, c3080}, 2,          false, false, false, true, "1",     true,  false, 0,   false, false, false, PeerTierWhy::user_layout},
+            {"env 1 beats 026/HIP",   {c3080, c3080}, 2,          true,  true,  true,  false, "1",    false, false, 0,   true,  false, true,  PeerTierWhy::env_on},
+            {"env empty = unset",     {c3080, c3080}, 2,          false, false, false, true, "",      false, false, 0,   false, false, false, PeerTierWhy::not_sm120},
+            {"5080s + --layer-split", {c5080, c5080}, 2,          false, false, false, true, nullptr, true,  false, 0,   false, false, false, PeerTierWhy::user_layout},
+            {"5080s + --peer-device", {c5080, c5080}, 2,          false, false, false, true, nullptr, false, true,  0,   false, false, false, PeerTierWhy::user_layout},
+            {"emu120 on 3080s 9.8G",  {c3080, c3080}, 2,          false, false, false, true, nullptr, false, false, 120, false, true,  false, PeerTierWhy::small},
+            {"emu120 on 16G sm_86",   {{8, 6, 48, 15.7 * G}, {8, 6, 48, 15.7 * G}}, 2, false, false, false, true, nullptr, false, false, 120, true, true, false, PeerTierWhy::rule_on},
+            {"emu120 + env 1",        {c3080, c3080}, 2,          false, false, false, true, "1",     false, false, 120, true,  false, true,  PeerTierWhy::env_on},
+            {"emu86 is not a dry run",{c5080, c5080}, 2,          false, false, false, true, nullptr, false, false, 86,  true,  true,  false, PeerTierWhy::rule_on},
+        };
+        for (const Row& r : rows) {
+            PeerTierInput in;
+            in.cards = r.c; in.n = r.n; in.hip = r.hip; in.v026 = r.v026; in.upstream = r.up; in.sm120_perf = r.perf; in.env = r.env;
+            in.user_layer_split = r.ls; in.user_peer_device = r.pd; in.emulate_cc = r.emu;
+            const PeerTierDecision d = peer_tier_decide(in);
+            if (d.on != r.on || d.dry_run != r.dry || d.auto_layout != r.autol || d.why != r.why) {
+                std::printf("FAIL peer tier row '%s': on %d dry %d auto %d why %s\n", r.name, d.on, d.dry_run, d.auto_layout, peer_tier_why_text(d.why));
+                ++fails;
+            }
+        }
+        {   // B1: the rule acts only with STRATA_PEER_TIER2_AUTO=1 (rule_acts); without it 2x 5080 is a logged-only decision
+            PeerTierCard c2[2] = {c5080, c5080};
+            PeerTierInput in; in.cards = c2; in.n = 2;
+            PeerTierDecision d = peer_tier_decide(in);
+            CHECK(d.on && d.dry_run && d.pending_ab && !d.auto_layout && d.why == PeerTierWhy::rule_on);
+            in.rule_acts = true; d = peer_tier_decide(in);
+            CHECK(d.on && !d.dry_run && !d.pending_ab && d.auto_layout && d.why == PeerTierWhy::rule_on);
+            in.user_peer_device = true; d = peer_tier_decide(in);
+            CHECK(!d.on && d.why == PeerTierWhy::user_layout);
+            PeerTierCard c3[2] = {c3080, c3080}; in.cards = c3; in.user_peer_device = false; d = peer_tier_decide(in);
+            CHECK(!d.on && d.why == PeerTierWhy::not_sm120);   // the opt-in does not widen the rule
+        }
+        // transport: P2P only with access + a readback that moved data + the opt-in
+        CHECK(peer_tier_transport(true, true, true) == 1);
+        CHECK(peer_tier_transport(true, false, true) == 0);    // #2666 host bridge: access says yes, data does not arrive
+        CHECK(peer_tier_transport(false, true, true) == 0);
+        CHECK(peer_tier_transport(true, true, false) == 0);
+        // the log line
+        PeerTierCard cc2[2] = {c5080, c5080};
+        PeerTierInput in; in.cards = cc2; in.n = 2;
+        std::string l = peer_tier_log_line(peer_tier_decide(in), 2, 120, 15.9, "mapped-host", false);
+        CHECK(l.find("peer tier WOULD be ON by default") != std::string::npos && l.find("A/B pending") != std::string::npos
+              && l.find("sm_120 x2") != std::string::npos);
+        in.rule_acts = true;
+        l = peer_tier_log_line(peer_tier_decide(in), 2, 120, 15.9, "mapped-host", false);
+        CHECK(l.find("peer tier ON by default") != std::string::npos && l.find("STRATA_PEER_TIER2=0 turns it off") != std::string::npos);
+        in.rule_acts = false;
+        PeerTierCard c86[2] = {c3080, c3080}; in.cards = c86;
+        l = peer_tier_log_line(peer_tier_decide(in), 2, 86, 9.8, "mapped-host", true);
+        CHECK(l.find("peer tier off: not every card is sm_120") != std::string::npos && l.find("STRATA_PEER_TIER2=1 forces it") != std::string::npos);
+        PeerTierCard c16[2] = {{8, 6, 48, 15.7 * G}, {8, 6, 48, 15.7 * G}}; in.cards = c16; in.emulate_cc = 120;
+        l = peer_tier_log_line(peer_tier_decide(in), 2, 86, 15.7, "mapped-host", true);
+        CHECK(l.find("ON by default") != std::string::npos && l.find("dry run") != std::string::npos && l.find("sm_120") != std::string::npos);
+    }
+    std::printf(fails ? "arch_defaults_test (all): %d FAILED\n" : "arch_defaults_test (all): OK\n", fails);
     return fails ? 1 : 0;
 }

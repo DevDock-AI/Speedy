@@ -45,6 +45,18 @@ jobs:
       - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_MMQ_TQ_OVERLAY=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_Q6K_EXPERTS=ON
       - run: cmake --build build --target strata -j 4
 
+  cuda-sm120:
+    name: CUDA sm_120 compile-only (manual; the RTX 50 peer tier / arch gate path, no GPU)
+    if: github.event_name == 'workflow_dispatch' && inputs.cuda
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update && apt-get install -y cmake ninja-build git python3
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_MMQ_TQ_OVERLAY=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_BUILD_TESTS=ON
+      - run: cmake --build build --target strata arch_defaults_test -j 4
+      - run: ./build/arch_defaults_test
+
   windows-cpu:
     name: Windows CPU build + CPU tests
     runs-on: windows-2022

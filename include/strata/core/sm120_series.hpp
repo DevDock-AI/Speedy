@@ -23,7 +23,9 @@
 
 #include "strata/core/emulate.hpp"
 
+#include <cstdio>
 #include <cstdlib>
+#include <string>
 
 namespace strata {
 
@@ -111,6 +113,132 @@ inline bool prefill_layer_major_default(bool hip, int stages, bool v026 = false)
 inline bool prefill_layer_major_resolve(const char* env, bool hip, int stages, bool v026 = false) {
     if (env != nullptr && env[0] != '\0') return std::atoi(env) != 0;
     return prefill_layer_major_default(hip, stages, v026);
+}
+
+
+// ---- R17 arch gate (PLAN-PEER-EXPERT-TIER §17): the decode peer expert tier (STRATA_PEER_TIER2)
+// A pure rule (no device calls; the engine reads the cards and calls it; table in arch_defaults_test).  Default ON only for:
+//   CUDA build, not STRATA_DEFAULTS=026 / STRATA_UPSTREAM_DEFAULTS=1, STRATA_SM120_PERF not 0, n >= 2 cards, every card compute
+//   capability 12.0, the cards alike (same CC, multiProcessorCount and VRAM within 10 % of the largest), every card >= 15 GiB.
+// STRATA_PEER_TIER2=1 / =0 wins both ways on any card.  A layout given by hand (--layer-split, --peer-device) wins over the rule:
+// no auto switch (an explicit STRATA_PEER_TIER2=1 still turns the tier on with --peer-device).  STRATA_EMULATE_CC=120 makes the
+// rule see 12.0 cards for a DRY RUN only: it decides and logs, the engine never acts on it (sm_120 kernels are not dispatched).
+// R17 review B1: the rule ships as a LOG ONLY until an outside 50xx A/B lands.  A rule_on decision is a dry run (decided and
+// logged, never applied) unless STRATA_PEER_TIER2_AUTO=1 (PeerTierInput::rule_acts) lets it act; STRATA_PEER_TIER2=1 still forces it.
+// The transport (P2P or mapped host) never gates the tier: it is picked by peer_tier_transport below.
+constexpr double kPeerTierMinGiB = 15.0;   // 16 GB cards report 15.6 - 16.0 GiB
+constexpr double kPeerTierAlikeTol = 0.10;
+
+enum class PeerTierWhy {
+    env_on, env_off, user_layout, hip, v026, upstream, sm120_off, one_card, not_sm120, unlike, small, rule_on,
+};
+
+struct PeerTierCard {
+    int major = 0, minor = 0;   ///< raw compute capability
+    int sms = 0;                ///< cudaDevAttrMultiProcessorCount
+    double total_bytes = 0;     ///< cudaDeviceProp::totalGlobalMem
+};
+
+struct PeerTierInput {
+    const PeerTierCard* cards = nullptr;
+    int n = 0;
+    bool hip = false, v026 = false, upstream = false;
+    bool sm120_perf = true;            ///< STRATA_SM120_PERF not 0
+    const char* env = nullptr;         ///< STRATA_PEER_TIER2 text (nullptr / "" = unset)
+    bool user_layer_split = false;     ///< --layer-split given
+    bool user_peer_device = false;     ///< --peer-device given
+    int emulate_cc = 0;                ///< STRATA_EMULATE_CC as given (120 = dry run of the rule as if every card were 12.0)
+    bool rule_acts = false;            ///< STRATA_PEER_TIER2_AUTO=1: a rule_on decision is applied (default: logged only, A/B pending)
+};
+
+struct PeerTierDecision {
+    bool on = false;          ///< the tier is on (forced or by the rule)
+    bool dry_run = false;     ///< decided under STRATA_EMULATE_CC=120: log only, the engine must not act
+    bool auto_layout = false; ///< the engine may pick the peer layout itself (rule on, no user layout, not a dry run)
+    bool pending_ab = false;  ///< rule_on but not applied: no STRATA_PEER_TIER2_AUTO=1 (dry_run is set too)
+    PeerTierWhy why = PeerTierWhy::not_sm120;
+};
+
+inline bool peer_tier_alike(const PeerTierCard* c, int n) {
+    if (n < 2) return false;
+    int smax = 0;
+    double vmax = 0;
+    for (int i = 0; i < n; ++i) { smax = c[i].sms > smax ? c[i].sms : smax; vmax = c[i].total_bytes > vmax ? c[i].total_bytes : vmax; }
+    if (smax <= 0 || vmax <= 0) return false;
+    for (int i = 0; i < n; ++i) {
+        if (c[i].major != c[0].major || c[i].minor != c[0].minor) return false;
+        if (c[i].sms < (1.0 - kPeerTierAlikeTol) * smax || c[i].total_bytes < (1.0 - kPeerTierAlikeTol) * vmax) return false;
+    }
+    return true;
+}
+
+inline PeerTierDecision peer_tier_decide(const PeerTierInput& in) {
+    PeerTierDecision d;
+    d.dry_run = in.emulate_cc == 120;
+    auto out = [&](bool on, PeerTierWhy w) { d.on = on; d.why = w; d.auto_layout = on && w == PeerTierWhy::rule_on && !d.dry_run; return d; };
+    if (in.env != nullptr && in.env[0] != '\0') {
+        if (std::atoi(in.env) != 0) {
+            if (in.user_layer_split) return out(false, PeerTierWhy::user_layout);   // a layer split by hand: the tier has no card
+            d.dry_run = false;   // an explicit opt-in acts on any card (the tier's kernels are generic CUDA)
+            d.auto_layout = !in.user_peer_device;
+            d.on = true; d.why = PeerTierWhy::env_on;
+            return d;
+        }
+        d.dry_run = false;
+        return out(false, PeerTierWhy::env_off);
+    }
+    if (in.user_layer_split || in.user_peer_device) return out(false, PeerTierWhy::user_layout);
+    if (in.hip) return out(false, PeerTierWhy::hip);
+    if (in.v026) return out(false, PeerTierWhy::v026);
+    if (in.upstream) return out(false, PeerTierWhy::upstream);
+    if (in.n < 2 || in.cards == nullptr) return out(false, PeerTierWhy::one_card);
+    for (int i = 0; i < in.n; ++i) {
+        const bool s120 = d.dry_run || (in.cards[i].major == 12 && in.cards[i].minor == 0);
+        if (!s120) return out(false, PeerTierWhy::not_sm120);
+    }
+    if (!in.sm120_perf) return out(false, PeerTierWhy::sm120_off);
+    if (!peer_tier_alike(in.cards, in.n)) return out(false, PeerTierWhy::unlike);
+    for (int i = 0; i < in.n; ++i)
+        if (in.cards[i].total_bytes / 1073741824.0 < kPeerTierMinGiB) return out(false, PeerTierWhy::small);
+    if (!d.dry_run && !in.rule_acts) { d.dry_run = true; d.pending_ab = true; }   // B1: log only until the 50xx A/B
+    return out(true, PeerTierWhy::rule_on);
+}
+
+/// The transport of the peer rows: 0 mapped host, 1 P2P.  P2P only when the pair has peer access both ways AND the readback test moved
+/// real data (p2p_copies_data, #2666) AND the user asked for P2P rows (STRATA_PEER_P2P_ROWS=1); otherwise mapped host (always works).
+inline int peer_tier_transport(bool can_access, bool readback_ok, bool rows_env) { return can_access && readback_ok && rows_env ? 1 : 0; }
+
+inline const char* peer_tier_why_text(PeerTierWhy w) {
+    switch (w) {
+        case PeerTierWhy::env_on: return "STRATA_PEER_TIER2=1";
+        case PeerTierWhy::env_off: return "STRATA_PEER_TIER2=0";
+        case PeerTierWhy::user_layout: return "a layout given by hand (--layer-split / --peer-device) wins";
+        case PeerTierWhy::hip: return "HIP build";
+        case PeerTierWhy::v026: return "STRATA_DEFAULTS=026";
+        case PeerTierWhy::upstream: return "STRATA_UPSTREAM_DEFAULTS=1";
+        case PeerTierWhy::sm120_off: return "STRATA_SM120_PERF=0";
+        case PeerTierWhy::one_card: return "one GPU";
+        case PeerTierWhy::not_sm120: return "not every card is sm_120 (measured no gain on 2x RTX 3080 sm_86)";
+        case PeerTierWhy::unlike: return "the cards are not alike (CC, SM count, VRAM within 10%)";
+        case PeerTierWhy::small: return "a card has less than 15 GiB";
+        case PeerTierWhy::rule_on: return "sm_120 alike cards >= 15 GiB";
+    }
+    return "?";
+}
+
+/// The one log line.  `transport`: "mapped-host" / "P2P"; `p2p`: whether the pair has working P2P (readback); `cc`: 10 * major + minor of card 0.
+inline std::string peer_tier_log_line(const PeerTierDecision& d, int n, int cc, double gib0, const char* transport, bool p2p) {
+    char b[512];
+    if (d.on)
+        std::snprintf(b, sizeof b, "speedy: peer tier %s%s (%s; sm_%d x%d, %.1f GiB each, transport %s, P2P %s)%s; STRATA_PEER_TIER2=0 turns it off",
+                      d.pending_ab ? "WOULD be ON" : "ON", d.why == PeerTierWhy::rule_on ? " by default" : "",
+                      peer_tier_why_text(d.why), d.dry_run && !d.pending_ab ? 120 : cc, n, gib0, transport, p2p ? "yes" : "no",
+                      d.pending_ab ? " [A/B pending: logged only, not applied; STRATA_PEER_TIER2_AUTO=1 or STRATA_PEER_TIER2=1 applies it]"
+                      : d.dry_run ? " [STRATA_EMULATE_CC=120 dry run: decided and logged only, not applied]" : "");
+    else
+        std::snprintf(b, sizeof b, "speedy: peer tier off: %s (sm_%d x%d)%s; STRATA_PEER_TIER2=1 forces it", peer_tier_why_text(d.why),
+                      d.dry_run ? 120 : cc, n, d.dry_run ? " [STRATA_EMULATE_CC=120 dry run]" : "");
+    return b;
 }
 
 }  // namespace strata

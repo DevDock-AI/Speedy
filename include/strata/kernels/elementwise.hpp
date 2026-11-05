@@ -112,6 +112,10 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
 /// wait_flag_ge launch it replaces is one dependent kernel node, ~2.4 us on a gfx1201 graph).
 void copy_rows_from_mapped_after(const uint32_t* flag, uint32_t value, float* dst, const float* src, int64_t rows,
                                  int64_t width, const int32_t* hit_rows, const int32_t* count, void* stream);
+/// R17 1a (STRATA_PEER_P2P_ROWS): copy_rows_from_mapped(_after when flag != null) where a row whose first 4 floats carry
+/// kP2PRowSentinel (peer_experts.hpp) is read from `p2p` (the device-0 mirror the peer GPU stored it into) instead.
+void copy_rows_from_mapped_p2p(const uint32_t* flag, uint32_t value, float* dst, const float* src, const float* p2p, int64_t rows,
+                               int64_t width, const int32_t* hit_rows, const int32_t* count, void* stream);
 
 /// Plan v0.3 P3: the doorbell's payload and its ring in ONE kernel.  Copies `x` (n floats), `ids` and `weights`
 /// (k each) into the mapped host regions, fences, and increments the mapped sequence number - replacing three

@@ -237,7 +237,8 @@ __global__ void copy_from_mapped_kernel(float4* __restrict__ dst, const volatile
 // pool writes +0.0 into those, so this writes +0.0 too): block = row, the plan's hit rows `dst[0, *count)`.
 __global__ void copy_rows_from_mapped_kernel(float4* __restrict__ dst, const volatile float4* src, int64_t row4,
                                              const int32_t* __restrict__ hit_rows, const int32_t* __restrict__ count,
-                                             const volatile uint32_t* wait_flag = nullptr, uint32_t wait_value = 0) {
+                                             const volatile uint32_t* wait_flag = nullptr, uint32_t wait_value = 0,
+                                             const volatile float4* p2p = nullptr) {
     const int row = blockIdx.x;
     __shared__ int hit;
     if (threadIdx.x == 0) {
@@ -248,12 +249,20 @@ __global__ void copy_rows_from_mapped_kernel(float4* __restrict__ dst, const vol
         int h = 0;
         const int c = *count;
         for (int i = 0; i < c; ++i) h |= hit_rows[i] == row;
+        if (!h && p2p != nullptr) {   // R17 1a: a peer row sent by P2P carries the sentinel in the mapped row: read the device-0 mirror
+            const volatile uint32_t* m = (const volatile uint32_t*) (src + (int64_t) row * row4);
+            if (m[0] == 0x7fbadbadu && m[1] == 0x7fbadbadu && m[2] == 0x7fbadbadu && m[3] == 0x7fbadbadu) h = 2;
+            __threadfence_system();
+        }
         hit = h;
     }
     __syncthreads();
     float4* d = dst + (int64_t) row * row4;
-    if (hit) {
+    if (hit == 1) {
         for (int64_t i = threadIdx.x; i < row4; i += blockDim.x) d[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    } else if (hit == 2) {
+        const volatile float4* sr = p2p + (int64_t) row * row4;
+        for (int64_t i = threadIdx.x; i < row4; i += blockDim.x) d[i] = const_cast<const float4*>(sr)[i];
     } else {
         const volatile float4* sr = src + (int64_t) row * row4;
         for (int64_t i = threadIdx.x; i < row4; i += blockDim.x) d[i] = const_cast<const float4*>(sr)[i];
@@ -295,6 +304,17 @@ void copy_rows_from_mapped_after(const uint32_t* flag, uint32_t value, float* ds
     }
     copy_rows_from_mapped_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>(
         (float4*) dst, (const volatile float4*) src, width / 4, hit_rows, count, (const volatile uint32_t*) flag, value);
+}
+void copy_rows_from_mapped_p2p(const uint32_t* flag, uint32_t value, float* dst, const float* src, const float* p2p, int64_t rows,
+                               int64_t width, const int32_t* hit_rows, const int32_t* count, void* stream) {
+    if (rows <= 0) return;
+    if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0 || ((uintptr_t) p2p & 15) != 0) {
+        std::fprintf(stderr, "copy_rows_from_mapped_p2p: width must be a multiple of 4 and the pointers 16-byte aligned\n");
+        std::exit(1);
+    }
+    copy_rows_from_mapped_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>(
+        (float4*) dst, (const volatile float4*) src, width / 4, hit_rows, count, (const volatile uint32_t*) flag, value,
+        (const volatile float4*) p2p);
 }
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     if (n <= 0) return;

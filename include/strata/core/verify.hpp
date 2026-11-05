@@ -69,6 +69,10 @@ using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, i
 
 struct VerifyHits {
     const int32_t* d_res = nullptr;      ///< device [n_layers * n_expert] slot or -1
+    /// R17 P1 (STRATA_PEER_TIER2=1): ROUTING eligibility, the union of the tiers (>= 0: some GPU holds it), read only by the
+    /// residency-biased router (route prior / STRATA_ROUTE_RESIDENT).  The plan, the doorbell skip and the hit path keep `d_res`
+    /// (THIS card's physical slots).  null = d_res (no tier).
+    const int32_t* d_route_res = nullptr;
     const int32_t* h_res = nullptr;      ///< host [n_layers * n_expert] slot or -1 (when all >= 0 in stage: zero-doorbell)
     const uint8_t* cache_base = nullptr; ///< slot 0 of the VRAM expert arena
     const uint64_t* slot_off = nullptr;   ///< E-6: host per-slot offsets when slots differ in size (null: slot * blob)
@@ -684,6 +688,7 @@ private:
     std::function<bool(cudaStream_t, std::string&)> pre_launch_;   // set_pre_launch
     int groups_[9] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
+    float* p2p_rows_ = nullptr;                                 // R17 1a: device-0 mirror of the CPU rows (STRATA_PEER_P2P_ROWS)
     // STRATA_VERIFY_DEFER_CPU=1 (opt-in, changes the output): a decode window's layer l adds the CPU's expert rows to the
     // residual before layer l+1's FFN-side read instead of waiting for them in its own combine (record_window)
     bool defer_ = false;

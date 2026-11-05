@@ -25,6 +25,7 @@
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/device.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -756,6 +757,9 @@ Verifier::~Verifier() {
         if (e) cudaEventDestroy(e);
     if (arena_) cudaFree(arena_);
     if (hcount_d_) cudaFree(hcount_d_);
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
+    if (p2p_rows_) { strata::core::unregister_p2p_rows(h_ymiss_); cudaFree(p2p_rows_); }
+#endif
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_, h_pflag_};
     for (void* h : hosts)
@@ -927,6 +931,26 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_) &&
               (defer_heavy_ <= 0.0f || mapped(64, (void**) &h_pflag_, (void**) &m_pflag_));
     if (!ok) { err = "verify: mapped staging allocation failed " + strata::core::pin_exhausted_hint(); return false; }
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
+    // R17 1a STRATA_PEER_P2P_ROWS=1: a device-0 mirror of the CPU-row block the peer GPU stores its decode rows into (P2P); only
+    // where the rows are read by copy_rows_from_mapped (dec_batch, no deferral, no device plan) and on the primary device
+    if (strata::core::p2p_rows_requested() && peer_portable() && p2p_rows_ == nullptr) {
+        int cur = -1;
+        cudaGetDevice(&cur);
+        const char* dp = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
+        const char* db = std::getenv("STRATA_DEC_BATCH");
+        const bool rows_path = !defer_ && !(dp != nullptr && std::atoi(dp) != 0) && !(db != nullptr && std::atoi(db) == 0);
+        if (cur == strata::core::primary_device() && rows_path) {
+            const size_t bytes = (size_t) T * K * N * 4;
+            if (cudaMalloc((void**) &p2p_rows_, bytes) == cudaSuccess) {
+                strata::core::register_p2p_rows(h_ymiss_, m_ymiss_, bytes, p2p_rows_);
+            } else { cudaGetLastError(); p2p_rows_ = nullptr; }
+        }
+        if (p2p_rows_ == nullptr)
+            std::fprintf(stderr, "strata verify: STRATA_PEER_P2P_ROWS: this stage keeps the mapped peer rows (%s)\n",
+                         cur != strata::core::primary_device() ? "not the primary GPU" : !rows_path ? "deferral / device plan / STRATA_DEC_BATCH=0" : "no memory");
+    }
+#endif
     // DFlash2 taps: set_taps (the drafter) or STRATA_TAP_FILE (the research dump); off, and nothing is allocated or captured, otherwise
     const char* tap_path = std::getenv("STRATA_TAP_FILE");
     if (tap_path != nullptr && tap_path[0] == '\0') tap_path = nullptr;
@@ -2231,12 +2255,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // discrete CUDA card of 13 GiB or less, off elsewhere (measured on an RTX 3060 12 GB at 2.0: story +37.6%, code +35.2%;
         // on an RTX PRO 5000 72 GB -1.9% / -0.5%, on 2x RTX A4000 -4.2% / +11.0%, hence not a default on bigger cards).
         const float route_prior = g_route_prior();
-        if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
-            route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
-        if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+        const int32_t* route_res = hits_.d_route_res != nullptr ? hits_.d_route_res : hits_.d_res;   // R17 P1: the union, not the slots
+        if (route_prior > 0.0f && NE == 512 && K == 10 && route_res != nullptr)
+            route_prior_top10(logits_ + tb * NE, route_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
+        if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && route_res != nullptr) {
             // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
             try {
-                native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
+                native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, route_res + l * g.n_expert, n,
                                       route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
                                       rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
@@ -2444,6 +2469,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 23, grp);
                 if (remote_opt_)   // #578: the helper's rows come back reduced; skip them as well
                     remote_opt_->copy_rows(parts_out, m_ymiss_ + (size_t) tb * K * N, tb, n, p_dst, p_counts + 1, cs);
+#if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
+                else if (p2p_rows_ != nullptr && dec_batch)   // R17 1a: the peer's P2P rows from the device-0 mirror, the rest mapped
+                    copy_rows_from_mapped_p2p(fuse_rows ? m_flag_ : nullptr, ring, parts_out, m_ymiss_ + (size_t) tb * K * N,
+                                              p2p_rows_ + (size_t) tb * K * N, (int64_t) n * K, N, p_dst, p_counts + 1, cs);
+#endif
                 else if (fuse_rows)   // the wait folded into the copy's blocks
                     copy_rows_from_mapped_after(m_flag_, ring, parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
                                                 p_dst, p_counts + 1, cs);

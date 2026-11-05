@@ -37,6 +37,24 @@ bool peer_portable();
 void set_pool_gpu_helper(const char* what);
 const char* pool_gpu_helper();
 
+/// R17 arch gate (sm120_series.hpp peer_tier_decide): the decode peer tier (P1, the "peer" class of the device plan) is on.  Set once
+/// at startup, before the verifiers' init.  set_peer_tier_log keeps what the one log line needs; PeerExperts::open prints it (with
+/// the transport its readback test found) when the tier is on.
+void set_peer_tier2(bool on);
+bool peer_tier2();
+void set_peer_tier_log(bool on, int n_cards, int cc, double gib0, int why);
+
+/// R17 1a STRATA_PEER_P2P_ROWS=1: the decode peer rows travel by P2P (the peer's scatter kernel stores straight into a device-0
+/// buffer) instead of through the mapped host rows.  A verifier on the primary device registers its mapped CPU-row block
+/// (`host`, `mapped`: the two addresses of the same `bytes`) and the device-0 block of the same shape the peer writes into
+/// (`dev0`).  The peer marks each P2P row in the mapped block with kP2PRowSentinel (the first 4 floats); the verifier's
+/// copy_rows_from_mapped_p2p then reads that row from `dev0`.  Unregistered blocks (another copy path) keep the mapped rows.
+void register_p2p_rows(const float* host, const float* mapped, size_t bytes, float* dev0);
+void unregister_p2p_rows(const float* host);
+/// whether STRATA_PEER_P2P_ROWS asks for P2P decode rows (read once)
+bool p2p_rows_requested();
+constexpr uint32_t kP2PRowSentinel = 0x7fbadbadu;   // a NaN payload no expert row produces
+
 class PeerExperts {
 public:
     PeerExperts() = default;
@@ -63,6 +81,10 @@ public:
     }
     /// Whether the primary (device 0) and the peer can read each other's memory directly (NVLink / PCIe P2P).
     bool p2p() const { return p2p_; }
+    /// R17 1a: the decode rows go by P2P stores into device 0 (STRATA_PEER_P2P_ROWS=1, peer access both ways, both readback
+    /// tests exact); false = the mapped host rows (the fallback, always available)
+    bool p2p_rows() const { return p2p_rows_; }
+    int64_t p2p_row_count() const { return p2p_row_count_; }   ///< rows sent by P2P
 
     /// Starts the peer's share of one layer: the entries i with kind[i] == 2 (x: n_tok rows of n_embd floats).
     /// multi-GPU: with `out` (pinned, portable host rows) the peer writes its rows straight into
@@ -90,6 +112,8 @@ public:
 private:
     int device_ = -1;
     bool p2p_ = false;
+    bool p2p_rows_ = false;
+    int64_t p2p_row_count_ = 0;
     int64_t n_layers_ = 0, n_expert_ = 0;
     ExpertCache cache_;
     ExpertSource* src_ = nullptr;

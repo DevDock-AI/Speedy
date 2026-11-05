@@ -45,6 +45,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/stage_pool.hpp"
 #include "strata/core/peer_experts.hpp"
+#include "strata/core/sm120_series.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
@@ -3472,6 +3473,62 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: STRATA_AUX_CPUS: %s\n", aerr.c_str());
             return 2;
         }
+    }
+    // R17 arch gate (PLAN-PEER §17, sm120_series.hpp peer_tier_decide): the decode peer tier, on by default only on alike sm_120 cards
+    // >= 15 GiB; STRATA_PEER_TIER2=0/1 wins; a layout given by hand wins; STRATA_EMULATE_CC=120 = dry run (decide + log, never act)
+    {
+        strata::PeerTierCard cards[8];
+        int nd = 0;
+        if (cudaGetDeviceCount(&nd) != cudaSuccess) nd = 0;
+        nd = std::min(nd, 8);
+        for (int d = 0; d < nd; ++d) {
+            cudaDeviceGetAttribute(&cards[d].major, cudaDevAttrComputeCapabilityMajor, d);
+            cudaDeviceGetAttribute(&cards[d].minor, cudaDevAttrComputeCapabilityMinor, d);
+            cudaDeviceGetAttribute(&cards[d].sms, cudaDevAttrMultiProcessorCount, d);
+            cudaDeviceProp p{};
+            if (cudaGetDeviceProperties(&p, d) == cudaSuccess) cards[d].total_bytes = (double) p.totalGlobalMem;
+        }
+        (void) cudaGetLastError();
+        strata::PeerTierInput in;
+        in.cards = cards;
+        in.n = nd;
+#if defined(STRATA_USE_HIP)
+        in.hip = true;
+#endif
+        in.v026 = strata::qwen_defaults_026();
+        { const char* u = std::getenv("STRATA_UPSTREAM_DEFAULTS"); in.upstream = u != nullptr && std::atoi(u) != 0; }
+        in.sm120_perf = strata::sm120_series();
+        in.env = std::getenv("STRATA_PEER_TIER2");
+        in.user_layer_split = !o.layer_split.empty();
+        in.user_peer_device = o.peer_device >= 0;
+        { const char* e = std::getenv("STRATA_EMULATE_CC"); in.emulate_cc = e != nullptr ? std::atoi(e) : 0; }
+        { const char* e = std::getenv("STRATA_PEER_TIER2_AUTO"); in.rule_acts = e != nullptr && std::atoi(e) != 0; }   // review B1
+        if (in.emulate_cc == 120) {   // the dry run only (never acted on): STRATA_EMULATE_VRAM_GIB lets a small card walk the >= 15 GiB branch
+            const char* v = std::getenv("STRATA_EMULATE_VRAM_GIB");
+            if (v != nullptr && std::atof(v) > 0)
+                for (int d = 0; d < nd; ++d) cards[d].total_bytes = std::atof(v) * 1073741824.0;
+        }
+        strata::PeerTierDecision pd = strata::peer_tier_decide(in);
+        if (pd.on && !pd.dry_run && pd.auto_layout && o.peer_device < 0) {
+            if (nd >= 2 && !o.expert_profile.empty() && o.expert_cache != 0) o.peer_device = 1;
+            else {
+                std::fprintf(stderr, "speedy: peer tier wanted (%s) but it needs 2 GPUs, --expert-profile and the expert cache: off\n",
+                             strata::peer_tier_why_text(pd.why));
+                pd.on = false;
+            }
+        }
+        if (pd.on && !pd.dry_run && o.peer_device < 1) pd.on = false;   // forced on, but no peer card to run it on
+        strata::core::set_peer_tier2(pd.on && !pd.dry_run);
+        if (pd.on && !pd.dry_run) {   // P1: static residency (no peer adaptation unless asked by hand); the refusals in one line
+            if (o.peer_adapt_swaps < 0) o.peer_adapt_swaps = 0;
+            std::fprintf(stderr, "speedy: peer tier P1: static peer residency (--peer-adapt-swaps %d), one window at a time; the existing "
+                                 "--peer-device fences apply (no session files, PCIe auto share or KVA with a peer GPU)\n", o.peer_adapt_swaps);
+        }
+        const int cc0 = nd > 0 ? cards[0].major * 10 + cards[0].minor : 0;
+        const double gib0 = nd > 0 ? cards[0].total_bytes / 1073741824.0 : 0.0;
+        if (!(pd.on && !pd.dry_run))   // on: PeerExperts::open prints it, with the transport its readback found
+            std::fprintf(stderr, "%s\n", strata::peer_tier_log_line(pd, nd, cc0, gib0, "mapped-host", false).c_str());
+        strata::core::set_peer_tier_log(pd.on && !pd.dry_run, nd, cc0, gib0, (int) pd.why);
     }
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     if (o.peer_device >= 1) {   // the peer's context must exist BEFORE the arena's whole-range cudaHostRegister
@@ -10157,6 +10214,32 @@ int main(int argc, char** argv) {
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
+        // R17 P1 (STRATA_PEER_TIER2=1): the router's eligibility table is the union of the tiers (this card's slots OR the peer's),
+        // a table of its own; the plan / doorbell skip / hit path keep thits.d_res, the physical slots of card 0
+        int32_t* d_route_res = nullptr;
+        std::vector<int32_t> route_res_h;
+        int64_t route_res_swaps = 0;
+        auto route_res_upload = [&]() {
+            if (d_route_res == nullptr) return;
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e) {
+                    const size_t i = (size_t) (l * g.n_expert + e);
+                    route_res_h[i] = host_res[i] >= 0 ? host_res[i] : (peer.valid() && peer.has(l, e) ? 0 : strata::core::kNotResident);
+                }
+            if (cudaMemcpy(d_route_res, route_res_h.data(), route_res_h.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess)
+                cudaGetLastError();
+        };
+        if (strata::core::peer_tier2() && peer.valid() && thits.d_res != nullptr && stages.empty() && !host_res.empty()) {
+            route_res_h.assign(host_res.size(), strata::core::kNotResident);
+            if (cudaMalloc((void**) &d_route_res, route_res_h.size() * sizeof(int32_t)) == cudaSuccess) {
+                route_res_upload();
+                vh.d_route_res = d_route_res;
+                int64_t u = 0;
+                for (int32_t v : route_res_h) u += v >= 0;
+                std::fprintf(stderr, "speedy: peer tier: routing eligibility = union of the tiers (%lld of %lld experts; card 0 slots %lld), "
+                                     "separate from the slot table\n", (long long) u, (long long) route_res_h.size(), (long long) xcache.slots());
+            } else { cudaGetLastError(); d_route_res = nullptr; }
+        }
         // STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, with STRATA_ROUTE_RESIDENT=<margin>; changes the output): the MTP
         // draft's router gets the same residency bias, with the last layer's residency row as its table (single GPU)
         if (use_mtp && stages.empty() && thits.d_res != nullptr && std::getenv("STRATA_ROUTE_RESIDENT") != nullptr &&
@@ -11546,7 +11629,10 @@ int main(int argc, char** argv) {
         };
         auto apply_pending = [&](bool wait) {
             if (peer.valid()) peer.apply_pending(wait);
-            if (pending.empty()) return;
+            if (pending.empty()) {   // only the peer's tier may have moved: upload the union when its swaps landed
+                if (d_route_res != nullptr && peer.valid() && peer.swaps() != route_res_swaps) { route_res_swaps = peer.swaps(); route_res_upload(); }
+                return;
+            }
             if (wait) cudaEventSynchronize(adapt_ev);
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
             for (auto& st : stages)
@@ -11569,6 +11655,7 @@ int main(int argc, char** argv) {
             pending_age = 0;
             agate.active.store(false, std::memory_order_release);   // 0.1.43: the copies have landed (STRATA_ADAPT_OVERLAP)
             aflipped = false;
+            route_res_upload();
             if (res_upload() == cudaSuccess) {   // the whole table: the hook has nothing left
                 drive.d.res_dirty = false;
                 drive.d.res_dirty_idx.clear();

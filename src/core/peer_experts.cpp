@@ -9,8 +9,11 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 
+#include "strata/core/sm120_series.hpp"
+
 #include <algorithm>
 #include <chrono>
+#include <mutex>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -25,6 +28,40 @@ bool peer_portable() { return g_peer_portable; }
 static const char* g_pool_gpu_helper = nullptr;
 void set_pool_gpu_helper(const char* what) { g_pool_gpu_helper = what; }
 const char* pool_gpu_helper() { return g_pool_gpu_helper; }
+
+static bool g_peer_tier2 = false;
+void set_peer_tier2(bool on) { g_peer_tier2 = on; }
+bool peer_tier2() { return g_peer_tier2; }
+static struct { bool on = false; int n = 0, cc = 0, why = 0; double gib = 0; } g_tier_log;
+void set_peer_tier_log(bool on, int n_cards, int cc, double gib0, int why) { g_tier_log = {on, n_cards, cc, why, gib0}; }
+
+namespace {
+struct P2PRowBlock { const float* host; const float* mapped; size_t bytes; float* dev0; };
+std::mutex g_p2p_mu;
+std::vector<P2PRowBlock> g_p2p_blocks;
+}  // namespace
+void register_p2p_rows(const float* host, const float* mapped, size_t bytes, float* dev0) {
+    std::lock_guard<std::mutex> lk(g_p2p_mu);
+    g_p2p_blocks.push_back({host, mapped, bytes, dev0});
+}
+void unregister_p2p_rows(const float* host) {
+    std::lock_guard<std::mutex> lk(g_p2p_mu);
+    g_p2p_blocks.erase(std::remove_if(g_p2p_blocks.begin(), g_p2p_blocks.end(), [&](const P2PRowBlock& b) { return b.host == host; }),
+                       g_p2p_blocks.end());
+}
+bool p2p_rows_requested() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PEER_P2P_ROWS"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+/// the device-0 address that mirrors `out` (a row inside a registered mapped block), or null
+static float* p2p_dst_of(const float* out, size_t row_bytes) {
+    std::lock_guard<std::mutex> lk(g_p2p_mu);
+    for (const auto& b : g_p2p_blocks)
+        for (const float* base : {b.host, b.mapped})
+            if (base != nullptr && out >= base && (const char*) out + row_bytes <= (const char*) base + b.bytes)
+                return b.dev0 + (out - base);
+    return nullptr;
+}
 
 namespace {
 
@@ -86,6 +123,47 @@ bool p2p_copies_data(int device) {
     return ok;
 }
 
+/// R17 1a: the P2P decode rows are written by a KERNEL on the peer storing into device-0 memory (not a copy-engine copy), so
+/// that is tested too: the peer scatters 8 rows into a device-0 buffer, device 0 reads them back.  true = exact.  Not
+/// testable (no memory): false (the mapped rows stay).
+bool p2p_stores_land(int device) {
+    constexpr int kRows = 8, kW = 256;
+    std::vector<float> h(kRows * kW), back(kRows * kW, 0.0f);
+    for (size_t i = 0; i < h.size(); ++i) h[i] = 0.5f + (float) ((i * 2246822519u) % 8191u);
+    const int32_t perm[kRows] = {5, 2, 7, 0, 3, 6, 1, 4};
+    float* src = nullptr;
+    int32_t* rows = nullptr;
+    float* dst = nullptr;
+    bool ok = false;
+    {
+        On on(0);
+        if (cudaMalloc((void**) &dst, h.size() * 4) != cudaSuccess || cudaMemset(dst, 0, h.size() * 4) != cudaSuccess ||
+            cudaDeviceSynchronize() != cudaSuccess) { cudaGetLastError(); if (dst) cudaFree(dst); return false; }
+    }
+    {
+        On on(device);
+        if (cudaMalloc((void**) &src, h.size() * 4) == cudaSuccess && cudaMalloc((void**) &rows, sizeof perm) == cudaSuccess &&
+            cudaMemcpy(src, h.data(), h.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+            cudaMemcpy(rows, perm, sizeof perm, cudaMemcpyHostToDevice) == cudaSuccess) {
+            try {
+                strata::kernels::scatter_rows_f32(src, dst, rows, kRows, kW, nullptr);
+                ok = cudaDeviceSynchronize() == cudaSuccess;
+            } catch (...) { ok = false; }
+        }
+        if (src) cudaFree(src);
+        if (rows) cudaFree(rows);
+        cudaGetLastError();
+    }
+    {
+        On on(0);
+        ok = ok && cudaMemcpy(back.data(), dst, back.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+        cudaFree(dst);
+        cudaGetLastError();
+    }
+    for (int r = 0; ok && r < kRows; ++r) ok = std::memcmp(&back[(size_t) perm[r] * kW], &h[(size_t) r * kW], kW * 4) == 0;
+    return ok;
+}
+
 bool ck(cudaError_t e, const char* what, std::string& err) {
     if (e == cudaSuccess) return true;
     err = std::string("peer experts: ") + what + ": " + cudaGetErrorString(e);
@@ -98,6 +176,10 @@ PeerExperts::~PeerExperts() { close(); }
 
 void PeerExperts::close() {
     if (device_ < 0) return;
+    if (entries_ > 0)   // R17: the lane's per-run summary (transport, rows, host wait)
+        std::fprintf(stderr, "strata: peer GPU %d summary: transport %s, %lld routed entries (%lld by P2P), %lld expert launches, "
+                             "%lld swaps, %.1f ms host wait\n", device_, p2p_rows_ ? "P2P rows" : "mapped host", (long long) entries_,
+                     (long long) p2p_row_count_, (long long) experts_, (long long) swaps_, ms_wait);
     {
         On on(device_);
         if (stream_) cudaStreamSynchronize(stream_);
@@ -163,6 +245,23 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
                 { On q1(device); cudaDeviceDisablePeerAccess(0); cudaGetLastError(); }
                 p2p_ = false;
             }
+        }
+    }
+    {   // R17 1a: the decode rows' transport (sm120_series.hpp peer_tier_transport): P2P only when asked, with peer access both ways
+        // and both readback tests exact (the copy engine's p2p_copies_data above, and a kernel's stores here); else mapped host
+        const bool stores = p2p_ && p2p_rows_requested() && p2p_stores_land(device);
+        p2p_rows_ = strata::peer_tier_transport(p2p_, stores, p2p_rows_requested()) == 1;
+        if (p2p_rows_requested())
+            std::fprintf(stderr, p2p_rows_ ? "strata: peer GPU %d: P2P rows on (decode rows by P2P stores into GPU 0, readback exact both ways)\n"
+                                           : "strata: peer GPU %d: P2P rows asked (STRATA_PEER_P2P_ROWS=1) but %s: the decode rows keep the mapped host route\n",
+                         device, !p2p_ ? "the pair has no working peer access (cudaDeviceCanAccessPeer / enable / copy readback)"
+                                       : "a peer kernel's stores into GPU 0 did not arrive exact");
+        if (g_tier_log.on) {
+            PeerTierDecision d;
+            d.on = true;
+            d.why = (PeerTierWhy) g_tier_log.why;
+            std::fprintf(stderr, "%s\n", peer_tier_log_line(d, g_tier_log.n, g_tier_log.cc, g_tier_log.gib,
+                                                            p2p_rows_ ? "P2P" : "mapped-host", p2p_).c_str());
         }
     }
     On on(device);
@@ -305,6 +404,19 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         err = "peer experts: only native packs are supported";
         return false;
     }
+    float* p2p_dst = direct && p2p_rows_ ? p2p_dst_of(out, (size_t) n * H * sizeof(float)) : nullptr;
+    if (p2p_dst != nullptr) {   // R17 1a: the rows straight into GPU 0's mirror block by P2P stores; the mapped rows get a mark only
+        for (int r = 0; r < rows; ++r) {
+            uint32_t* mark = (uint32_t*) (out + (size_t) m.out_row[r] * H);
+            for (int q = 0; q < 4; ++q) mark[q] = kP2PRowSentinel;
+        }
+        try {
+            strata::kernels::scatter_rows_f32(d_out_, p2p_dst, dm->out_row, rows, H, s);
+        } catch (const std::exception& e) { err = std::string("peer experts: P2P scatter: ") + e.what(); return false; }
+        launched_direct_ = true;
+        p2p_row_count_ += rows;
+        return true;
+    }
     if (direct) {   // the rows straight into the host `out` (zero-copy, coalesced float4 writes)
         try {
             strata::kernels::scatter_rows_f32(d_out_, out, dm->out_row, rows, H, s);
@@ -322,8 +434,17 @@ bool PeerExperts::finish(float* out, std::string& err) {
     {
         On on(device_);
         // spin on the stream (a blocking sync would sleep the pool thread and wake it late)
+        // R17: bounded (STRATA_PEER_WAIT_MS, default 10000): a peer that never finishes fails the window with a message
+        // instead of hanging the pool (and the graph spinning on its flag) forever
+        static const double limit_ms = [] { const char* v = std::getenv("STRATA_PEER_WAIT_MS"); return v != nullptr && std::atof(v) > 0 ? std::atof(v) : 10000.0; }();
         cudaError_t e;
+        uint32_t polls = 0;
         while ((e = cudaStreamQuery(stream_)) == cudaErrorNotReady) {
+            if ((++polls & 1023u) == 0 &&
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() > limit_ms) {
+                err = "peer experts: the peer GPU did not finish its rows within " + std::to_string((int) limit_ms) + " ms (STRATA_PEER_WAIT_MS)";
+                return false;
+            }
         }
         if (!ck(e, "finish", err)) return false;
     }
