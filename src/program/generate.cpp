@@ -7451,7 +7451,11 @@ int main(int argc, char** argv) {
     const bool auto_cache = o.expert_cache < 0;
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
     // --pipeline-windows: what it allocates on CUDA0 after the cache (see kPipeWindowMib)
-    const int64_t pipe_first = o.pipeline_windows <= 0 ? (kPipeWindowMib << 20)
+#if defined(STRATA_USE_HIP)
+    const int64_t pipe_first = o.pipeline_windows <= 0 ? (kPipeWindowMib << 20)   // RDNA3 port: room kept at pw 0 too
+#else
+    const int64_t pipe_first = o.pipeline_windows <= 0 ? 0   // CUDA: no room kept at pw 0 (the base sizing)
+#endif
         : (kPipeWindowMib << 20) + (o.pipeline_windows >= 2 ? 2 * (int64_t) gdn_snapshot_bytes(ss) : 0);
     if (pipe_first > 0 && o.pipeline_windows > 0)
         std::fprintf(stderr, "strata generate: --pipeline-windows %d: %lld MiB of CUDA0 kept out of the expert cache "
