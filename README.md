@@ -164,7 +164,7 @@ Speedy keeps Strata's Windows support: the same engine source, the same `serve/`
 **Option A, setup does everything:**
 1. Clone the repository, or download and extract a release.
 2. Run `START-HERE.bat`. In PowerShell, run `.\START-HERE.bat`.
-3. Pick the model and quant. On an **RTX 30** card setup downloads the ready-made engine (`strata-windows-x64-rtx30.zip` from the [latest release](https://github.com/DevDock-AI/Speedy/releases/latest)); on other cards it compiles from source, so install the build tools in option B.
+3. Pick the model and quant. On an **RTX 20, 30, 40 or 50** card setup downloads the ready-made engine for that family (`strata-windows-x64-rtx20.zip` ... `rtx50.zip` from the [latest release](https://github.com/DevDock-AI/Speedy/releases/latest)); on other cards (or a PC that mixes families) it compiles from source, so install the build tools in option B.
 
 **Option B, build the engine yourself:**
 1. Install the **Visual Studio 2022 Build Tools** (C++ workload) and **CUDA 13.x** (13.3 or newer also works with VS 2026).

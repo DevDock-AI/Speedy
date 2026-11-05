@@ -14,7 +14,7 @@ on:
         description: "which engines: all, linux or windows"
         default: all
       family:
-        description: "card family: rtx30, rtx40 or rtx50"
+        description: "card family: rtx20, rtx30, rtx40 or rtx50"
         default: rtx30
 
 permissions:
@@ -23,7 +23,7 @@ permissions:
 env:
   TAG: ${{ inputs.tag || github.ref_name }}
   FAM: ${{ inputs.family || 'rtx30' }}
-  ARCHS: ${{ fromJSON('{"rtx30":"86","rtx40":"89","rtx50":"120"}')[inputs.family || 'rtx30'] }}
+  ARCHS: ${{ fromJSON('{"rtx20":"75","rtx30":"86","rtx40":"89","rtx50":"120"}')[inputs.family || 'rtx30'] }}
   FLAGS: -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_PORTABLE=ON -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_MMQ_TQ_OVERLAY=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_Q6K_EXPERTS=ON
 
 jobs:

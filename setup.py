@@ -236,7 +236,7 @@ PREBUILT_TAG_URL = "https://github.com/DevDock-AI/Speedy/releases/download/v{ver
 PREBUILT_ASSET = "strata-windows-x64-rtx30.zip" if WIN else "strata-linux-x64-rtx30.zip"   # the RTX 30 engine (the reference card)
 # One ready-made engine per card family (compute capability -> release asset suffix). A card whose family has no zip in
 # the release yet compiles the engine here instead (the HEAD request fails and get_prebuilt returns None).
-PREBUILT_FAMILY = {86: "rtx30", 89: "rtx40", 120: "rtx50"}   # the kernels need sm_80+ (CMakeLists.txt)
+PREBUILT_FAMILY = {75: "rtx20", 86: "rtx30", 89: "rtx40", 120: "rtx50"}   # sm_75 (RTX 20) and newer (CMakeLists.txt)
 
 
 def prebuilt_asset(gpu) -> str | None:
