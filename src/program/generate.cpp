@@ -6809,6 +6809,14 @@ int main(int argc, char** argv) {
         // The arena pins until the OS refuses; on Windows that leaves no page-locked memory for the small buffers the
         // engine allocates after it (the verify window's staging: "mapped staging allocation failed", exit 1).  Keep a
         // reserve while the arena pins and hand it back after (pin_budget.hpp).
+        if (ple_lock_by_policy)   // #4846: the residency policy priced the table against the arena before the rest of the start took its RAM
+            arena_src.give_back_ram = [&]() -> uint64_t {
+                if (!ple_table.locked()) return 0;
+                const uint64_t held = ple_table.table_bytes();
+                if (!ple_table.unlock()) return 0;
+                ple_lock_by_policy = false;   // (given back: the conversation cache's give-back has nothing left to do)
+                return held;
+            };
         strata::core::pin_reserve_take();
         const bool arena_ok = arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                                              o.shared_expert_arena);
@@ -12176,6 +12184,10 @@ int main(int argc, char** argv) {
                     if (pl) {   // the copies in at each card's next gap: after this step, so fenced (see above)
                         a_res_dirty = true;
                         for (const ASwap& w : aswaps) a_in_due[(size_t) w.home] = 1;
+                        // the whole round is one batch: when the pipelined loop drains before step 3, the next tick
+                        // takes step 3 serially and marks [a_lo, a_hi), which an earlier round left otherwise
+                        a_lo = 0;
+                        a_hi = a_bi = aswaps.size();
                         ajob->post(a_stage_in);
                     } else {
                         res_upload();
@@ -15868,6 +15880,13 @@ int main(int argc, char** argv) {
                                                ? drive.d.pcie_num : pcie_num_of(stages[(size_t) st - 1]->pcie_frac);
             if (pipe) for (int st = 0; st < split_drive.n; ++st) split_drive_b.pcie_num[st] = split_drive.pcie_num[st];
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
+            // #4590: the repeat / frequency / presence penalties count the tokens this reply has written, not the prompt's last
+            // tokens (the prompt's own numbers and quoted answers were penalised, and a conversation whose last turn asks for
+            // something new could get its previous answer back).  Earlier assistant turns inside the prompt are not counted
+            // either.  STRATA_PENALTY_PROMPT=1 brings the old window back (the last penalty_last_n tokens of prompt + reply).
+            // The history is rebuilt from the request's prompt ids every time, so a conversation restored from the cache or a
+            // saved slot seeds it exactly as a cold read does.
+            static const bool pen_prompt = strata::kernels::penalty_counts_prompt(std::getenv("STRATA_PENALTY_PROMPT"));
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             if (pipe) ver_b.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             bool cancelled = false;
@@ -15947,6 +15966,7 @@ int main(int argc, char** argv) {
             int64_t merge_at = -1;
             auto merge_from = [&](int64_t a0, int64_t to) -> int64_t {
                 if (!admit_merge_first_env() || admit_slot < 0 || max_new != 1 || batch_mtp || pipe) return -1;
+                if (hist_n > 0 && !pen_prompt) return -1;   // #4590: the merged window's prompt rows would join the reply-only penalty window
                 if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at) return -1;
                 if (!req_imgs.empty() || kvg.on || peer.valid() || remote_caches || remote_opt || fs_swap) return -1;
                 if (std::getenv("STRATA_LOGPOS") != nullptr) return -1;
@@ -16107,6 +16127,9 @@ int main(int argc, char** argv) {
             std::vector<int32_t> consumed;
             consumed.reserve((size_t) (n + max_new + S));
             for (int64_t i = 0; i < p; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
+            // #4590: where the penalty window may start in `consumed` (see pen_prompt above): the end of the prompt without its
+            // last token, which joins the window as the fed-back head `x`.
+            const size_t pen_gen0 = strata::kernels::penalty_window_from(consumed.size(), pen_prompt);
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
@@ -16644,7 +16667,7 @@ int main(int argc, char** argv) {
                             if ((int64_t) consumed.size() != A.p)   // T3: the history prefix is the committed prefix
                                 return die("pipelined penalties: consumed " + std::to_string(consumed.size()) +
                                            " != window position " + std::to_string(A.p));
-                            strata::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), A.tok, A.T, hist_n,
+                            strata::kernels::penalty_rows(consumed.data() + pen_gen0, (int64_t) (consumed.size() - pen_gen0), A.tok, A.T, hist_n,
                                                           hist_stage.data());
                             const strata::core::OnDevice on_h(hist_dev);
                             if (!V1(A).pl_set_history_rows(hist_stage.data(), A.T, err)) return die(err);
@@ -17058,7 +17081,7 @@ int main(int argc, char** argv) {
                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
                     // before that row - what plain decode would have counted there.  (Until 0.1.19 only row 0
                     // was staged, and the drafted rows read unwritten slots.)
-                    strata::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), window.data(), T,
+                    strata::kernels::penalty_rows(consumed.data() + pen_gen0, (int64_t) (consumed.size() - pen_gen0), window.data(), T,
                                                   hist_n, hist_stage.data());
                     const strata::core::OnDevice on_h(hist_dev);
                     cudaMemcpy(d_hist, hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
@@ -17158,7 +17181,7 @@ int main(int argc, char** argv) {
                 // coupled drafts with penalties: the next window's row-0 history (`consumed` holds this window's
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
-                    mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
+                    mtp.set_draft_history(consumed.data() + pen_gen0, (int64_t) (consumed.size() - pen_gen0), outv[(size_t) a]);
                 generation = {};   // a skipped or failed production must not expose an older q view
                 const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
                 const bool drafted = !use_mtp || eos || produced_n >= max_new ||
