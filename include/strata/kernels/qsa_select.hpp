@@ -59,7 +59,19 @@ bool qsa_block_scores_rows(const float* pooled, const float* dead, const float* 
 bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                          int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks);
 
+/// The same scores on AMD tensor cores (ROCWMMA 16x16x16, FP16 operands with FP32 accumulation: FP16-level input
+/// accuracy and another summation order; the tail block n_bid is still the warp kernel's arithmetic).  HIP/gfx1100
+/// only; false (nothing launched) on another geometry, architecture or build, so callers keep their fallbacks.
+/// Keys and queries are converted to FP16 per call into an internal scratch - that conversion is part of the arm's
+/// cost.  Scores may differ from the warp kernel's by at most the bound recorded in PORTING.md 18:
+/// B(qi,b) = 2^-9.5 * S(qi,b) + 8 * 2^-24 * |score|, with S the absolute product sum of the entry.
+bool qsa_block_scores_wmma(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
+                           int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks);
+
 /// ids [nq, cap] (cells, ascending); `cap` >= the largest selection width.
+/// while true (set by the verifier around a long-context graph capture), decode top-k calls take the multi-CTA
+/// split kernels (the same ids); see STRATA_TOPK_SPLIT_MIN in verify.hpp
+void qsa_topk_split_capture(bool on);
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream,
                     int64_t active_blocks = -1);   ///< > 0: no query of the call has more than this many blocks (n_bid + 1;

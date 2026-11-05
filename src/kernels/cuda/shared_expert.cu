@@ -226,7 +226,10 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         x_q8_1 = nw.q8_1;
     }
     // S26 STRATA_LFUSE (gate_deferred): gate and up in one launch where the pair applies (bitwise the two calls)
-    if (!(pair && nw.gate_type == nw.up_type &&
+    // STRATA_RDNA_PAIR: gate and up in one RDNA GEMV launch when they share a format the RDNA kernels take (bitwise)
+    const bool rpair = nw.gate_type == nw.up_type &&
+        rdna_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, x_q8_1, gate, up, (int) n_embd, (int) n_ff, (int) n_ff, n_tok, stream);
+    if (!rpair && !(pair && nw.gate_type == nw.up_type &&
           native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, x_q8_1, gate, up, (int) n_embd, (int) n_ff, n_tok, stream))) {
         native_mmvq(nw.gate_type, nw.gate_data, x_q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
         native_mmvq(nw.up_type, nw.up_data, x_q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
@@ -416,14 +419,17 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
 #endif
         {
     // gate and up projections, then silu(gate) * up in place in `gate`
-    if (native_gate || native_up)
+    // native->x_q8_1: the caller's q8_1 image of x (STRATA_MTP_QFUSE: the hyper-connection read wrote it, the same bytes
+    // native_quantize_q8_1 writes) - read as is; the quantize launch is skipped
+    const void* x_q8 = native->x_q8_1 != nullptr ? native->x_q8_1 : native->q8_1;
+    if ((native_gate || native_up) && native->x_q8_1 == nullptr)
         native_quantize_q8_1(x_f32, native->q8_1, (int) n_embd, 1, stream);
     if (native_gate)
-        native_mmvq(native->gate_type, native->gate_data, native->q8_1, gate, (int) n_embd, (int) n_ff, 1, stream);
+        native_mmvq(native->gate_type, native->gate_data, x_q8, gate, (int) n_embd, (int) n_ff, 1, stream);
     else
         gemv(gate_form, gate_codes, gate_scales, gate_off, x_q8_0, x_q8k, gate, n_embd, n_ff);
     if (native_up)
-        native_mmvq(native->up_type, native->up_data, native->q8_1, up, (int) n_embd, (int) n_ff, 1, stream);
+        native_mmvq(native->up_type, native->up_data, x_q8, up, (int) n_embd, (int) n_ff, 1, stream);
     else
         gemv(up_form, up_codes, up_scales, up_off, x_q8_0, x_q8k, up, n_embd, n_ff);
     if (native_projection && native_down && fused_swiglu_q81_enabled()) {
