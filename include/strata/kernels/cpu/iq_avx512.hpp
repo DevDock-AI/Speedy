@@ -18,6 +18,18 @@ void iq512_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_
 void iq512_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                 float* const* out, int r0, int r1);
 
+/// IQ3_S gate/up rows for ONE token, bit for bit ggml-cpu's ggml_vec_dot_iq3_s_q8_K (its x86 AVX2 path: the same
+/// integer lanes, the same FMA order and horizontal sum), with the grid read through byte planes (vpermt2b) instead
+/// of 16 scalar lookups per 64 weights.  Needs AVX512-VBMI (iq3s_1t_supported).  `act` is one block_q8_K row.
+bool iq3s_1t_supported() noexcept;
+void iq3s_gu_rows_1t(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* act, float* ff, int r0,
+                     int r1);
+/// IQ3_XXS gate/up rows for one token, bit for bit ggml-cpu's ggml_vec_dot_iq3_xxs_q8_K (the same byte planes)
+bool iq3xxs_1t_supported() noexcept;
+void iq3xxs_gu_rows_1t(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* act, float* ff, int r0,
+                       int r1);
+/// the same IQ3_S dot for single rows (out[r] = w_r . a), rows [r0, r1)
+void iq3s_rows_1t(const uint8_t* w, size_t row_bytes, int n, const void* act, float* out, int r0, int r1);
 /// The DeepSeek-V4.1 CPU lane's rows (src/dsv41/ds4_gg_cpu.cpp): the same 64-value decode, summed in ggml's order, so a token's
 /// dot is ggml-cpu's AVX2 vec_dot bit for bit at any number of tokens (1-6 in one pass, 7 and more as a prompt chunk's tiles).
 /// The caller checks cpu_avx512_ok() (AVX-512 F/BW/VL/DQ/VNNI/VBMI).
