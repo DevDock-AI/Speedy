@@ -36,4 +36,5 @@ Stock Strata on the same card, UD-IQ4_XS 32K prefill: 1,151 tok/s. Not yet re-me
 - `GPU_MAX_HW_QUEUES=6` with one card (8 with two).
 - `STRATA_HIPBLASLT_TUNING` points at `tools/hip/gfx1100-hipblaslt-100200.txt`.
 - `--mtp-draft-vocab data/draft_vocab_zh60k.bin` is the fork's draft vocabulary.
+- `STRATA_UPSTREAM_DEFAULTS=1`: the fork measured these settings on upstream defaults; Speedy's defaults (docs/SPEEDY_DEFAULTS.md) were tuned on RTX 3080.
 - `--vision` dropped (the release engine has no vision).
