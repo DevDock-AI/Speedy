@@ -50,6 +50,7 @@ struct ExpertLayout;
 }
 
 namespace strata::core {
+class ArenaShm;   // arena_shm.hpp
 
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
 class RemoteExperts;
@@ -376,6 +377,10 @@ private:
 /// after the ring and published before the CPU starts its own share.  Groups of entries that share a blob; the
 /// blob is a VRAM slot or a pinned host blob read over PCIe.
 struct GpuPlanSink {
+    // Experimental peer decode: device activation/result destinations for this group.
+    const float* peer_x = nullptr;
+    float* peer_rows = nullptr;
+    int32_t* peer_kind = nullptr;
     int32_t* counts = nullptr;             ///< [0] groups, [1] entries
     int32_t* start = nullptr;              ///< cap + 1
     int32_t* dst = nullptr;                ///< cap: the entry's row of parts (token * k + j)
@@ -570,6 +575,10 @@ struct ExpertDispatch {
     /// of what the device hit path reads.  When set, the pool leaves a resident expert's row at zero (the GPU
     /// computes it) without any `Launch` callback.
     const int32_t* host_res = nullptr;
+    /// Tensor parallel by expert id (core/tp.hpp, M2): the OTHER card's residency table.  An expert it holds is
+    /// computed there, inside that card's own window: its row stays zero here and the CPU does nothing for it (as a
+    /// peer's or a helper's).  Null: no other card.
+    const int32_t* tp_other_res = nullptr;
     /// Plan v0.3 P4: split every expert by rows across the pool's threads (default on; A/B `--no-split-rows`).
     bool split_rows = true;
 
@@ -629,6 +638,7 @@ struct ExpertDispatch {
     int64_t tail_skipped = 0;
     int64_t tail_experts = 0;
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
+    double ms_cpu_only = 0, ms_helper_tail = 0;   ///< verify-window dispatch sections
     /// 149-cold STRATA_COLD_OVERLAP: 0 off (the CPU starts once every blob of the layer is read), 1 the blobs that
     /// must be read are read in the background while the pool computes the ready experts, each landed one computed
     /// as it lands; 2 measure only (read everything first, then the ready experts, then the read ones, timed apart).
@@ -645,6 +655,11 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
+    /// STRATA_REFILL_DEMAND (generate.cpp): per (layer, expert), the value of `miss_now` when it last missed
+    /// (routed, resident nowhere); empty = off.  The driver bumps `miss_now` a window and refills the rows a long
+    /// prompt lent in the order the windows miss them.
+    std::vector<int32_t> miss_mark;
+    int32_t miss_now = 0;
     /// The adaptive tier's evictions reach the device's table before the next window, not when the round's copies
     /// land: until then doorbell_publish_res can skip a layer's activation while the pool computes an evicted expert
     /// from the one published before.  The driver sets it where the tier does not wait for its copies
@@ -1328,6 +1343,8 @@ public:
 
 private:
     void* arena_ = nullptr;          ///< the PinnedArena, owned
+    ArenaShm* shm_ = nullptr;        ///< STRATA_ARENA_SHM: the shared object backing arena_ (owned; after arena_)
+    bool shm_off_ = false;           ///< the retry after a failed sampled check loads a private arena
     void* map_ = nullptr;            ///< STRATA_ARENA_MMAP: the arena file, mapped read-only (not the PinnedArena)
     uint64_t map_bytes_ = 0;
     std::vector<const uint8_t*> dev_slice_;   ///< device alias of each registered slice (or of the whole range)

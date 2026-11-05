@@ -178,6 +178,9 @@ public:
     /// picks are discarded - a prompt read through windows commits every token - so they cost no sampler launch
     /// or sync and never read a history staged for another position.
     void set_head_sampling(bool on) { head_sampling_ = on; if (next_) next_->set_head_sampling(on); }
+    /// N2: capture_all also captures the long-context twins (STRATA_TOPK_SPLIT_MIN) - the pipelined decode's
+    /// verifiers; off where the stage verifiers never decode past the threshold pipelined (tensor parallel)
+    void set_eager_long(bool on) { eager_long_ = on; }
 
     /// LAYER SPLIT (multi-GPU): this verifier runs layers [layer_begin, layer_end) of every window.  A stage that
     /// does not start at layer 0 takes its residual from `handoff_in` instead of embedding the tokens; a stage that
@@ -211,6 +214,8 @@ public:
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+    /// commit() for this card alone (TP: the caller commits the peer itself, e.g. on another thread).
+    bool commit_one(int n_keep, std::string& err);
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
@@ -283,12 +288,43 @@ public:
         if (next_) next_->set_slot_sampling(slot, sp);
     }
     const int32_t* batch_out() const { return b_out_; }
-    bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
+    bool last_stage() const { return g_ != nullptr && (tp_ ? tp_head_ : le_ == g_->n_layers); }
+
+    // ---- TENSOR PARALLEL (core/tp.hpp, docs/STRATA_TP_DESIGN_20261022.txt): two cards, every layer on both at half
+    // the heads.  This verifier's geometry, session and weight table are the half's (tp_geometry / TpWeights); after
+    // each out-projection and after each layer's MoE the two cards exchange the block output through the pinned pages
+    // of `TpLink` inside the window graph (tp_exchange).  The routed experts of layers [own_lb, own_le) are this card's
+    // (its expert cache, its doorbells); the other card receives those layers' block output.  `head`: this card runs
+    // the head (the other ends after the last layer's write).  run() / commit() on rank 0 drive both cards (the peer is
+    // `next_`, so the head-side accessors forward to it as a layer split's do).  Before init.
+    struct TpLink {
+        int rank = 0;
+        float* inbox[2] = {};        ///< this card's inboxes (device addresses of pinned pages), by exchange parity
+        float* peer_inbox[2] = {};   ///< the peer card's inboxes, as this device addresses them
+        uint32_t* flag = nullptr;    ///< this card's flag: the peer raises it when its partial is in my inbox
+        uint32_t* flag_h = nullptr;  ///< ... its host address (the watchdog releases it)
+        uint32_t* peer_flag = nullptr;
+        int flag_dev = -1;           ///< STRATA_TP_INBOX=vram: `flag` is a word in this device's VRAM (flag_h null)
+    };
+    /// `mode` 1: the routed experts of layers [own_lb, own_le) are this card's (M1); 2 (by id, M2): every layer's
+    /// experts are split between the two cards' caches - rank 0 rings the host for every layer (the CPU rows, the
+    /// shared expert; the other card's experts are "elsewhere" to its pool), rank 1 plans its resident experts on the
+    /// device and adds its partial in the layer's second exchange, now a true all-reduce.
+    bool set_tp(const TpLink& link, int64_t own_lb, int64_t own_le, bool head, Verifier* peer, std::string& err,
+                int mode = 1);
+    /// TP head split (STRATA_TP_HEAD_SPLIT=1, greedy windows): the head card computes vocabulary rows [0, row0) and
+    /// the other card (`half`, rows [row0, n_vocab), on its own device) the rest from the head card's q8_1 image;
+    /// the picks are combined on the head card.  Call on both cards (the head card passes half = nullptr) before
+    /// the first capture.  A sampled or penalized request gets the full logits again in finish_head.
+    void set_tp_head_split(const NativeHead* half, int64_t row0) { tp_head_half_ = half; tp_head_row0_ = row0; }
+    bool tp() const { return tp_; }
+    int tp_rank() const { return tpl_.rank; }
     /// commit() returns without waiting for its graph (a single-GPU session sets it): the next window follows it on
     /// the same stream and the drafter reads nothing it writes, so it overlaps the draft. Whoever reads or writes
     /// the session from another stream or the host afterwards (a new request, a checkpoint, a snapshot, the prompt
     /// path, the end of a run) calls wait_commit() first.  STRATA_COMMIT_SYNC=1 keeps the wait.
-    static void set_commit_async(bool on);
+    /// `tp`: the tensor-parallel verifiers commit asynchronously too (each card's window follows its commit on its own stream).
+    static void set_commit_async(bool on, bool tp = false);
     /// The stages of a layer split commit without the wait as well (with set_commit_async on; off by default, so a
     /// split waits after every stage's commit).  STRATA_SPLIT_COMMIT_ASYNC=1 in generate.
     static void set_split_commit_async(bool on);
@@ -386,6 +422,7 @@ public:
     /// It gets this verifier's stream; false (with the message in `err`) fails the launch.
     void set_pre_launch(std::function<bool(cudaStream_t cs, std::string& err)> f) { pre_launch_ = std::move(f); }
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
+    void set_pcie_off(bool off) { pcie_off_ = off; }
 
     /// The PCIe count of each layer from measured costs (PcieModel) instead of a fixed share: the spin kernels stamp
     /// each step's GPU work (the plan's arrival, the PCIe part's start, the wait for the CPU's rows; GPU clock), the host
@@ -399,6 +436,8 @@ public:
     bool pcie_balance_on() const { return bal_ != nullptr && m_bal_ != nullptr; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    double ct_launch_ = 0, ct_event_ = 0, ct_query_ = 0; long long ct_n_ = 0;   // STRATA_COMMIT_TIMING
+    double ms_launch = 0;   ///< TP: the host time of the window graphs' launches (both cards)
     int64_t windows = 0;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
@@ -411,6 +450,28 @@ public:
 private:
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool capture(int T, std::string& err);
+    // tensor parallel (set_tp)
+    bool tp_ = false, tp_head_ = false;
+    int tp_mode_ = 1;                            ///< set_tp's mode
+    bool tp_gpu_only_ = false;                   ///< mode 2, rank 1: no doorbells; the resident experts planned on the device
+    bool tp_dev_plan_ = false;                   ///< mode 2, rank 0: its resident experts planned on the device too (the host's plan unused; only the CPU rows are waited for)
+    TpLink tpl_;
+    int64_t tp_lb_ = 0, tp_le_ = 0;              ///< the layers whose routed experts are this card's
+    Verifier* tp_peer_ = nullptr;
+    uint32_t tp_epoch_ = 0;                      ///< the window's epoch (rank 0's value, written to both cards' words)
+    uint32_t* h_tp_epoch_ = nullptr; uint32_t* m_tp_epoch_ = nullptr;   // mapped: the host's epoch word
+    uint32_t* tp_epoch_d_ = nullptr;             ///< device: the graph's copy of it (tp_window_begin)
+    unsigned* tp_cnt_ = nullptr;                 ///< device: the publishing blocks' counter
+    cudaStream_t tp_flag_cs_ = nullptr;          ///< STRATA_TP_INBOX=vram: the host's writes of the VRAM flag word
+    uint32_t* h_ple_flag_ = nullptr; uint32_t* m_ple_flag_ = nullptr;   // the PLE rows are in h_ple_ (raised to epoch + 1)
+    bool tp_own(int64_t l) const { return !tp_ || tp_gpu_only_ || (l >= tp_lb_ && l < tp_le_); }
+    bool run_tp(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
+    /// run()'s tail on the stage with the head (the window synced): the host-side sampling, the picks, the NaN check.
+    bool finish_head(int T, const int32_t* tokens, int64_t pos0, int32_t* out, std::string& err);
+    /// run()'s per-layer service loop over this verifier's rings (the CPU experts, the plan, the flags); with
+    /// `ple_peer` the PLE rows gathered at the first ring are copied to it and both PLE flags raised.
+    bool serve_rings(int T, PoolMultiFn pool, void* user, bool do_ple, const uint32_t* ple_rows, Verifier* ple_peer,
+                     std::string& err);
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
@@ -619,6 +680,15 @@ private:
     cudaGraphExec_t exec_nr_[2][9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
     bool launched_[2][9] = {}, launched_nr_[2][9] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
     int sel_long_ = 0;
+    // STRATA_TOPK_SPLIT_MIN=P: windows starting at position >= P run graphs captured with the multi-CTA decode
+    // top-k (the same ids; captured on first use); below it the graphs above.  0 / unset: off (one set, as before)
+    cudaGraphExec_t exec_l_[9] = {}, exec_nr_l_[9] = {};
+    bool launched_l_[9] = {}, launched_nr_l_[9] = {};
+    bool long_ = false;
+    bool eager_long_ = true;
+    void refresh_long(int64_t pos0);
+    cudaGraphExec_t& ex(int T) { return long_ ? (ar_off_ ? exec_nr_l_[T] : exec_l_[T]) : (ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T]); }
+    bool& lau(int T) { return long_ ? (ar_off_ ? launched_nr_l_[T] : launched_l_[T]) : (ar_off_ ? launched_nr_[sel_long_][T] : launched_[sel_long_][T]); }
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
     // mixer's projections, joined before the recurrence / the attention
     cudaStream_t side_ = nullptr;
@@ -660,6 +730,7 @@ private:
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
+    bool pcie_off_ = false;                                       // no PCIe share ever (--pcie-frac 0)
     // set_pcie_balance: per step (layer x group, stride 2 groups) the GPU's clock as the plan arrives, as the PCIe
     // part starts and as it waits for the CPU rows (4 words a step); the pool's ms, its experts, the PCIe ones, and
     // whether the step had a plan
@@ -687,6 +758,8 @@ private:
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     std::function<bool(cudaStream_t, std::string&)> pre_launch_;   // set_pre_launch
     int groups_[9] = {};
+    float* peer_rows_ = nullptr;
+    int32_t* h_peer_kind_ = nullptr; int32_t* m_peer_kind_ = nullptr;
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
     float* p2p_rows_ = nullptr;                                 // R17 1a: device-0 mirror of the CPU rows (STRATA_PEER_P2P_ROWS)
     // STRATA_VERIFY_DEFER_CPU=1 (opt-in, changes the output): a decode window's layer l adds the CPU's expert rows to the
@@ -710,6 +783,13 @@ private:
     float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
     uint8_t* xq_ = nullptr;                                   // T columns of q8_1
+    unsigned *h_mk_stall_ = nullptr, *m_mk_stall_ = nullptr;   // STRATA_MEGAKERNEL: a phase that never completed (mapped)
+    unsigned* mk_counters_ = nullptr;
+    const NativeHead* tp_head_half_ = nullptr;   // set_tp_head_split
+    int64_t tp_head_row0_ = 0;
+    float *hv_own_ = nullptr, *hv_peer_ = nullptr;   // the split head's picks (T x 4 floats each)
+    int32_t *h_hchk_ = nullptr, *m_hchk_ = nullptr;   // STRATA_TP_HEAD_CHECK: the full-vocabulary pick beside the split one (mapped)
+    long long hchk_rows_ = 0, hchk_bad_ = 0;                         // STRATA_MEGAKERNEL: the persistent kernel's phase counters
     uint8_t* xil_ = nullptr;                                  // fork F4: the interleaved copy of xq_'s 2-4 columns
     uint8_t* sh_xq_ = nullptr;                                // T columns of q8_1 for shared expert branch
     float *qkv_L_ = nullptr, *h_L_ = nullptr, *gate_L_ = nullptr, *beta_L_ = nullptr;   // per GDN layer
