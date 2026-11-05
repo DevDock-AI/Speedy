@@ -49,6 +49,7 @@
 #include "strata/core/stage_pool.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/sm120_series.hpp"
+#include "strata/core/amd_only_switches.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
@@ -2973,6 +2974,7 @@ static bool prepare_gated_window(strata::core::gated::Packet& packet,
 }
 
 int main(int argc, char** argv) {
+    strata::core::clear_amd_only_switches();   // RDNA3 port switches: HIP builds only
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
@@ -3278,6 +3280,10 @@ int main(int argc, char** argv) {
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
         else if (a == "--tensor-parallel") {
+#if !defined(STRATA_USE_HIP)
+            std::fprintf(stderr, "strata generate: --tensor-parallel is for the RX 7900 XTX (HIP) build only\n");
+            return 2;
+#endif
             o.tensor_parallel = 2;
             if (i + 1 < argc && (std::string(argv[i + 1]) == "1" || std::string(argv[i + 1]) == "2")) o.tensor_parallel = std::atoi(next("--tensor-parallel"));
         }
