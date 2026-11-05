@@ -18,7 +18,6 @@
 
 #include <cstdint>
 #include <string>
-#include <sys/types.h>
 
 namespace strata::core {
 
@@ -62,7 +61,7 @@ private:
     bool complete_ = false;
     std::string path_;        // the /dev/shm file, or the keeper's index file
     bool memfd_ = false;
-    pid_t keeper_ = 0;
+    long long keeper_ = 0;   // the memfd keeper's pid (Linux only; a plain integer so the header builds everywhere)
     std::string where_;
 };
 
