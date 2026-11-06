@@ -66,6 +66,26 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream,
                     int64_t ld16 = 0);   // ld16: y16's row stride (0 = 6144; S23 STRATA_PF_PAD pads it)
+/// TP prefill (docs/STRATA_TP_PREFILL_DESIGN_20261101.txt): the same kernels on card `rank`'s GDN head half -
+/// k-heads [8 rank, 8 rank + 8) and the v-heads whose head % 16 falls there - in the full-layout buffers and state; only
+/// that half's channels / heads / y16 columns are read and written, each with the one-card kernel's arithmetic.  Only
+/// the production variants (STRATA_GDN_CONVL2, chunks over 64 tokens; STRATA_GDN_HEAD + STRATA_GDN_CHUNKED with the WMMA
+/// scan, STRATA_GDN_CHUNK_GDV=0, T >= 128): false, nothing launched, otherwise (gdn_recurrence_tp_ok asks first).
+/// TP prefill: rank's GDN head-half columns of y16 (rows x ld halves; 24 heads x 128) to a dense
+/// [rows][3072] block and back; and a head half's recurrent + conv state (src, `layers` x `per_layer` floats, the
+/// session layout) written into the owner's full state (dst) - only that half's elements
+void tp_y16_pack(const uint16_t* y16, int64_t ld, int64_t rows, int rank, uint16_t* out, void* stream);
+void tp_y16_unpack(const uint16_t* in, int64_t rows, int rank, uint16_t* y16, int64_t ld, void* stream);
+void tp_gdn_merge(float* dst, const float* src, int64_t layers, int64_t per_layer, int rank, void* stream);
+bool gdn_conv_tp(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, int rank,
+                 void* stream);
+bool gdn_recurrence_tp_ok(int64_t T);
+bool gdn_recurrence_tp(float* state, const float* h, const float* gate, const float* beta, const float* z,
+                       const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream, int64_t ld16,
+                       int rank);
+/// Allocate the chunked recurrence's scratch and load its kernels now (STRATA_GDN_CHUNKED=1 + STRATA_GDN_CHUNK_GDV=0;
+/// the current device), not on the first prompt.
+void gdn_recurrence_warm();
 /// The kernels behind gdn_recurrence, for the parity test: 0 = the column-split kernels + the norm kernel (or the
 /// one-block-per-head kernel under STRATA_GDN_REC_HEADS), 1 = four lanes per column (no barrier per token) + the grid-stride norm, 2 = the
 /// one-block-per-head kernel (its fused norm rounds differently).  0 and 1 give the same bits.  On HIP, 0 and 1 run the opt-in
@@ -85,6 +105,9 @@ void gdn_recurrence_state_only(float* state, const float* h, const float* gate, 
 // ---- MoE
 /// softmax over 512, top-10 (ties to the lower id), weights renormalised over the ten (the native router).
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream);
+/// hist[ids[i]] += 1 for i < n (ids outside [0, n_expert) skipped): the prompt's routing counts of a layer,
+/// the order its lent cache slots are refilled in (generate.cpp's STRATA_REFILL_OVERLAP).
+void route_hist(const int32_t* ids, int64_t n, int32_t* hist, int64_t n_expert, void* stream);
 /// Expert blob (Strata pack layout, Q2_0) -> BF16 matrices: gate/up interleaved [1280, 2560], down [2560, 640].
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream);
 /// h16[n, r] = fp16(silu(gu[n, 2r]) * gu[n, 2r + 1])   (the interleaved expert gate/up)
@@ -99,6 +122,11 @@ void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream);
 /// dst[0, n) = src[0, n) in 16-byte loads (both 16-byte aligned; src may be mapped host memory: read over PCIe by
 /// the kernel, not queued on a copy engine).
 void copy_f32_wide(float* dst, const float* src, int64_t n, void* stream);
+/// dst[i] += src[i] (the routed walk's CPU sums into the MoE output)
+void add_f32(float* dst, const float* src, int64_t n, void* stream);
+/// waits (on the device) until *flag == want (a coherent mapped host flag the CPU raises), then
+/// dst[i] += src[i] with src in coherent mapped host memory
+void add_f32_mapped_wait(float* dst, const float* src, int64_t n, const uint32_t* flag, uint32_t want, void* stream);
 /// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
@@ -126,6 +154,15 @@ void peer_scatter_add(float* sum, const float* rows, const float* wk, const int3
 /// eddoursul/Strata's moe_gather_add, with the weight looked up through the row's pair.
 void peer_gather_add(float* sum, const float* rows, int64_t r0, const float* wk, const int32_t* pair, const int32_t* tok,
                      const int32_t* start, const int32_t* list, int64_t n_tok, void* stream);
+/// layer split, fused-path help: out[i] = ids[i] when flag[ids[i]] == want, else ne (the dummy expert that
+/// collects the pairs the other card computes, so neither card's grouping hands it their rows)
+void help_remap(const int32_t* ids, const uint8_t* flag, int want, int32_t* out, int64_t n, int ne, void* stream);
+/// out[t, :] = FP16 of sum over k with ids_r[t, k] != ne of w[t, k] * D[slot[t, k], :] (the helper's per-token sums)
+void help_sum16(const float* D, const int32_t* slot, const float* w, const int32_t* ids_r, int ne, uint16_t* out,
+                int64_t T, void* stream);
+/// bo[t, :] = (sum over k with ids_r[t, k] != ne of w[t, k] * D[slot[t, k], :]) + peer16[t, :] + shared * sigmoid(sg[t])
+void moe_combine_help16(const float* D, const int32_t* slot, const float* w, const int32_t* ids_r, int ne,
+                        const float* shared, const float* sg, const uint16_t* peer16, float* bo, int64_t T, void* stream);
 /// moe_combine_peer with the peer's sums in FP16 (`peer16`, may be mapped host memory)
 void moe_combine_peer16(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg,
                         const uint16_t* peer16, int64_t rows_local, float* bo, int64_t T, void* stream);

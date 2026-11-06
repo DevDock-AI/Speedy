@@ -2248,6 +2248,8 @@ bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, 
         const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
         static const bool fast = [] { const char* e = std::getenv("STRATA_PA_FAST"); return e != nullptr && e[0] == '1'; }();
         static const int64_t min_t = [] { const char* e = std::getenv("STRATA_PF_SWITCH_MIN_T"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
+        // (the merge with upstream 0.2.4: our STRATA_PA_KLDS kernel variant gave way to upstream's read-ahead kernel,
+        // acc94b21; STRATA_PA_KLDS is a no-op until re-measured)
         if (fast && n_q >= min_t)
             prompt_attn_wmma_kernel<false><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, 0, st>>>(
                 q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,

@@ -69,6 +69,8 @@ bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, con
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// STRATA_WAIT_FUSE: wait_flag_ge then copy_i32_from_mapped(dst, src, n) in one launch
+void wait_flag_copy_i32(const uint32_t* flag, uint32_t value, int32_t* dst, const int32_t* src, int64_t n, void* stream);
 /// wait_flag_ge and copy_i32_from_mapped in ONE launch (143-amdk): thread 0 spins on *flag >= value, the block then
 /// copies dst[0, n) = src[0, n) (mapped host memory, volatile reads).  One kernel node fewer per layer: a dependent
 /// kernel costs ~2.4 us on a gfx1201 graph whatever it does.  n <= 128 * k for any k (a strided loop).
@@ -105,14 +107,20 @@ void copy_rows_strided(float* dst, const float* src, int64_t rows, int64_t w, in
 /// routing order, their entries ascending), no PCIe groups.  *skip = ring when it did, else 0.
 /// #871: without `skip` (the all-resident graph) an entry whose expert is not in VRAM cannot be planned: the plan is
 /// left empty and *plan_err (mapped host memory) is set to 1, so the host sees it instead of running a stale plan.
+/// `partial` (tensor parallel by id): the entries whose expert is NOT in this card's table are left out of the plan
+/// (no group, no dst row: another card computes them), never an error; counts[1] is then the planned entries.
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
-                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err = nullptr);
+                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err = nullptr,
+                   bool partial = false);
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
 /// copy_i32_from_mapped unless *skip == value.
 void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, const uint32_t* skip, uint32_t value,
                                  void* stream);
+/// a check (STRATA_TP_NOMEMSET=2): the 32-bit words where a and b differ are counted into counter[0] (device or mapped
+/// memory; counter[1] counts the launches)
+void count_mismatch_f32(const float* a, const float* b, long long n, unsigned* counter, void* stream);
 /// copy_from_mapped, or zeros when *skip == value (n a multiple of 4, 16-byte aligned).
 void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const uint32_t* skip, uint32_t value,
                               void* stream);
@@ -195,6 +203,14 @@ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int3
 /// be mapped host memory read after the window's own sync.  Graph-capturable; CUDA and HIP.
 inline constexpr int kNonfiniteBlocks = 16;
 void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* flags, void* stream);
+/// TENSOR PARALLEL head split (STRATA_TP_HEAD_SPLIT): row t's greedy pick over a slice of the vocabulary - logits
+/// (n_rows, n), vocabulary ids [base, base + n) - as sampler_greedy_kernel orders it (the larger value, on equality the
+/// lower id; a NaN never wins), into vi[t * 4 .. + 4) = {value, id as int bits (`sentinel` when no candidate), 1 when
+/// the slice holds a non-finite logit, 0}.
+void head_argmax_part(const float* logits, int n_rows, int n, int base, int sentinel, float* vi, void* stream);
+/// The two slices' picks: `own` holds the LOWER ids (it wins a tie, as the full argmax would), `peer` the upper;
+/// out[t] = the id; a peer slice's non-finite flag is ORed into flags[t * kNonfiniteBlocks + kNonfiniteBlocks - 1].
+void head_argmax_combine(const float* own, const float* peer, int n_rows, int32_t* out, uint32_t* flags, void* stream);
 /// True where row_top_prob_split runs as its own kernel (CUDA; AMD keeps the one-block row_top_prob, so it calls
 /// that).  STRATA_MULTI_BLOCK_ARGMAX=0: off.
 bool multi_block_head_ops();
@@ -211,5 +227,25 @@ void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_str
 /// selects exactly what window_ids selects.  CUDA / HIP only.
 void window_ids_floor(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, const int32_t* floor_cell,
                       void* stream);
+
+// ---- TENSOR PARALLEL (docs/STRATA_TP_DESIGN_20261022.txt): two cards run every layer at half the heads and exchange
+// their partial sums through coherent pinned host memory, inside the window graph.  A card's exchange `k` of the window
+// waits for flag >= *epoch + k, where `epoch` is a DEVICE word tp_window_begin filled from the host's per-window value:
+// a captured graph then never repeats a flag value, so no flag needs a reset between windows.
+/// The window's first TP node: epoch_d <- *epoch_h (mapped host memory), *cnt <- 0.
+void tp_window_begin(uint32_t* epoch_d, unsigned* cnt, const uint32_t* epoch_h, void* stream);
+/// Exchange `k` (1, 2, ...) of the window over the `n` floats at `mine` (a multiple of 4).  mode 0, the all-reduce: the
+/// floats are stored into `peer_inbox`, `peer_flag` is raised to epoch + k once every block has stored (`cnt` counts
+/// the blocks of this card's publishing exchanges: `pub` is the sum of tp_exchange_blocks over them, this one's included -
+/// sends of different sizes in one window, e.g. the head split's q8_1 image and picks), the kernel waits for
+/// `my_flag` >= epoch + k and writes mine = partial(rank 0) + partial(rank 1), the same order on both cards.  mode 1
+/// (send): the store and the flag only.  mode 2 (receive): the wait, then mine <- my_inbox.
+/// The grid tp_exchange launches for n floats (a send's share of the publish count).
+int tp_exchange_blocks(int64_t n);
+void tp_exchange(float* mine, float* peer_inbox, const float* my_inbox, uint32_t* peer_flag, const uint32_t* my_flag,
+                 const uint32_t* epoch_d, uint32_t k, uint32_t pub, unsigned* cnt, int64_t n, int rank, int mode,
+                 void* stream, bool vram = false);
+/// Spin until *flag >= *epoch_d + k (a mapped host flag the host raises: the TP PLE rows, gathered once for both cards).
+void tp_wait_epoch(const uint32_t* flag, const uint32_t* epoch_d, uint32_t k, void* stream);
 
 }  // namespace strata::kernels

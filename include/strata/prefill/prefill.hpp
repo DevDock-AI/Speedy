@@ -211,6 +211,11 @@ public:
     /// mid-prompt checkpoint takes each stage's part.  Runs on that stage's thread, with its device current.
     std::function<bool(int64_t done, std::string& err)> on_stage_chunk;
 
+    /// DP (run_dp): called on this path's thread once its share of the prompt is read and its device is
+    /// idle - the other path still reading.  Its prompt buffers are free from here (the hand-off pushes, the other
+    /// path never reads them), so the caller can give their slots back while the other GPU finishes.
+    std::function<bool(std::string& err)> on_dp_done;
+
     /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
     std::function<bool()> should_stop;
     /// The first stage only, checked before every chunk but the first: true ends the run there as if the prompt
@@ -263,6 +268,12 @@ public:
     /// thread runs meanwhile (no batch slots); on a layer split every stage may have it - one stage at a time takes it
     /// for a chunk. Set before `init`.
     void set_cpu_pool(kernels::cpu::ExpertPool* pool);
+    /// the prompt's routing counts, per (layer, expert) [n_layers * n_expert], summed over every chunk this
+    /// path read since the last `route_hist_reset` (on: a tiny histogram kernel after each layer's router, one 96 KB
+    /// download a chunk).  generate.cpp refills a long prompt's lent cache slots in this order (STRATA_REFILL_OVERLAP).
+    void route_hist_enable(bool on) { route_hist_on_ = on; }
+    const std::vector<int32_t>& route_hist() const { return route_hist_; }
+    void route_hist_reset() { std::fill(route_hist_.begin(), route_hist_.end(), 0); }
     /// With STRATA_PREFILL_CPU_SHARE set and `applies` (a pool will be set): the chunks staged after their routing - the
     /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 3072) instead of 1024.
     /// Before any `bytes_needed` (the ring and the small-chunk buffers follow the limit); `init` also sets it.
@@ -279,6 +290,50 @@ public:
         return p->lm_mid_;
     }
 
+    /// DUAL DATA-PARALLEL prompt path (STRATA_DP_PREFILL, docs/DP_PREFILL_DESIGN.md).  Two prompt paths on two
+    /// GPUs both run ALL layers, each on every other chunk of a long prompt; chunk k+1 at layer l waits (cross-device
+    /// event) for chunk k's state of layer l, which the GPU that ran chunk k copies into the other GPU's state buffers
+    /// (GDN state, indexer rows and tail, PLE history; the K/V go through the streamed layers' shared host copy).
+    /// `foreign`: this GPU's session for the layers it does not own in decode (the owned ones stay in init's `ss`);
+    /// `own_lb`/`own_le`: the layers whose experts this GPU's cache holds (the others are streamed).  Both paths must
+    /// have run `init` with chunk >= the DP chunk.  `index` 0 / 1.
+    struct DpLink;
+    /// TP by id (--tensor-parallel 2): this path's residency table maps its own card's cache for EVERY layer
+    /// (each card holds half of every layer's hot experts), so a DP prompt reads every layer's resident experts from
+    /// it instead of only its layer-split half's (32K: ~2,500 fewer experts streamed a card).
+    void set_dp_full_residency(bool on) { dp_full_res_ = on; }
+    /// STRATA_TP_SHARE_DP: the foreign session's VRAM is the TP session's too; run_dp zeroes it before use
+    void set_dp_foreign_shared(bool on) { dp_foreign_shared_ = on; }
+    /// TP by id: the layer split's stage helper (set_stage_helper) holds its own card's half of THIS stage's
+    /// layers' hot experts in its cache (its table maps its own cache for every layer): a helped one-chunk prompt has
+    /// the helper compute those experts from its cache instead of this card streaming them (STRATA_HELP_PEER_RES=0: off)
+    void set_help_peer_residency(bool on) { help_peer_res_ = on; }
+    void set_dp(Prefill* peer, core::SessionState* foreign, int64_t own_lb, int64_t own_le, std::shared_ptr<DpLink> link,
+                int index);
+    bool dp_ready() const { return dp_link_ != nullptr; }
+    /// Read [pos0, pos0 + n) on `a` and `b` together in chunks of up to `chunk` tokens; the last chunk runs on `b` (the
+    /// drafter's GPU) and is at least `min_last` tokens when the prompt allows.  `b`'s on_chunk reports b's chunks.
+    static bool run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, int64_t pos0, int64_t chunk,
+                       int64_t min_last, std::string& err);
+    static std::shared_ptr<DpLink> make_dp_link(int n_layers, int dev_a, int dev_b, std::string& err);
+
+    /// TENSOR-PARALLEL prompt path (STRATA_TP_PREFILL=1, docs/STRATA_TP_PREFILL_DESIGN_20261101.txt).  The two DP
+    /// paths (set_dp, the same link and foreign sessions) read the SAME chunks together, every layer on both GPUs: each
+    /// owns half of a chunk's tokens (a: the first) for the per-token work, the GDN layers run by head half over all the
+    /// chunk's tokens, the QSA layers by query half (both append every K/V cell), the routed experts by id (each GPU the
+    /// experts its cache holds and its share of the others, for every token; FP16 partial sums back to the owners).
+    /// Chunks of up to `chunk` tokens (and the layouts').  The drafter's GPU (b) reports at least the prompt's last
+    /// `min_last` positions through its on_chunk.  false with err "prefill TP: ..." before anything ran: not applicable
+    /// (the caller reads the prompt another way).
+    static bool run_tp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, int64_t pos0, int64_t chunk,
+                       int64_t min_last, std::string& err);
+    /// STRATA_TP_PREFILL=1 (default off)
+    static bool tp_prefill_env();
+    /// The layouts init / relayout / bytes_needed make from here on carve the TP exchange buffers (a TP read's loan) or
+    /// not (every other read's: no TP bytes in their loans); tp_layout_now: this path's current layout has them
+    static void set_tp_layout(bool on);
+    bool tp_layout_now() const;
+
 private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);
@@ -293,12 +348,47 @@ private:
     void lm_release();
     bool lm_mid_ = false;
     bool lm_by_default_ = false;   ///< the walk is on because nothing was set (a wider VRAM margin, the measured super-chunk size)
+
+    bool route_hist_on_ = false;                     ///< route_hist_enable
+    std::vector<int32_t> route_hist_;                ///< route_hist
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     bool drain_pipeline(std::string& err);
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
+    // DP: see set_dp
+    Prefill* dp_peer_ = nullptr;
+    core::SessionState* dp_foreign_ = nullptr;
+    int64_t dp_own_lb_ = 0, dp_own_le_ = 0;
+    bool dp_full_res_ = false;   // this card's table maps its own cache for every layer (TP by id)
+    bool help_peer_res_ = false; // set_help_peer_residency
+    bool dp_foreign_shared_ = false;   // set_dp_foreign_shared
+    std::shared_ptr<DpLink> dp_link_;
+    int dp_index_ = 0;
+    struct DpChunk { int64_t c0, T, k; int who; };
+  public:
+    /// the DP read in flight (or the last one): the first position of its last chunk (the second path's); every
+    /// position before it is final once the first path is done (on_dp_done).  -1: no DP read yet
+    int64_t dp_last_start() const { return dp_last_p0_; }
+  private:
+    int64_t dp_last_p0_ = -1;
+    std::vector<DpChunk> dp_plan_;      ///< set by run_dp for one prompt: every chunk, and who reads it
+    std::vector<int32_t> dp_res_;       ///< this GPU's residency view for one prompt (foreign layers -1)
+    bool dp_active_ = false;
+    bool dp_wait(int64_t l, int64_t k, std::string& err);
+    // TP prefill (run_tp): this run's mode, the chunk counter the exchanges are numbered by, the drafter's tail,
+    // which experts this GPU computes ([l * n_expert + e] = 1), the GDN head halves' hand-back
+    bool tp_active_ = false;
+    int64_t tp_chunk_ = 0;
+    int64_t tp_report_from_ = 0;            // the first prompt position the drafter's path reports (n - min_last)
+    std::vector<uint8_t> tp_mine_;
+    bool tp_post(int64_t l, int x, std::string& err);                    // this GPU's exchange x of layer l is sent
+    bool tp_take(int64_t l, int x, void* stream, std::string& err, int64_t want = -1);   // the other GPU's has landed
+                                                                                          // (for chunk `want`, -1: this one)
+    bool tp_send(int64_t l, int x, void* dst, const void* src, size_t bytes, std::string& err);
+    bool tp_gdn_back(std::string& err);                                  // each GDN layer's other head half to its owner
+    bool dp_publish(int64_t l, int64_t k, int64_t p0, int64_t T, std::string& err);
     std::vector<int> tap_layers_;
     int64_t tap_first_ = 0, tap_cap_ = 0;
     float* tap_dev_ = nullptr;
@@ -311,6 +401,8 @@ private:
     int64_t force_chunk_ = 0;           ///< force_chunk, for the next run (0: none)
     bool force_single_ = false, force_planned_ = false;
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
+    bool bind_fused_helper(int64_t T);  // the same on the fused int8 kernels
+    bool make_stage_helper(Prefill* helper, std::string& err);  // set_stage_helper's streams and events
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
     /// STRATA_HANDOFF_PIPE: the previous stage's per-piece "landed in hand_in_" events (cudaEvent_t[hand_pieces_],
     /// on its device) when it copies the chunk in pieces without a host wait; null with the one-copy hand-off

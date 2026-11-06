@@ -238,7 +238,8 @@ __global__ void copy_from_mapped_kernel(float4* __restrict__ dst, const volatile
 __global__ void copy_rows_from_mapped_kernel(float4* __restrict__ dst, const volatile float4* src, int64_t row4,
                                              const int32_t* __restrict__ hit_rows, const int32_t* __restrict__ count,
                                              const volatile uint32_t* wait_flag = nullptr, uint32_t wait_value = 0,
-                                             const volatile float4* p2p = nullptr) {
+                                             const volatile float4* p2p = nullptr,
+                                             const float4* peer_src = nullptr, const volatile int32_t* peer_kind = nullptr) {
     const int row = blockIdx.x;
     __shared__ int hit;
     if (threadIdx.x == 0) {
@@ -257,6 +258,9 @@ __global__ void copy_rows_from_mapped_kernel(float4* __restrict__ dst, const vol
         hit = h;
     }
     __syncthreads();
+#if defined(__HIPCC__)
+    if (wait_flag != nullptr) __threadfence_system();   // every wave's acquire (RDNA3: else stale lines of the reused rows)
+#endif
     float4* d = dst + (int64_t) row * row4;
     if (hit == 1) {
         for (int64_t i = threadIdx.x; i < row4; i += blockDim.x) d[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -264,7 +268,7 @@ __global__ void copy_rows_from_mapped_kernel(float4* __restrict__ dst, const vol
         const volatile float4* sr = p2p + (int64_t) row * row4;
         for (int64_t i = threadIdx.x; i < row4; i += blockDim.x) d[i] = const_cast<const float4*>(sr)[i];
     } else {
-        const volatile float4* sr = src + (int64_t) row * row4;
+        const volatile float4* sr = (peer_src && peer_kind && peer_kind[row]==2 ? peer_src : src) + (int64_t) row * row4;
         for (int64_t i = threadIdx.x; i < row4; i += blockDim.x) d[i] = const_cast<const float4*>(sr)[i];
     }
 }
@@ -286,14 +290,14 @@ void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t
     scatter_rows_kernel<<<(unsigned) n, 128, 0, (cudaStream_t) stream>>>((const float4*) src, (float4*) dst, rows, width / 4);
 }
 void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t width, const int32_t* hit_rows,
-                           const int32_t* count, void* stream) {
+                           const int32_t* count, void* stream, const float* peer_src, const int32_t* peer_kind) {
     if (rows <= 0) return;
     if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
         std::fprintf(stderr, "copy_rows_from_mapped: width must be a multiple of 4 and both pointers 16-byte aligned\n");
         std::exit(1);
     }
     copy_rows_from_mapped_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) src,
-                                                                                  width / 4, hit_rows, count);
+                                                                                  width / 4, hit_rows, count, nullptr, 0, nullptr, (const float4*)peer_src, peer_kind);
 }
 void copy_rows_from_mapped_after(const uint32_t* flag, uint32_t value, float* dst, const float* src, int64_t rows,
                                  int64_t width, const int32_t* hit_rows, const int32_t* count, void* stream) {
@@ -414,7 +418,7 @@ __global__ void copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const vol
     for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
 }
 
-#if !defined(__HIPCC__)
+// (built on HIP too: the drafter's STRATA_MTP_MULTICOPY=1 uses it; the verifier's HIP paths keep their separate copies)
 struct MappedCopies {
     MappedCopy c[8];
 };
@@ -445,20 +449,12 @@ void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {
     copy_from_mapped_multi_kernel<<<dim3(bx < 1 ? 1 : bx, (unsigned) n), 256, 0, (cudaStream_t) stream>>>(a);
     check_launch("copy_from_mapped_multi");
 }
-#endif
 
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
     copy_i32_from_mapped_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n);
     check_launch("copy_i32_from_mapped");
 }
-
-#if defined(__HIPCC__)   // AMD keeps one copy a launch
-void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {
-    for (int i = 0; i < n; ++i)
-        copy_i32_from_mapped((int32_t*) copies[i].dst, (const int32_t*) copies[i].src, copies[i].words, stream);
-}
-#endif
 
 void doorbell_ring(uint32_t* d_seq, void* stream) {
     if (d_seq == nullptr) return;

@@ -108,8 +108,11 @@ public:
     /// One round: catch-up over T cells from `p` (rows = the window's final residuals, `tokens` = the window's
     /// argmaxes: row t pairs R_{p+t} with the token at p+t+1), then the draft chain from row `a` (the last
     /// accepted row) for T-1 drafts at cells p+a+1 ...  `drafts` gets T-1 tokens.
+    /// `between` (STRATA_MTP_DRAFT_ALL=1 only): host work run after the round's launches and before the wait for its
+    /// drafts (the TP loop issues the other card's commit there: the draft's GPU time hides it).
     bool draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
-               float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr, DraftResult* result = nullptr);
+               float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr, DraftResult* result = nullptr,
+               const std::function<void()>* between = nullptr);
 
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     /// STRATA_SPEC_COST: called after each draft step with (index, probability) instead of the `min_p` test; false ends the chain.
@@ -239,6 +242,18 @@ private:
     bool hnorm_stream_ = false;
     bool q4_ = false, q4_head_ = false;
     uint8_t* dense4_ = nullptr;              ///< --mtp-q4: Q4_0 copies of the Q8_0 tensors
+    /// STRATA_MTP_GR_R8=1: int8 + fp16-scale images of the three hyper-connections' down / up projections (the
+    /// verifier's STRATA_GR_RDNA_Q8 form, rdna_gr.cu), so each read is one rdna_gr_fused launch instead of down + up.
+    /// [0,1] the attention read, [2,3] the MLP read, [4,5] the final mixer; null: the BF16 read
+    void* hc_r8_[6] = {};
+    bool hc_r8_allowed_ = true;
+    bool make_hc_r8(std::string& err);
+public:
+    /// STRATA_MTP_GR_R8's single-kernel read spins at a grid barrier: where a draft chain can run beside a verify
+    /// window on the same card (--pipeline-windows' loop) the two grid-barrier kernels deadlock each other, so that loop
+    /// refuses it (measured: 2-GPU Q4 hung at layer 24).  Call before bind.
+    void set_hc_r8_allowed(bool on) { hc_r8_allowed_ = on; }
+private:
     std::vector<std::pair<std::string, uint64_t>> q4_off_;
     int dhead_type_ = -1;                    ///< the draft head subset's ggml type (the main head's, or Q4_0)
     std::string dvocab_path_;
@@ -271,6 +286,10 @@ private:
     cudaStream_t side_ = nullptr;                    // the shared expert's branch of the draft graphs (CUDA)
     cudaEvent_t sh_fork_ = nullptr, sh_join_ = nullptr;
     cudaGraphExec_t round_exec_[9] = {};
+    cudaGraphExec_t all_exec_[2][9][9] = {};   ///< STRATA_MTP_DRAFT_ALL: [coupled][T][max_steps] the round and its steps as one graph
+    bool capture_all(int T, int max_steps, bool coupled, std::string& err);
+    bool record_round_graph(int T, bool coupled, std::string& err);
+    bool record_step_graph(int j, bool coupled, std::string& err);
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
     std::vector<Tensor> tensors_;
@@ -314,6 +333,7 @@ private:
     /// and with --pipeline-windows a chain and that stage's window can run on the card at once)
     strata::kernels::GrWorkspace own_gr_;
     uint8_t* xq_ = nullptr;
+    unsigned* qcnt_ = nullptr;   ///< STRATA_MTP_QFUSE: the hyper-connection reads' q8_1 counters (n_embd / 32 words, zero between reads)
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr;
     float* attn_scratch_ = nullptr;
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *y_ = nullptr, *sample_ = nullptr;
