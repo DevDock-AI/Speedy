@@ -794,7 +794,10 @@ def _close_verdict(after: str, final: bool) -> str:
     text decide, so a call is never held longer than that."""
     m = re.match(r"(?:</function>)?\s*</tool_call>", after)
     if not m:
-        return "end"                                       # only `</function>` so far, or the call is cut: as before
+        tail = after[len(FUNC_END):].lstrip() if after.startswith(FUNC_END) else after
+        if not final and CALL_END.startswith(tail):
+            return "hold"                                  # #5040: `</tool_call>` is still arriving: a streamed view must not end the value yet
+        return "end"                                       # the call is cut, or it has no wrapper: as before
     rest = after[m.end():].lstrip()
     if not rest:
         return "end" if final else "hold"                  # the usual call: the turn ends right after it
@@ -1324,9 +1327,9 @@ class OutputParser:
         self._line_blocks = None
 
     def _track(self, text: str) -> str:
-        """Follow the reasoning text that has gone out: the open code fence, the current line, and the backticks of
-        the current paragraph.  Returns the text."""
-        # Most token fragments stay on the current line. Fence and paragraph
+        """Follow the reasoning text that has gone out: the open code fence, the current line and the inline-code
+        parity of the paragraph.  Returns the text."""
+        # Most token fragments stay on the current line. Fence and line
         # bookkeeping happens only when a newline completes that line.
         if "\n" not in text:
             if text:
@@ -1358,7 +1361,16 @@ class OutputParser:
                 elif not s:
                     self.ticks = 0
                 else:
+                    # #4923: an unmatched backtick followed by prose on its line ("Let me use `run_commands to
+                    # check.") is a stray marker, not the opening of a code span that goes on into the next line
+                    # and hides every later call.  A span does go on from a backtick at the end of its line ("Use `"
+                    # and the example on the next line) or one immediately followed by a tag ("Use `<tool_call>`"),
+                    # the two shapes #804/#1058 keep as text.
                     self.ticks += line.count("`")
+                    if self.ticks % 2 == 1:
+                        after = line[line.rfind("`") + 1:].strip()
+                        if after and not after.startswith("<"):
+                            self.ticks -= 1
                 # #4703: an indented (4 spaces or a tab) code block starts after a blank line and goes on until a line that is not indented
                 if was_fenced or self.fence:
                     self._prev_blank = self._indented = False
@@ -1376,7 +1388,7 @@ class OutputParser:
 
     def _opener_ok(self) -> bool:
         """The reasoning text so far puts a `<tool_call>` at the start of a line, outside a code fence and outside
-        inline code."""
+        inline code (`_in_code`)."""
         return not self.fence and not self.line.strip() and self.ticks % 2 == 0 and not self._in_indented_block()
 
     def _in_indented_block(self) -> bool:
@@ -1861,9 +1873,10 @@ class OutputParser:
                 if self.stream_tools:
                     if i >= 0:
                         whole, self.buf = self.buf, self.buf[:i]     # scan only the body
+                        final, self._final = self._final, True       # #5040: its end is known, so no closing tag is still arriving
                         out += self._scan()
                         out += self._close_scan()
-                        self.buf = whole
+                        self.buf, self._final = whole, final
                     else:
                         out += self._scan()
                 if i < 0 or drop is None:
