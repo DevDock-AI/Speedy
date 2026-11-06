@@ -9558,9 +9558,20 @@ int main(int argc, char** argv) {
     };
     // Room in every card's indexer for `cells` cells (rounded up to a step).  `quiesce`: as kvg_ensure's.
     auto ixg_ensure = [&](int64_t cells, const std::function<void()>& quiesce) -> bool {
-        if (!ixg.on || cells <= ixg.cells) return true;
+        if (!ixg.on || (cells <= ixg.cells && cells <= strata::core::qsa_kv_host_elastic_cells())) return true;
         const int64_t target = std::min<int64_t>(o.max_context, (cells + ixg.step - 1) / ixg.step * ixg.step);
         bool quiet = false, evicted_any = false;
+        // STRATA_KV_HOST_ELASTIC: the K/V host copies first (RAM; refused when MemAvailable cannot cover it)
+        if (strata::core::qsa_kv_host_elastic() && target > strata::core::qsa_kv_host_elastic_cells()) {
+            std::string why;
+            if (!strata::core::qsa_kv_host_elastic_grow(target, why)) {
+                std::fprintf(stderr, "strata: the K/V host copy could not grow to %lld cells: %s\n", (long long) target,
+                             why.c_str());
+                return false;
+            }
+            std::fprintf(stderr, "strata: K/V host copy grown to %lld cells (%.2f GiB pinned)\n", (long long) target,
+                         (double) strata::core::qsa_kv_host_bytes() / 1073741824.0);
+        }
         for (IxPart& p : ixg.parts) {
             const strata::core::OnDevice on(p.dev);
             const int64_t need = strata::core::qsa_idx_elastic_need(target, p.dev);
@@ -9702,6 +9713,12 @@ int main(int argc, char** argv) {
             any = true;
         }
         if (any && !ixg_res_put_all()) return false;
+        if (strata::core::qsa_kv_host_elastic()) {   // STRATA_KV_HOST_ELASTIC: the host copies back to the initial cells
+            strata::core::qsa_kv_host_elastic_shrink(target);
+            std::fprintf(stderr, "strata: K/V host copy back to %lld cells (%.2f GiB pinned)\n",
+                         (long long) strata::core::qsa_kv_host_elastic_cells(),
+                         (double) strata::core::qsa_kv_host_bytes() / 1073741824.0);
+        }
         ixg.cells = strata::core::qsa_idx_elastic_cells(-1);
         ++ixg.trims;
         std::fprintf(stderr, "strata: elastic indexer trimmed to %lld cells; slots back to the expert cache\n",
@@ -18785,7 +18802,7 @@ int main(int argc, char** argv) {
                                cudaMemcpyHostToDevice);
                 }
                 // the elastic K/V: the window's cells and the drafter's beyond them
-                if ((kvg.on && p + T + 64 > kvg.cells || ixg.on && p + T + 64 > ixg.cells) &&
+                if ((kvg.on && p + T + 64 > kvg.cells || ixg.on && (p + T + 64 > ixg.cells || p + T + 64 > strata::core::qsa_kv_host_elastic_cells())) &&
                     !kvg_ensure(p + T + 64, [&] { std::string we; (void) dv.wait_commit(we); adapt_quiesce(); late_apply(true); })) {
                     std::printf("ERR the K/V cannot grow: no VRAM is left\n");
                     return 1;

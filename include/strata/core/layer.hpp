@@ -298,7 +298,13 @@ int64_t qsa_idx_elastic_cells(int dev);
 int64_t qsa_idx_elastic_need(int64_t cells, int dev);
 bool qsa_idx_elastic_grow(int64_t cells, int dev, const std::function<strata::core::VmmChunk()>& take);
 int64_t qsa_idx_elastic_shrink(int64_t cells, int dev, const std::function<void(strata::core::VmmChunk)>& give);
-uint64_t qsa_idx_elastic_mapped_bytes(int dev);   ///< STRATA_ROPE_HOST=1: RoPE cos/sin tables in pinned host memory, not VRAM
+uint64_t qsa_idx_elastic_mapped_bytes(int dev);
+/// STRATA_KV_HOST_ELASTIC=1 (opt-in, with STRATA_IDX_ELASTIC): the KV-streaming host copies pinned only up to the
+/// cells requests reach (layer.cpp). grow false: refused (why says so), nothing half-done that matters.
+bool qsa_kv_host_elastic();
+int64_t qsa_kv_host_elastic_cells();
+bool qsa_kv_host_elastic_grow(int64_t cells, std::string& why);
+void qsa_kv_host_elastic_shrink(int64_t cells);   ///< STRATA_ROPE_HOST=1: RoPE cos/sin tables in pinned host memory, not VRAM
 /// Cells every elastic state can hold now (INT64_MAX when none is elastic).
 int64_t qsa_kv_elastic_cells();
 /// Chunks still to map for every elastic state to hold `cells` cells.
