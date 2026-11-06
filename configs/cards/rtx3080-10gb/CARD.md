@@ -49,3 +49,6 @@
   [docs/TUNING-HISTORY.md](../../../docs/TUNING-HISTORY.md).
 - 10 GB is the limit that shapes these presets: `--kv-resident 20480`, `--vram-reserve-mib 700` and the layer split
   are sized for it. A card with more VRAM should start from here and raise them.
+- 2x UD-IQ4_XS (`2x/strata-ud-iq4_xs-2gpu-pw2.json`, 2026-11-06): `--prefill auto:16384` caps the prompt chunk at
+  16384 (55K prefill +7 %, 110K +9.5 %, 185K +11 %; 12288 and 20480 were slower) and `--kv-resident 24576`
+  keeps more KV cells on the cards (decode +3.6 %, 20K-110K, same VRAM peak). Both: 3 A/B pairs + quality gate 8/8 + 4/4.
