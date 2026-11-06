@@ -771,6 +771,14 @@ int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
+// STRATA_ROPE_HOST=1 (opt-in, default off): the RoPE cos/sin tables (max_cells x n_rot/2 x 2 fp32, 256 MiB per card
+// at 1M cells) live in pinned, device-mapped host memory instead of the session arena. The values are the same bytes
+// (the same host build), only their home changes; the kernels read a few rows per token over PCIe.
+bool qsa_rope_host() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_ROPE_HOST"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
@@ -784,7 +792,7 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     n += (uint64_t) s.idx_dim * 4;                                             // dead
     n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                             // pooled
     n += 16;                                                                   // block_pos
-    if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
+    if (with_rope && !qsa_rope_host()) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
     n += strata::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
     n += (uint64_t) s.n_head * 4;                                              // pos_dev
     return align_up16(n) + 256;
@@ -885,6 +893,19 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     if (share_rope != nullptr) {
         st.cos_tab = share_rope->cos_tab;
         st.sin_tab = share_rope->sin_tab;
+    } else if (qsa_rope_host()) {
+        const size_t per = (size_t) max_cells * (size_t) (s.n_rot / 2);
+        float* h = nullptr;
+        float* d = nullptr;
+        if (strata::core::host_alloc_guarded((void**) &h, per * 4 * 2, cudaHostAllocMapped | cudaHostAllocPortable) !=
+                cudaSuccess || cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
+            std::fprintf(stderr, "strata: STRATA_ROPE_HOST: cannot pin %.1f MiB of RAM for the RoPE table\n",
+                         (double) (per * 8) / 1048576.0);
+            return 0;
+        }
+        st.rope_host = h;
+        st.cos_tab = d;
+        st.sin_tab = d + per;
     } else {
         st.cos_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
         st.sin_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));

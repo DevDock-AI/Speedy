@@ -138,6 +138,12 @@ void session_release(SessionState& s) {
         if (s.qsa_states[j].owns_rope) {
             strata::kernels::rope_table_release(s.qsa_states[j].cos_tab);
             s.qsa_states[j].owns_rope = false;
+            if (s.qsa_states[j].rope_host != nullptr) {
+                auto& pin = pin_detail::st();
+                std::lock_guard<std::mutex> lock(pin.mu);
+                pin_detail::free_locked(pin, s.qsa_states[j].rope_host);
+                s.qsa_states[j].rope_host = nullptr;
+            }
         }
 }
 

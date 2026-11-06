@@ -249,6 +249,7 @@ struct QsaState {
     int32_t* idx_block_pos = nullptr;
 
     float* cos_tab = nullptr;        ///< (max_cells, n_rot/2), built on the HOST in float64
+    float* rope_host = nullptr;      ///< STRATA_ROPE_HOST=1: the cos+sin tables live in this pinned, device-mapped block
     bool owns_rope = false;          ///< built the table above (not borrowed with share_rope): it releases it
     float* sin_tab = nullptr;
 
@@ -288,6 +289,7 @@ void qsa_set_kv_resident(int64_t cells);
 /// captured graphs stay valid.  Set before sizing and initializing the session and the drafter.
 void qsa_set_kv_elastic(bool enabled, int64_t init_cells);
 bool qsa_kv_elastic();
+bool qsa_rope_host();   ///< STRATA_ROPE_HOST=1: RoPE cos/sin tables in pinned host memory, not VRAM
 /// Cells every elastic state can hold now (INT64_MAX when none is elastic).
 int64_t qsa_kv_elastic_cells();
 /// Chunks still to map for every elastic state to hold `cells` cells.

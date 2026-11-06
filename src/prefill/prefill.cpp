@@ -1124,6 +1124,7 @@ struct PrefillWarmer {
     }
 };
 
+namespace { int64_t pf_sel_batch(); }   // STRATA_PF_SEL_BATCH, below
 struct Prefill::Impl {
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
@@ -1157,7 +1158,7 @@ struct Prefill::Impl {
     PinnedUpload steps_up;
     int32_t* sel_ids = nullptr;
     float* sel_scores = nullptr;          // [sel_batch, max_blocks]
-    int64_t sel_batch = 256, max_blocks = 0;
+    int64_t sel_batch = pf_sel_batch(), max_blocks = 0;
     float* attn_scratch = nullptr;
     int64_t attn_batch = 32, cap = 0;
     // MoE
@@ -1524,6 +1525,17 @@ uint64_t gdn_set_bytes(size_t T) {
     a.take<float>(T * HV, ok); a.take<float>(T * C, ok); a.take<float>(T * ZV, ok);
     a.take<uint16_t>(T * (ZV + (pf_pad() ? ZV_PAD : 0)), ok);
     return a.used;
+}
+// STRATA_PF_SEL_BATCH=N (opt-in; default 256 = unchanged): queries per prefill selection batch. The score scratch is
+// [sel_batch, max_blocks] fp32 = 256 MiB per card at 1M cells with 256; 64 cuts it to 64 MiB. Each query's scores and
+// top-k do not depend on which batch it is in, only the number of launches changes. Multiple of 16, 16..256.
+int64_t pf_sel_batch() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_PF_SEL_BATCH");
+        const long long n = e != nullptr ? std::atoll(e) : 256;
+        return (int64_t) (n >= 16 && n <= 256 && n % 16 == 0 ? n : 256);
+    }();
+    return v;
 }
 uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_batch, int64_t attn_batch,
                        const strata::kernels::QsaShapes& s) {
@@ -3153,7 +3165,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     strata::kernels::QsaShapes s = core::qsa_shapes(g);
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
-    o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
+    o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, pf_sel_batch(), 32, s),
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, src)),
                                        hcr ? hc_set_bytes(T, f16_io) : (uint64_t) 0}), ok);
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
