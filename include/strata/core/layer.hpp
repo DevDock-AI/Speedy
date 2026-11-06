@@ -289,7 +289,16 @@ void qsa_set_kv_resident(int64_t cells);
 /// captured graphs stay valid.  Set before sizing and initializing the session and the drafter.
 void qsa_set_kv_elastic(bool enabled, int64_t init_cells);
 bool qsa_kv_elastic();
-bool qsa_rope_host();   ///< STRATA_ROPE_HOST=1: RoPE cos/sin tables in pinned host memory, not VRAM
+bool qsa_rope_host();
+/// STRATA_IDX_ELASTIC=<cells> (opt-in): the pooled indexer keys in per-layer VMM ranges mapped up to the cells the
+/// requests reach (layer.cpp). `dev` < 0: every device. Cells are rounded to whole 2 MiB chunks per layer.
+bool qsa_idx_elastic();
+int64_t qsa_idx_elastic_init();
+int64_t qsa_idx_elastic_cells(int dev);
+int64_t qsa_idx_elastic_need(int64_t cells, int dev);
+bool qsa_idx_elastic_grow(int64_t cells, int dev, const std::function<strata::core::VmmChunk()>& take);
+int64_t qsa_idx_elastic_shrink(int64_t cells, int dev, const std::function<void(strata::core::VmmChunk)>& give);
+uint64_t qsa_idx_elastic_mapped_bytes(int dev);   ///< STRATA_ROPE_HOST=1: RoPE cos/sin tables in pinned host memory, not VRAM
 /// Cells every elastic state can hold now (INT64_MAX when none is elastic).
 int64_t qsa_kv_elastic_cells();
 /// Chunks still to map for every elastic state to hold `cells` cells.

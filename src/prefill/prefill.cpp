@@ -1124,7 +1124,7 @@ struct PrefillWarmer {
     }
 };
 
-namespace { int64_t pf_sel_batch(); }   // STRATA_PF_SEL_BATCH, below
+namespace { int64_t pf_sel_batch(int64_t max_blocks); }   // STRATA_PF_SEL_BATCH, below
 struct Prefill::Impl {
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
@@ -1158,7 +1158,7 @@ struct Prefill::Impl {
     PinnedUpload steps_up;
     int32_t* sel_ids = nullptr;
     float* sel_scores = nullptr;          // [sel_batch, max_blocks]
-    int64_t sel_batch = pf_sel_batch(), max_blocks = 0;
+    int64_t sel_batch = 256, max_blocks = 0;
     float* attn_scratch = nullptr;
     int64_t attn_batch = 32, cap = 0;
     // MoE
@@ -1529,13 +1529,22 @@ uint64_t gdn_set_bytes(size_t T) {
 // STRATA_PF_SEL_BATCH=N (opt-in; default 256 = unchanged): queries per prefill selection batch. The score scratch is
 // [sel_batch, max_blocks] fp32 = 256 MiB per card at 1M cells with 256; 64 cuts it to 64 MiB. Each query's scores and
 // top-k do not depend on which batch it is in, only the number of launches changes. Multiple of 16, 16..256.
-int64_t pf_sel_batch() {
-    static const int64_t v = [] {
+// With STRATA_IDX_ELASTIC (and no STRATA_PF_SEL_BATCH) the batch is scaled so the scratch is what an engine of the
+// elastic indexer's initial cells would carve (1M with 262144 initial: 64), so the startup lend plan - and the
+// prompt chunk it picks - is the short-context engine's.
+int64_t pf_sel_batch(int64_t max_blocks) {
+    static const int64_t env = [] {
         const char* e = std::getenv("STRATA_PF_SEL_BATCH");
-        const long long n = e != nullptr ? std::atoll(e) : 256;
-        return (int64_t) (n >= 16 && n <= 256 && n % 16 == 0 ? n : 256);
+        const long long n = e != nullptr ? std::atoll(e) : 0;
+        return (int64_t) (n >= 16 && n <= 256 && n % 16 == 0 ? n : 0);
     }();
-    return v;
+    if (env > 0) return env;
+    if (strata::core::qsa_idx_elastic() && max_blocks > 0) {
+        const int64_t init_blocks = strata::core::qsa_idx_elastic_init() / 4 + 2;
+        const int64_t b = 256 * init_blocks / max_blocks / 16 * 16;
+        return std::max<int64_t>(16, std::min<int64_t>(256, b));
+    }
+    return 256;
 }
 uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_batch, int64_t attn_batch,
                        const strata::kernels::QsaShapes& s) {
@@ -2129,6 +2138,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     strata::kernels::QsaShapes s = core::qsa_shapes(g);
     m.cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     m.max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
+    m.sel_batch = pf_sel_batch(m.max_blocks);
     {
         // one region for the attention half's and the MoE half's scratch (see gdn_set_bytes)
         const bool fz = fused_layout(T, m.src != nullptr);
@@ -3165,7 +3175,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     strata::kernels::QsaShapes s = core::qsa_shapes(g);
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
-    o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, pf_sel_batch(), 32, s),
+    o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, pf_sel_batch(max_blocks), 32, s),
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, src)),
                                        hcr ? hc_set_bytes(T, f16_io) : (uint64_t) 0}), ok);
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }

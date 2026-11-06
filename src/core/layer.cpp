@@ -728,18 +728,139 @@ uint64_t qsa_kv_elastic_full_bytes() {
     for (const auto& p : g_pools) n += (uint64_t) p->range.chunks() * strata::core::vmm_granularity();
     return n;
 }
+// ---- STRATA_IDX_ELASTIC=<cells> (opt-in, default off): each main QSA layer's pooled indexer keys
+// (max_cells/idx_block + 2 rows of idx_dim fp32: 128 MiB per layer at 1M cells) live in their own reserved VMM range,
+// with physical chunks mapped only for the rows the context reaches (first <cells>, "1" = 262144). The addresses
+// never move, so captured graphs stay valid; generate.cpp grows the ranges at request admission (funded by
+// expert-cache slots) and never unmaps while a request runs. Values are the same fp32 rows -> bit-exact.
+namespace {
+struct IdxRange {
+    strata::core::VmmRange range;
+    int dev = -1;
+    uint64_t row_bytes = 0;
+    int64_t rows = 0;   // logical rows (the whole --max-context)
+};
+std::vector<std::unique_ptr<IdxRange>> g_idx;
+int64_t idx_rows_for(int64_t cells, int64_t block) { return cells / block + 2; }
+int64_t g_idx_block = 4;
+int64_t idx_chunks_for(const IdxRange& r, int64_t cells) {
+    const uint64_t G = strata::core::vmm_granularity();
+    const int64_t rows = std::min<int64_t>(r.rows, idx_rows_for(cells, g_idx_block));
+    return (int64_t) std::min<uint64_t>((uint64_t) r.range.chunks(), ((uint64_t) rows * r.row_bytes + G - 1) / G);
+}
+bool idx_range_grow(IdxRange& r, int64_t cells, const std::function<strata::core::VmmChunk()>& take) {
+    const uint64_t G = strata::core::vmm_granularity();
+    const int64_t c1 = idx_chunks_for(r, cells);
+    std::vector<int64_t> fresh;
+    for (int64_t c = 0; c < c1; ++c)
+        if (!r.range.mapped(c)) fresh.push_back(c);
+    if (fresh.empty()) return true;
+    if (!r.range.map_range(0, c1, take)) {
+        std::fprintf(stderr, "strata: the elastic indexer could not map %zu chunks (no VRAM left)\n", fresh.size());
+        return false;
+    }
+    // a chunk that held an expert is not indexer state: zeroed, as qsa_state_zero does for a new sequence
+    for (const int64_t c : fresh)
+        if (cudaMemset(r.range.base() + (uint64_t) c * G, 0, (size_t) G) != cudaSuccess) return false;
+    return true;
+}
+float* idx_range_new(const strata::kernels::QsaShapes& s, int64_t rows) {
+    auto r = std::make_unique<IdxRange>();
+    cudaGetDevice(&r->dev);
+    r->row_bytes = (uint64_t) s.idx_dim * 4;
+    r->rows = rows;
+    g_idx_block = s.idx_block;
+    if (!r->range.reserve((uint64_t) rows * r->row_bytes) ||
+        !idx_range_grow(*r, qsa_idx_elastic_init(), [] { return (strata::core::VmmChunk) 0; })) {
+        std::fprintf(stderr, "strata: STRATA_IDX_ELASTIC: cannot reserve/map the indexer range\n");
+        return nullptr;
+    }
+    float* p = (float*) r->range.base();
+    g_idx.push_back(std::move(r));
+    return p;
+}
+/// Rows of `pooled` that are backed by memory (all of them unless it is an elastic range).
+int64_t idx_rows_mapped(const float* pooled, int64_t rows) {
+    for (const auto& r : g_idx)
+        if ((const float*) r->range.base() == pooled) {
+            int64_t c = 0;
+            while (c < r->range.chunks() && r->range.mapped(c)) ++c;
+            return std::min<int64_t>(rows, (int64_t) ((uint64_t) c * strata::core::vmm_granularity() / r->row_bytes));
+        }
+    return rows;
+}
+}  // namespace
+
+bool qsa_idx_elastic() {
+    static const bool on = qsa_idx_elastic_init() > 0 && strata::core::vmm_available();
+    return on;
+}
+int64_t qsa_idx_elastic_init() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_IDX_ELASTIC");
+        if (e == nullptr || e[0] == '\0' || e[0] == '0') return (int64_t) 0;
+        const long long n = std::atoll(e);
+        return (int64_t) (n > 1 ? n : 262144);
+    }();
+    return v;
+}
+int64_t qsa_idx_elastic_cells(int dev) {
+    int64_t cells = std::numeric_limits<int64_t>::max();
+    bool any = false;
+    for (const auto& r : g_idx) {
+        if (dev >= 0 && r->dev != dev) continue;
+        any = true;
+        const int64_t rows = idx_rows_mapped((const float*) r->range.base(), r->rows);
+        cells = std::min<int64_t>(cells, rows >= r->rows ? std::numeric_limits<int64_t>::max() / 2
+                                                         : std::max<int64_t>(0, rows - 2) * g_idx_block);
+    }
+    return any ? cells : std::numeric_limits<int64_t>::max() / 2;
+}
+int64_t qsa_idx_elastic_need(int64_t cells, int dev) {
+    int64_t n = 0;
+    for (const auto& r : g_idx) {
+        if (dev >= 0 && r->dev != dev) continue;
+        const int64_t c1 = idx_chunks_for(*r, cells);
+        for (int64_t c = 0; c < c1; ++c) n += !r->range.mapped(c);
+    }
+    return n;
+}
+bool qsa_idx_elastic_grow(int64_t cells, int dev, const std::function<strata::core::VmmChunk()>& take) {
+    for (auto& r : g_idx)
+        if ((dev < 0 || r->dev == dev) && !idx_range_grow(*r, cells, take)) return false;
+    return cudaDeviceSynchronize() == cudaSuccess;
+}
+int64_t qsa_idx_elastic_shrink(int64_t cells, int dev, const std::function<void(strata::core::VmmChunk)>& give) {
+    int64_t n = 0;
+    for (auto& r : g_idx) {
+        if (dev >= 0 && r->dev != dev) continue;
+        const int64_t c1 = std::max<int64_t>(idx_chunks_for(*r, cells), idx_chunks_for(*r, qsa_idx_elastic_init()));
+        for (int64_t c = c1; c < r->range.chunks(); ++c)
+            if (const strata::core::VmmChunk h = r->range.unmap(c)) { give(h); ++n; }
+    }
+    return n;
+}
+uint64_t qsa_idx_elastic_mapped_bytes(int dev) {
+    uint64_t n = 0;
+    for (const auto& r : g_idx)
+        if (dev < 0 || r->dev == dev) n += (uint64_t) r->range.mapped_count() * strata::core::vmm_granularity();
+    return n;
+}
+
 namespace {
 
 /// How one state holds its K/V: `mode` as in QsaState::kv_mode, `slots` VRAM pages of `pages` logical ones.
 struct KvPlan {
     int mode = 0;
     int64_t pages = 0, slots = 0, pooled_rows = 0;
+    bool idx_elastic = false;   // STRATA_IDX_ELASTIC: the pooled keys are in their own VMM range, not the arena
 };
 KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
     KvPlan p;
     p.pages = (max_cells + s.page_size - 1) / s.page_size;
     p.slots = p.pages;
     p.pooled_rows = max_cells / s.idx_block + 2;
+    p.idx_elastic = ring_cells <= 0 && qsa_idx_elastic();   // the drafter (ring) has no indexer
     if (g_kv_resident <= 0 || ring_cells < 0) return p;   // ring_cells < 0: always fully resident
     // A/B only: STRATA_KV_RING_OFF keeps the drafter fully resident, STRATA_KV_MAIN_OFF the main layers
     static const bool ring_off = std::getenv("STRATA_KV_RING_OFF") != nullptr;
@@ -747,7 +868,7 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
     if (ring_cells > 0 ? ring_off : main_off) return p;
     if (ring_cells > 0) {
         const int64_t r = (ring_cells + s.page_size - 1) / s.page_size;
-        if (r < p.pages) { p.mode = 2; p.slots = r; p.pooled_rows = 2; }   // the drafter has no indexer
+        if (r < p.pages) { p.mode = 2; p.slots = r; p.pooled_rows = 2; p.idx_elastic = false; }   // no indexer
     } else {
         const int64_t r = (std::max(g_kv_resident, qsa_kv_resident_min()) + s.page_size - 1) / s.page_size;
         if (r < p.pages) { p.mode = 1; p.slots = r; }
@@ -790,7 +911,7 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     if (p.mode == 1) n += strata::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
     n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
     n += (uint64_t) s.idx_dim * 4;                                             // dead
-    n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                             // pooled
+    if (!p.idx_elastic) n += (uint64_t) p.pooled_rows * s.idx_dim * 4;        // pooled (elastic: its own range)
     n += 16;                                                                   // block_pos
     if (with_rope && !qsa_rope_host()) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
     n += strata::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
@@ -888,7 +1009,12 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);
     st.idx_dead = c.take<float>((uint64_t) s.idx_dim);
     st.idx_pooled_rows = p.pooled_rows;
-    st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
+    if (p.idx_elastic) {
+        st.idx_pooled = idx_range_new(s, p.pooled_rows);
+        if (st.idx_pooled == nullptr) return 0;
+    } else {
+        st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
+    }
     st.idx_block_pos = c.take<int32_t>(1);
     if (share_rope != nullptr) {
         st.cos_tab = share_rope->cos_tab;
@@ -1013,7 +1139,7 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, stream);
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
-    cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
+    cudaMemsetAsync(st.idx_pooled, 0, (size_t) idx_rows_mapped(st.idx_pooled, st.idx_pooled_rows) * s.idx_dim * 4, cs);
 }
 
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
