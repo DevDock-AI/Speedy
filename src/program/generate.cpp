@@ -9480,7 +9480,9 @@ int main(int argc, char** argv) {
         strata::core::ExpertCache* cache = nullptr;
         int dev = 0;
         int64_t lb = 0, le = 0;
-        int64_t top = 0, lo = 0;   // slots [lo, top) hold no expert; their whole chunks may be with the indexer
+        int64_t top = 0;           // the startup loan's first slot: growth goes down from it, then up into the loan
+        int64_t lo = 0, hi = 0;    // slots [lo, hi) hold no expert; their whole chunks may be with the indexer
+        int64_t hi_max = 0;        // hi stops here: the smallest loan (1024 tokens, the whole context staged) stays
         std::vector<strata::core::VmmChunk> spare;
     };
     struct IdxGrow {
@@ -9490,6 +9492,15 @@ int main(int argc, char** argv) {
         int64_t grows = 0, trims = 0, evicted = 0, fresh = 0, refilled = 0;
     } ixg;
     std::vector<int64_t> ixg_tops;   // per part (CUDA0, then each stage): its first lent slot (set before kvg_start)
+    std::vector<int64_t> ixg_himax;  // per part: the highest slot the indexer may take up to (set with ixg_tops)
+    std::function<bool()> ixg_no_loan = [] { return true; };   // no prompt loan is laid out (set with ixg_tops)
+    // the lowest slot a prompt loan of `cache` may start at: above the indexer's slots (0: no limit)
+    auto ixg_lend_floor = [&](const strata::core::ExpertCache* cache) -> int64_t {
+        if (!ixg.on) return 0;
+        for (const IxPart& p : ixg.parts)
+            if (p.cache == cache && p.lo < p.hi) return p.hi;
+        return 0;
+    };
     auto ixg_res_put_all = [&]() -> bool {
         bool ok = true;
         if (d_res != nullptr) { const strata::core::OnDevice on(primary_device); ok = ok && res_put(d_res) == cudaSuccess; }
@@ -9513,7 +9524,8 @@ int main(int argc, char** argv) {
         }
         IxPart p0;
         p0.cache = &xcache; p0.dev = primary_device; p0.lb = 0; p0.le = multi_gpu ? split_at[0] : g.n_layers;
-        p0.top = p0.lo = !ixg_tops.empty() && ixg_tops[0] >= 0 ? ixg_tops[0] : xcache.slots();
+        p0.top = p0.lo = p0.hi = !ixg_tops.empty() && ixg_tops[0] >= 0 ? ixg_tops[0] : xcache.slots();
+        p0.hi_max = std::max<int64_t>(p0.top, !ixg_himax.empty() ? ixg_himax[0] : xcache.slots());
         ixg.parts.push_back(p0);
         for (size_t i = 0; i < stages.size(); ++i) {
             GpuStage& st = *stages[i];
@@ -9524,17 +9536,25 @@ int main(int argc, char** argv) {
             }
             IxPart p;
             p.cache = &st.cache; p.dev = st.dev; p.lb = st.lb; p.le = st.le;
-            p.top = p.lo = i + 1 < ixg_tops.size() && ixg_tops[i + 1] >= 0 ? ixg_tops[i + 1] : st.cache.slots();
+            p.top = p.lo = p.hi = i + 1 < ixg_tops.size() && ixg_tops[i + 1] >= 0 ? ixg_tops[i + 1] : st.cache.slots();
+            p.hi_max = std::max<int64_t>(p.top, i + 1 < ixg_himax.size() ? ixg_himax[i + 1] : st.cache.slots());
             ixg.parts.push_back(p);
         }
         if (const char* v = std::getenv("STRATA_IDX_ELASTIC_STEP"); v != nullptr && std::atoll(v) > 0) ixg.step = std::atoll(v);
         ixg.cells = strata::core::qsa_idx_elastic_cells(-1);
         ixg.on = true;
-        for (const IxPart& p : ixg.parts)
+        for (const IxPart& p : ixg.parts) {
+            // the most cells the slots [floor, hi_max) can fund on this card (on top of what is mapped now)
+            const double mapped = (double) strata::core::qsa_idx_elastic_mapped_bytes(p.dev);
+            const double per_cell = ixg.cells > 0 ? mapped / (double) ixg.cells : 0.0;
+            const double room = (double) (p.cache->slot_offset(p.hi_max) - p.cache->slot_offset(ixg.floor));
+            const double reach = per_cell > 0 ? (double) ixg.cells + room / per_cell : 0.0;
             std::fprintf(stderr, "strata generate: elastic indexer: CUDA%d %lld cells mapped (%.0f MiB); its cache (%lld "
-                                 "slots) gives room below slot %lld as the context grows\n", p.dev, (long long) ixg.cells,
-                         (double) strata::core::qsa_idx_elastic_mapped_bytes(p.dev) / 1048576.0,
-                         (long long) p.cache->slots(), (long long) p.top);
+                                 "slots) gives room below slot %lld, then up to slot %lld (the smallest loan stays): "
+                                 "about %.0f cells reachable%s\n", p.dev, (long long) ixg.cells, mapped / 1048576.0,
+                         (long long) p.cache->slots(), (long long) p.top, (long long) p.hi_max, reach,
+                         reach < (double) o.max_context ? " - WARNING: below --max-context" : "");
+        }
     };
     // Room in every card's indexer for `cells` cells (rounded up to a step).  `quiesce`: as kvg_ensure's.
     auto ixg_ensure = [&](int64_t cells, const std::function<void()>& quiesce) -> bool {
@@ -9551,27 +9571,36 @@ int main(int argc, char** argv) {
             const uint64_t G = strata::core::vmm_granularity();
             auto freeable = [&]() -> int64_t {
                 const int64_t c0 = (int64_t) ((p.cache->slot_offset(p.lo) + G - 1) / G);
-                const int64_t c1 = (int64_t) (p.cache->slot_offset(p.top) / G);
+                const int64_t c1 = (int64_t) (p.cache->slot_offset(p.hi) / G);
                 int64_t k = 0;
                 for (int64_t c = c0; c < c1; ++c) k += r.mapped(c) ? 1 : 0;
                 return k;
             };
             std::vector<int32_t> owner;   // slot -> residency index (this card's layers only)
             int64_t gave = 0;
-            while ((int64_t) p.spare.size() + freeable() < need && p.lo > ixg.floor) {
+            auto give_up = [&](int64_t slot) {
                 if (owner.empty()) {
                     owner.assign((size_t) p.cache->slots(), -1);
                     for (int64_t i = p.lb * g.n_expert; i < p.le * g.n_expert; ++i)
                         if (host_res[(size_t) i] >= 0 && host_res[(size_t) i] < p.cache->slots())
                             owner[(size_t) host_res[(size_t) i]] = (int32_t) i;
                 }
-                --p.lo;
                 ++gave;
-                if (const int32_t oi = owner[(size_t) p.lo]; oi >= 0) {
+                if (const int32_t oi = owner[(size_t) slot]; oi >= 0) {
                     host_res[(size_t) oi] = strata::core::kNotResident;
                     ++ixg.evicted;
                     evicted_any = true;
                 }
+            };
+            // first the slots below the startup loan (middling heat), then up into the loan's own region: the prompt
+            // loan of a long request then starts above them (a smaller chunk for it; the lend clamps to ixg_lend_floor)
+            while ((int64_t) p.spare.size() + freeable() < need && p.lo > ixg.floor) give_up(--p.lo);
+            if ((int64_t) p.spare.size() + freeable() < need && p.hi < p.hi_max) {
+                if (!ixg_no_loan()) {
+                    std::fprintf(stderr, "strata: elastic indexer on CUDA%d: a prompt loan is laid out; growth waits\n", p.dev);
+                    return false;
+                }
+                while ((int64_t) p.spare.size() + freeable() < need && p.hi < p.hi_max) give_up(p.hi++);
             }
             // the residency tables first: no reader may name a slot whose memory is about to go
             if (gave > 0 && !ixg_res_put_all()) {
@@ -9580,7 +9609,7 @@ int main(int argc, char** argv) {
             }
             {
                 const int64_t c0 = (int64_t) ((p.cache->slot_offset(p.lo) + G - 1) / G);
-                const int64_t c1 = (int64_t) (p.cache->slot_offset(p.top) / G);
+                const int64_t c1 = (int64_t) (p.cache->slot_offset(p.hi) / G);
                 for (int64_t c = c0; c < c1; ++c)
                     if (r.mapped(c))
                         if (const strata::core::VmmChunk h = r.unmap(c)) p.spare.push_back(h);
@@ -9596,7 +9625,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata: elastic indexer on CUDA%d grown to %lld cells (%.0f MiB); the expert cache gave "
                                  "%lld slots (%lld of %lld hold experts)%s\n", p.dev, (long long) target,
                          (double) strata::core::qsa_idx_elastic_mapped_bytes(p.dev) / 1048576.0, (long long) gave,
-                         (long long) (p.lo + (p.cache->slots() - p.top)), (long long) p.cache->slots(),
+                         (long long) (p.lo + (p.cache->slots() - p.hi)), (long long) p.cache->slots(),
                          fresh > 0 ? " - and new VRAM, the cache being at its floor" : "");
             if (!ok) {
                 std::fprintf(stderr, "strata: the elastic indexer could not grow to %lld cells (%s)\n", (long long) target,
@@ -9622,14 +9651,14 @@ int main(int argc, char** argv) {
         for (IxPart& p : ixg.parts) {
             const strata::core::OnDevice on(p.dev);
             strata::core::qsa_idx_elastic_shrink(target, p.dev, [&](strata::core::VmmChunk h) { p.spare.push_back(h); });
-            if (p.lo >= p.top) {   // nothing lent: what came back was new memory
+            if (p.lo >= p.hi) {   // nothing lent: what came back was new memory
                 for (const strata::core::VmmChunk h : p.spare) strata::core::vmm_chunk_free(h);
                 p.spare.clear();
                 continue;
             }
             strata::core::VmmRange& r = *p.cache->vmm_range();
             const uint64_t G = strata::core::vmm_granularity();
-            const int64_t c1 = (int64_t) (p.cache->slot_offset(p.top) / G);
+            const int64_t c1 = (int64_t) ((p.cache->slot_offset(p.hi) + G - 1) / G);
             const int64_t c0 = (int64_t) (p.cache->slot_offset(p.lo) / G);
             if (!r.map_range(c0, c1, [&]() -> strata::core::VmmChunk {
                     if (p.spare.empty()) return 0;
@@ -9645,7 +9674,7 @@ int main(int argc, char** argv) {
             // every chunk of [lo, top) is mapped again: refill those slots from the profile (this card's layers)
             std::vector<std::pair<size_t, int32_t>> filled;
             size_t pi = 0;
-            for (int64_t sl = p.lo; sl < p.top; ++sl) {
+            for (int64_t sl = p.lo; sl < p.hi; ++sl) {
                 const uint64_t room = p.cache->slot_offset(sl + 1) - p.cache->slot_offset(sl);
                 for (; pi < profile.size(); ++pi) {
                     const int32_t l = profile[pi].first, e = profile[pi].second;
@@ -9669,7 +9698,7 @@ int main(int argc, char** argv) {
             }
             for (const auto& [i, sl] : filled) host_res[i] = sl;
             ixg.refilled += (int64_t) filled.size();
-            p.lo = p.top;
+            p.lo = p.hi = p.top;
             any = true;
         }
         if (any && !ixg_res_put_all()) return false;
@@ -9708,6 +9737,12 @@ int main(int argc, char** argv) {
     // the adaptive tier's swaps (a swap in flight could still be writing a slot given up here).
     auto kvg_ensure = [&](int64_t cells, const std::function<void()>& quiesce) -> bool {
         if (ixg.on && !ixg_ensure(cells, quiesce)) return false;   // STRATA_IDX_ELASTIC (off: no-op)
+        if (!ixg.on && strata::core::qsa_idx_elastic() && cells > strata::core::qsa_idx_elastic_cells(-1)) {
+            std::fprintf(stderr, "strata: STRATA_IDX_ELASTIC: %lld cells are past the %lld the indexer holds and it cannot "
+                                 "grow here (serve mode with a profile only)\n", (long long) cells,
+                         (long long) strata::core::qsa_idx_elastic_cells(-1));
+            return false;
+        }
         if (!kvg.on || cells <= kvg.cells) return true;
         const int64_t target = std::min<int64_t>(o.max_context, (cells + kvg.step - 1) / kvg.step * kvg.step);
         const int64_t need = strata::core::qsa_kv_elastic_need(target);
@@ -10911,7 +10946,21 @@ int main(int argc, char** argv) {
         }
         if (strata::core::qsa_idx_elastic()) {   // STRATA_IDX_ELASTIC: each card grows below its own loan
             ixg_tops.clear();
-            for (const PfPart& p : pf_parts) ixg_tops.push_back(p.first);
+            ixg_himax.clear();
+            for (const PfPart& p : pf_parts) {
+                ixg_tops.push_back(p.first);
+                // the smallest loan a long request still needs: a 1024-token chunk with the whole context staged
+                const int64_t keep = strata::prefill::Prefill::stage_cells();
+                strata::prefill::Prefill::set_stage_cells(o.max_context);
+                const int64_t k = part_slots(p, 1024);
+                strata::prefill::Prefill::set_stage_cells(keep);
+                ixg_himax.push_back(k > 0 ? std::max<int64_t>(0, p.cache->slots() - k) : p.cache->slots());
+            }
+            ixg_no_loan = [&]() -> bool {
+                for (const PfPart& p : pf_parts)
+                    if (!p.lent.empty()) return false;
+                return true;
+            };
             ixg_start();
         }
         kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots());
@@ -15557,10 +15606,13 @@ int main(int argc, char** argv) {
             }
             auto kv_quiesce = [&] { adapt_quiesce(); late_apply(true); };
             // STRATA_IDX_ELASTIC: the indexer grows once at admission for the whole request (prompt + max_new)
-            if (ixg.on && !ixg_ensure(n + max_new + 256, kv_quiesce)) {
+            // (max_new is often the whole rest of the context: only its first 16384 tokens are made room for here, the
+            // window path grows on as the reply goes on).  A failed growth refuses this request; the engine serves on.
+            if (ixg.on && !ixg_ensure(n + std::min<int64_t>(max_new, 16384) + 256, kv_quiesce)) {
+                (void) cudaGetLastError();
                 std::printf("ERR the indexer cannot grow to this request: no VRAM is left\n");
                 std::fflush(stdout);
-                return 1;
+                continue;
             }
             if (kvg.on) {   // the elastic K/V: this prompt's cells (it gives back what it does not need below)
                 // a failed growth may leave the tier half-changed: the engine stops (as for any CUDA failure)
@@ -16059,7 +16111,7 @@ int main(int argc, char** argv) {
                 kv_quiesce();
                 // STRATA_KV_GROW_HOLD=1 (opt-in): keep the K/V as long as the longest parked conversation; default: trim to this request alone, as 0.1.40
                 static const bool hold_on = [] { const char* v = std::getenv("STRATA_KV_GROW_HOLD"); return v != nullptr && std::atoi(v) != 0; }();
-                if (ixg.on && !ixg_trim(std::max<int64_t>(n + max_new + 256, conversations.longest_tokens() + 256))) {
+                if (ixg.on && !ixg_trim(std::max<int64_t>(n + std::min<int64_t>(max_new, 16384) + 256, conversations.longest_tokens() + 256))) {
                     std::printf("ERR the indexer could not give its VRAM back to the expert cache\n");
                     std::fflush(stdout);
                     return 1;
@@ -16704,11 +16756,13 @@ int main(int argc, char** argv) {
                         // loan starts where the chunk itself needs it (the 128-slot floor aside); a chunk that cannot be
                         // lent even then is halved until it can, instead of ending the engine.
                         int64_t need_p = part_slots(p, want_p);
-                        while ((need_p <= 0 || need_p + 128 > p.cache->slots()) && want_p > 256) {
+                        // STRATA_IDX_ELASTIC: the loan starts above the slots the indexer holds (0 when off: unchanged)
+                        const int64_t lend_floor = std::max<int64_t>(128, ixg_lend_floor(p.cache));
+                        while ((need_p <= 0 || need_p + lend_floor > p.cache->slots()) && want_p > 256) {
                             want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
                             need_p = part_slots(p, want_p);
                         }
-                        if (need_p <= 0 || need_p + 128 > p.cache->slots()) {
+                        if (need_p <= 0 || need_p + lend_floor > p.cache->slots()) {
                             e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
                             return false;
                         }
