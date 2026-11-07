@@ -2388,7 +2388,8 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     float* Vc = (float*) carve((size_t) B * KV * 4);
     int32_t* tok = (int32_t*) carve((size_t) B * 4);
     void* xq = q8 ? carve(mmq::q8_bytes(B * g.hc, Nn)) : nullptr;
-    int32_t* ident = q8 ? (int32_t*) carve((size_t) B * g.hc * 4) : nullptr;
+    // (B + 256 rows of slack: the stream-k fixup reads the row table past its end, as mmq_ids_rows / #5108)
+    int32_t* ident = q8 ? (int32_t*) carve((size_t) (B * g.hc + B + 256) * 4) : nullptr;
     int32_t* bnd = q8 ? (int32_t*) carve(16) : nullptr;
     if ((uint64_t) (q - m.region) > m.region_bytes) return decline("the batch buffers do not fit the scratch region");
     static const bool timing = std::getenv("STRATA_DRAFT_TIMING") != nullptr;   // debug: where this pass's time goes
@@ -2401,7 +2402,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     std::vector<int32_t> tk((size_t) B);
     if (q8) {
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
-        mmq::iota(ident, B * g.hc, m.cs);
+        mmq::iota(ident, B * g.hc + B + 256, m.cs);
     }
     // y[rows, n_out] = x[rows, k] . w^T for a Q8_0 matrix: MMQ from the FP32 rows (bounds slot 0: rows, 1: rows*hc)
     auto proj = [&](const float* x, const uint16_t* x16, const void* w, float* y, int64_t rows, int64_t n_out,

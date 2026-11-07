@@ -6277,12 +6277,16 @@ int main(int argc, char** argv) {
             bool remote = false;
             for (const int r : o.expert_cache_remote) remote = remote || r > 0;
             const bool asked = ev != nullptr && ev[0] != '\0' ? ev[0] != '0' : o.kv_grow;
-            const bool on = asked && !multi_gpu && o.kv_resident <= 0 &&
+            bool on = asked && !multi_gpu && o.kv_resident <= 0 &&
                             !o.expert_profile.empty() && !o.resident_cpu_experts && o.expert_cache != 0 && !remote &&
                             strata::core::vmm_available() &&
                             // the batch slots carve their own K/V and --vram-elastic's cache is not one VMM range;
                             // a peer tier is fine - its cache never enables VMM (only the K/V's own cache does)
                             o.batch == 0 && !o.vram_elastic;
+            if (asked && on && strata::core::qsa_idx_elastic()) {   // R20 review: both fund from xcache below the loan
+                std::fprintf(stderr, "strata generate: --kv-grow is off: it does not run beside STRATA_IDX_ELASTIC\n");
+                on = false;
+            }
             if (asked && !on)
                 std::fprintf(stderr, "strata generate: --kv-grow is off (one GPU, a profile, the whole K/V in VRAM, "
                                      "every expert in RAM, no --batch or --vram-elastic)\n");
@@ -9618,6 +9622,9 @@ int main(int argc, char** argv) {
             while ((int64_t) p.spare.size() + freeable() < need && p.lo > ixg.floor) give_up(--p.lo);
             if ((int64_t) p.spare.size() + freeable() < need && p.hi < p.hi_max) {
                 if (!ixg_no_loan()) {
+                    // the slots given up below the loan stay given up (still mapped, just empty): the tables must say so
+                    if (gave > 0 && !ixg_res_put_all())
+                        std::fprintf(stderr, "strata: the residency table upload failed (elastic indexer)\n");
                     std::fprintf(stderr, "strata: elastic indexer on CUDA%d: a prompt loan is laid out; growth waits\n", p.dev);
                     return false;
                 }
@@ -9665,11 +9672,14 @@ int main(int argc, char** argv) {
     auto ixg_trim = [&](int64_t cells) -> bool {
         if (!ixg.on) return true;
         const int64_t target = strata::core::qsa_idx_elastic_init();
-        if (cells > target || ixg.cells <= target + ixg.step) return true;
+        const bool idx_grown = ixg.cells > target + ixg.step;
+        const bool host_grown = strata::core::qsa_kv_host_elastic() && strata::core::qsa_kv_host_elastic_cells() > target;
+        if (cells > target || (!idx_grown && !host_grown)) return true;
         ixg_sync_all();
         const auto& lay = strata::kernels::cpu::expert_layout();
         bool any = false;
         for (IxPart& p : ixg.parts) {
+            if (!idx_grown) break;   // (only the host copy to give back)
             const strata::core::OnDevice on(p.dev);
             strata::core::qsa_idx_elastic_shrink(target, p.dev, [&](strata::core::VmmChunk h) { p.spare.push_back(h); });
             if (p.lo >= p.hi) {   // nothing lent: what came back was new memory
@@ -15639,7 +15649,7 @@ int main(int argc, char** argv) {
             // STRATA_IDX_ELASTIC: the indexer grows once at admission for the whole request (prompt + max_new)
             // (max_new is often the whole rest of the context: only its first 16384 tokens are made room for here, the
             // window path grows on as the reply goes on).  A failed growth refuses this request; the engine serves on.
-            if (ixg.on && !ixg_ensure(n + std::min<int64_t>(max_new, 16384) + 256, kv_quiesce)) {
+            if (ixg.on && !ixg_ensure(n + std::min<int64_t>(max_new, 32768) + 256, kv_quiesce)) {
                 (void) cudaGetLastError();
                 std::printf("ERR the indexer cannot grow to this request: no VRAM is left\n");
                 std::fflush(stdout);
@@ -16142,7 +16152,7 @@ int main(int argc, char** argv) {
                 kv_quiesce();
                 // STRATA_KV_GROW_HOLD=1 (opt-in): keep the K/V as long as the longest parked conversation; default: trim to this request alone, as 0.1.40
                 static const bool hold_on = [] { const char* v = std::getenv("STRATA_KV_GROW_HOLD"); return v != nullptr && std::atoi(v) != 0; }();
-                if (ixg.on && !ixg_trim(std::max<int64_t>(n + std::min<int64_t>(max_new, 16384) + 256, conversations.longest_tokens() + 256))) {
+                if (ixg.on && !ixg_trim(std::max<int64_t>(n + std::min<int64_t>(max_new, 32768) + 256, conversations.longest_tokens() + 256))) {
                     std::printf("ERR the indexer could not give its VRAM back to the expert cache\n");
                     std::fflush(stdout);
                     return 1;
@@ -18377,7 +18387,19 @@ int main(int argc, char** argv) {
                     if (nf) finish = "nonfinite";
                     else if (eos) finish = "stop";
                     else if (stop_req.load()) finish = "cancel";
-                    const bool last = nf || eos || produced_n >= max_new || stop_req.load();
+                    // STRATA_IDX_ELASTIC: the pipelined loop does not grow the context; the next window and the speculative
+                    // one after it must fit the mapped cells, else the reply ends here ("length") and the engine serves on
+                    const bool elastic_end = ixg.on && !nf && !eos &&
+                        A.p + a + 1 + 2 * (int64_t) strata::kernels::kVerifyMaxT + 64 >
+                            std::min<int64_t>(ixg.cells, strata::core::qsa_kv_host_elastic_cells());
+                    if (elastic_end && produced_n < max_new && !stop_req.load()) {
+                        finish = "length";
+                        std::fprintf(stderr, "strata serve: the elastic context holds %lld cells: the pipelined reply ends at "
+                                             "%lld tokens (admission reserves the prompt + 32768)\n",
+                                     (long long) std::min<int64_t>(ixg.cells, strata::core::qsa_kv_host_elastic_cells()),
+                                     (long long) produced_n);
+                    }
+                    const bool last = nf || eos || produced_n >= max_new || stop_req.load() || elastic_end;
                     const bool on = !nf && B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
                     if (B.made) {   // the gate's calibration: would B have been on the path, by its estimate p_on
                         const bool would = a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
@@ -18821,6 +18843,13 @@ int main(int argc, char** argv) {
                 // the elastic K/V: the window's cells and the drafter's beyond them
                 if ((kvg.on && p + T + 64 > kvg.cells || ixg.on && (p + T + 64 > ixg.cells || p + T + 64 > strata::core::qsa_kv_host_elastic_cells())) &&
                     !kvg_ensure(p + T + 64, [&] { std::string we; (void) dv.wait_commit(we); adapt_quiesce(); late_apply(true); })) {
+                    (void) cudaGetLastError();
+                    if (ixg.on && !kvg.on) {   // STRATA_IDX_ELASTIC: the reply ends here ("length"), the engine serves on
+                        std::fprintf(stderr, "strata serve: the elastic context cannot grow past %lld cells: the reply ends "
+                                             "at %lld tokens\n", (long long) p, (long long) produced_n);
+                        finish = "length";
+                        break;
+                    }
                     std::printf("ERR the K/V cannot grow: no VRAM is left\n");
                     return 1;
                 }

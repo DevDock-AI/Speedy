@@ -293,6 +293,8 @@ bool qsa_rope_host();
 /// STRATA_IDX_ELASTIC=<cells> (opt-in): the pooled indexer keys in per-layer VMM ranges mapped up to the cells the
 /// requests reach (layer.cpp). `dev` < 0: every device. Cells are rounded to whole 2 MiB chunks per layer.
 bool qsa_idx_elastic();
+/// Frees this state's elastic indexer range and elastic K/V host copy, if it has them (session_release, a failed init).
+void qsa_state_elastic_release(QsaState& st);
 int64_t qsa_idx_elastic_init();
 int64_t qsa_idx_elastic_cells(int dev);
 int64_t qsa_idx_elastic_need(int64_t cells, int dev);

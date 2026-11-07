@@ -665,7 +665,8 @@ uint64_t kvh_prefix(const KvHostElastic& k, size_t a, int64_t cells) {
     const uint64_t G = 2ull << 20;
     const int64_t pg = std::min<int64_t>(k.pages, (cells + k.page_size - 1) / k.page_size + 1);
     const uint64_t want = (k.size[a] / (uint64_t) k.pages) * (uint64_t) pg;
-    return std::min<uint64_t>(k.size[a], (want + G - 1) / G * G);
+    if (want >= k.size[a]) return k.size[a] + 1024;   // the whole array and its tail slack
+    return std::min<uint64_t>(k.size[a] + 1024, (want + G - 1) / G * G);
 }
 #ifndef _WIN32
 // Each array keeps ONE registration (its whole prefix): a copy or kernel over cells of the old and the new part then
@@ -691,8 +692,12 @@ bool kvh_set_prefix(KvHostElastic& k, size_t a, uint64_t to) {
             g_kv_host_bytes += old;
         } else {
             (void) cudaGetLastError();
-            std::fprintf(stderr, "strata: STRATA_KV_HOST_ELASTIC: an array lost its registration (old %.0f MiB)\n",
-                         (double) old / 1048576.0);
+            // the GPU would read this array's host addresses unregistered (an Xid at the next streamed read): the
+            // engine stops here, said, instead of serving on a broken K/V copy (the supervisor restarts it)
+            std::fprintf(stderr, "strata: FATAL: STRATA_KV_HOST_ELASTIC: a K/V host array lost its registration (re-register "
+                                 "of %.0f MiB refused); stopping the engine\n", (double) old / 1048576.0);
+            std::fflush(stderr);
+            std::_Exit(70);
         }
         return false;
     }
@@ -742,10 +747,10 @@ uint8_t* kv_host_elastic_new(const std::vector<uint64_t>& sizes, int64_t pages, 
     k->pages = pages;
     k->page_size = page_size;
     uint64_t at = 0;
-    for (const uint64_t z : sizes) {
+    for (const uint64_t z : sizes) {   // (+1 KiB per array: the 4 x 256 B tail slack the plain allocation has)
         k->off.push_back(at);
         k->size.push_back(z);
-        at += (z + G - 1) / G * G;
+        at += (z + 1024 + G - 1) / G * G;
     }
     k->total = at;
     k->regs.resize(sizes.size());
@@ -945,14 +950,17 @@ bool idx_range_grow(IdxRange& r, int64_t cells, const std::function<strata::core
     for (int64_t c = 0; c < c1; ++c)
         if (!r.range.mapped(c)) fresh.push_back(c);
     if (fresh.empty()) return true;
-    if (!r.range.map_range(0, c1, take)) {
+    const bool mapped_all = r.range.map_range(0, c1, take);
+    // a chunk that held an expert is not indexer state: zeroed, as qsa_state_zero does for a new sequence - every
+    // chunk this call mapped, also when the map stopped part way (those stay mapped and must not hold expert bytes)
+    bool zeroed = true;
+    for (const int64_t c : fresh)
+        if (r.range.mapped(c) && cudaMemset(r.range.base() + (uint64_t) c * G, 0, (size_t) G) != cudaSuccess) zeroed = false;
+    if (!mapped_all) {
         std::fprintf(stderr, "strata: the elastic indexer could not map %zu chunks (no VRAM left)\n", fresh.size());
         return false;
     }
-    // a chunk that held an expert is not indexer state: zeroed, as qsa_state_zero does for a new sequence
-    for (const int64_t c : fresh)
-        if (cudaMemset(r.range.base() + (uint64_t) c * G, 0, (size_t) G) != cudaSuccess) return false;
-    return true;
+    return zeroed;
 }
 float* idx_range_new(const strata::kernels::QsaShapes& s, int64_t rows) {
     auto r = std::make_unique<IdxRange>();
@@ -980,6 +988,30 @@ int64_t idx_rows_mapped(const float* pooled, int64_t rows) {
     return rows;
 }
 }  // namespace
+
+void qsa_state_elastic_release(QsaState& st) {
+    for (auto it = g_idx.begin(); it != g_idx.end(); ++it)
+        if (st.idx_pooled != nullptr && (const float*) (*it)->range.base() == st.idx_pooled) {
+            g_idx.erase(it);   // VmmRange's destructor unmaps and frees its chunks
+            st.idx_pooled = nullptr;
+            break;
+        }
+#ifndef _WIN32
+    const void* firsts[4] = {st.host.k_q, st.host.k_q4, st.host.k_pool, st.host.v_q};
+    for (auto it = g_kvh.begin(); it != g_kvh.end(); ++it) {
+        bool mine = false;
+        for (const void* f : firsts) mine = mine || (f != nullptr && f == (const void*) (*it)->base);
+        if (!mine) continue;
+        for (size_t a = 0; a < (*it)->regs.size(); ++a)
+            for (auto& [ptr, n] : (*it)->regs[a]) { cudaHostUnregister(ptr); g_kv_host_bytes -= n; }
+        (void) cudaGetLastError();
+        munmap((*it)->base, (size_t) (*it)->total);
+        g_kvh.erase(it);
+        st.host = strata::kernels::KvHostPools{};
+        break;
+    }
+#endif
+}
 
 bool qsa_idx_elastic() {
     static const bool on = qsa_idx_elastic_init() > 0 && strata::core::vmm_available();
@@ -1109,6 +1141,16 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     return align_up16(n) + 256;
 }
 
+// a state whose init stops part way gives back what it took outside the arena (MEDIUM 6 of the R20 review)
+static void qsa_state_init_fail(QsaState& st) {
+    qsa_state_elastic_release(st);
+    if (st.rope_host != nullptr) {
+        auto& pin = pin_detail::st();
+        std::lock_guard<std::mutex> lock(pin.mu);
+        pin_detail::free_locked(pin, st.rope_host);
+        st.rope_host = nullptr;
+    }
+}
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
@@ -1217,6 +1259,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                 cudaSuccess || cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
             std::fprintf(stderr, "strata: STRATA_ROPE_HOST: cannot pin %.1f MiB of RAM for the RoPE table\n",
                          (double) (per * 8) / 1048576.0);
+            qsa_state_init_fail(st);
             return 0;
         }
         st.rope_host = h;
@@ -1234,6 +1277,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                       cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
         strata::core::host_alloc_guarded((void**) &st.host_pos, (size_t) s.n_head * 4, cudaHostAllocMapped | cudaHostAllocPortable) !=
             cudaSuccess) {
+        qsa_state_init_fail(st);
         return 0;   // the caller sees a zero byte count; a half-built state is worse than none
     }
     st.host_step[strata::kernels::kStepCount] = 0;
@@ -1279,6 +1323,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                                  "(%.2f GiB pinned so far): RAM or the driver refused to pin it - lower the context, "
                                  "or run without --kv-resident\n", (double) bytes / 1073741824.0,
                                  (double) g_kv_host_bytes / 1073741824.0);
+            qsa_state_init_fail(st);
             return 0;
         }
         if (d != nullptr) g_kv_host_bytes += bytes;
