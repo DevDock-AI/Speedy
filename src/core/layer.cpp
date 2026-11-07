@@ -668,19 +668,45 @@ uint64_t kvh_prefix(const KvHostElastic& k, size_t a, int64_t cells) {
     return std::min<uint64_t>(k.size[a], (want + G - 1) / G * G);
 }
 #ifndef _WIN32
+// Each array keeps ONE registration (its whole prefix): a copy or kernel over cells of the old and the new part then
+// never spans two registrations.  Growing unregisters the old prefix and registers the longer one at the same
+// addresses (the pages and their contents stay; the GPU reads the host addresses), so the device must be quiet -
+// the caller (generate.cpp's ixg_ensure, or the state's init) guarantees it.  On a refusal the old prefix is
+// registered again.
+bool kvh_set_prefix(KvHostElastic& k, size_t a, uint64_t to) {
+    if (to == k.reg_len[a]) return true;
+    uint8_t* at = k.base + k.off[a];
+    const uint64_t old = k.reg_len[a];
+    if (!k.regs[a].empty()) {
+        if (cudaHostUnregister(at) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+        k.regs[a].clear();
+        g_kv_host_bytes -= old;
+        k.reg_len[a] = 0;
+    }
+    if (to > 0 && cudaHostRegister(at, (size_t) to, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+        (void) cudaGetLastError();
+        if (old > 0 && cudaHostRegister(at, (size_t) old, cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess) {
+            k.regs[a].emplace_back(at, old);
+            k.reg_len[a] = old;
+            g_kv_host_bytes += old;
+        } else {
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "strata: STRATA_KV_HOST_ELASTIC: an array lost its registration (old %.0f MiB)\n",
+                         (double) old / 1048576.0);
+        }
+        return false;
+    }
+    if (to > 0) {
+        k.regs[a].emplace_back(at, to);
+        k.reg_len[a] = to;
+        g_kv_host_bytes += to;
+    }
+    return true;
+}
 bool kvh_grow_one(KvHostElastic& k, int64_t cells) {
     for (size_t a = 0; a < k.off.size(); ++a) {
         const uint64_t to = kvh_prefix(k, a, cells);
-        if (to <= k.reg_len[a]) continue;
-        uint8_t* at = k.base + k.off[a] + k.reg_len[a];
-        const uint64_t n = to - k.reg_len[a];
-        if (cudaHostRegister(at, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
-            (void) cudaGetLastError();
-            return false;
-        }
-        k.regs[a].emplace_back(at, n);
-        k.reg_len[a] = to;
-        g_kv_host_bytes += n;
+        if (to > k.reg_len[a] && !kvh_set_prefix(k, a, to)) return false;
     }
     return true;
 }
@@ -772,15 +798,10 @@ void qsa_kv_host_elastic_shrink(int64_t cells) {
     if (g_kvh.empty() || cells >= g_kvh_cells) return;
     for (auto& k : g_kvh)
         for (size_t a = 0; a < k->off.size(); ++a) {
-            const uint64_t keep = kvh_prefix(*k, a, cells);
-            auto& v = k->regs[a];
-            while (!v.empty() && (uint64_t) (v.back().first - (k->base + k->off[a])) >= keep) {
-                cudaHostUnregister(v.back().first);
-                madvise(v.back().first, (size_t) v.back().second, MADV_DONTNEED);
-                g_kv_host_bytes -= v.back().second;
-                k->reg_len[a] -= v.back().second;
-                v.pop_back();
-            }
+            const uint64_t keep = kvh_prefix(*k, a, cells), had = k->reg_len[a];
+            if (keep >= had) continue;
+            if (!kvh_set_prefix(*k, a, keep)) continue;   // still registered whole: nothing given back
+            madvise(k->base + k->off[a] + keep, (size_t) (had - keep), MADV_DONTNEED);
         }
     (void) cudaGetLastError();
     g_kvh_cells = cells;

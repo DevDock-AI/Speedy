@@ -9561,16 +9561,26 @@ int main(int argc, char** argv) {
         if (!ixg.on || (cells <= ixg.cells && cells <= strata::core::qsa_kv_host_elastic_cells())) return true;
         const int64_t target = std::min<int64_t>(o.max_context, (cells + ixg.step - 1) / ixg.step * ixg.step);
         bool quiet = false, evicted_any = false;
-        // STRATA_KV_HOST_ELASTIC: the K/V host copies first (RAM; refused when MemAvailable cannot cover it)
+        // STRATA_KV_HOST_ELASTIC: the K/V host copies first (RAM; refused when MemAvailable cannot cover it).  They are
+        // re-registered at the same addresses, so nothing may run on either card meanwhile: quiesced here.
         if (strata::core::qsa_kv_host_elastic() && target > strata::core::qsa_kv_host_elastic_cells()) {
+            quiesce();
+            ixg_sync_all();
+            quiet = true;
+            std::fprintf(stderr, "strata: K/V host copy: growing %lld -> %lld cells (%.2f GiB pinned) for a request of "
+                                 "%lld cells\n", (long long) strata::core::qsa_kv_host_elastic_cells(), (long long) target,
+                         (double) strata::core::qsa_kv_host_bytes() / 1073741824.0, (long long) cells);
+            std::fflush(stderr);
             std::string why;
             if (!strata::core::qsa_kv_host_elastic_grow(target, why)) {
                 std::fprintf(stderr, "strata: the K/V host copy could not grow to %lld cells: %s\n", (long long) target,
                              why.c_str());
+                std::fflush(stderr);
                 return false;
             }
             std::fprintf(stderr, "strata: K/V host copy grown to %lld cells (%.2f GiB pinned)\n", (long long) target,
                          (double) strata::core::qsa_kv_host_bytes() / 1073741824.0);
+            std::fflush(stderr);
         }
         for (IxPart& p : ixg.parts) {
             const strata::core::OnDevice on(p.dev);
@@ -9714,6 +9724,10 @@ int main(int argc, char** argv) {
         }
         if (any && !ixg_res_put_all()) return false;
         if (strata::core::qsa_kv_host_elastic()) {   // STRATA_KV_HOST_ELASTIC: the host copies back to the initial cells
+            ixg_sync_all();   // re-registered at the same addresses: nothing in flight
+            std::fprintf(stderr, "strata: K/V host copy: giving back %lld -> %lld cells\n",
+                         (long long) strata::core::qsa_kv_host_elastic_cells(), (long long) target);
+            std::fflush(stderr);
             strata::core::qsa_kv_host_elastic_shrink(target);
             std::fprintf(stderr, "strata: K/V host copy back to %lld cells (%.2f GiB pinned)\n",
                          (long long) strata::core::qsa_kv_host_elastic_cells(),
@@ -16776,7 +16790,10 @@ int main(int argc, char** argv) {
                         // STRATA_IDX_ELASTIC: the loan starts above the slots the indexer holds (0 when off: unchanged)
                         const int64_t lend_floor = std::max<int64_t>(128, ixg_lend_floor(p.cache));
                         while ((need_p <= 0 || need_p + lend_floor > p.cache->slots()) && want_p > 256) {
-                            want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
+                            // with the elastic indexer's floor the loan is just short of room: 256 tokens a step keeps
+                            // the chunk next to the startup one (halving went 9472 -> 4608); off: halving as before
+                            want_p = lend_floor > 128 ? std::max<int64_t>(256, (want_p - 256) / 256 * 256)
+                                                      : std::max<int64_t>(256, want_p / 2 / 256 * 256);
                             need_p = part_slots(p, want_p);
                         }
                         if (need_p <= 0 || need_p + lend_floor > p.cache->slots()) {
