@@ -1187,6 +1187,23 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
 RCALL_MAX = 32768        # the most of a `<tool_call>` inside the reasoning that is held while waiting for its end (#804)
 
 
+class _Aliases(dict):
+    """OutputParser's alias map: an exact alias first, then a case-insensitive match of exactly one declared tool (see `folded`)."""
+    folded: dict = {}
+
+    def _fold(self, key):
+        return self.folded.get(key.casefold()) if isinstance(key, str) else None
+
+    def get(self, key, default=None):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        hit = self._fold(key)
+        return default if hit is None or hit == key else hit
+
+    def __contains__(self, key):
+        return dict.__contains__(self, key) or self.get(key) is not None
+
+
 class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
@@ -1236,8 +1253,14 @@ class OutputParser:
             if isinstance(name, str) and name:
                 for prefix in ("tools.", "functions.", "default_api."):
                     aliases.setdefault(prefix + name, set()).add(name)
-        self.aliases = {alias: next(iter(names)) for alias, names in aliases.items()
-                        if len(names) == 1 and alias not in self.schemas}
+        self.aliases = _Aliases({alias: next(iter(names)) for alias, names in aliases.items()
+                                 if len(names) == 1 and alias not in self.schemas})
+        # A declared tool written in another case (`Bash` for OpenCode's `bash`) is that tool, when exactly one declared name (or one
+        # alias above) matches case-insensitively; an exact name or alias always wins, two that fit leave the text as it was.
+        folded = {}
+        for key, target in [*((n, n) for n in self.schemas if isinstance(n, str)), *self.aliases.items()]:
+            folded.setdefault(key.casefold(), set()).add(target)
+        self.aliases.folded = {k: next(iter(v)) for k, v in folded.items() if len(v) == 1}
         self.unread = 0              # #3441: `<tool_call>` blocks that opened like a call and were returned as text
         self.unread_names: list[str] = []   # the names (first few) of those that named a tool the request did not declare
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
@@ -1311,7 +1334,7 @@ class OutputParser:
             bare = after[1:].strip().lstrip("=").strip()
             if after[1:].lstrip().startswith(("=", "function")):
                 return "wait"
-            if any(k.startswith(bare) for k in list(self.schemas) + list(self.aliases) if isinstance(k, str)):
+            if any(k.casefold().startswith(bare.casefold()) for k in list(self.schemas) + list(self.aliases) if isinstance(k, str)):
                 return "wait"
         return None
 
@@ -1669,6 +1692,7 @@ class OutputParser:
         if "<function=" in buf:
             def spaced(m):
                 name = m.group(2).strip()
+                name = self.aliases.get(name, name)
                 return f"<function={name}>" if name in self.schemas else m.group(0)
             buf = _PREFIX_SPACED.sub(spaced, buf)
             m = _PREFIX_PART.search(buf)
