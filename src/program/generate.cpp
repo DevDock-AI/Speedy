@@ -15662,7 +15662,7 @@ int main(int argc, char** argv) {
             // STRATA_IDX_ELASTIC: the indexer grows once at admission for the whole request (prompt + max_new)
             // (max_new is often the whole rest of the context: only its first 16384 tokens are made room for here, the
             // window path grows on as the reply goes on).  A failed growth refuses this request; the engine serves on.
-            if (ixg.on && !ixg_ensure(n + std::min<int64_t>(max_new, 32768) + 256, kv_quiesce)) {
+            if (ixg.on && !ixg_ensure(n + std::min<int64_t>(max_new, 16384) + 256, kv_quiesce)) {
                 (void) cudaGetLastError();
                 std::printf("ERR the indexer cannot grow to this request: no VRAM is left\n");
                 std::fflush(stdout);
@@ -16165,7 +16165,7 @@ int main(int argc, char** argv) {
                 kv_quiesce();
                 // STRATA_KV_GROW_HOLD=1 (opt-in): keep the K/V as long as the longest parked conversation; default: trim to this request alone, as 0.1.40
                 static const bool hold_on = [] { const char* v = std::getenv("STRATA_KV_GROW_HOLD"); return v != nullptr && std::atoi(v) != 0; }();
-                if (ixg.on && !ixg_trim(std::max<int64_t>(n + std::min<int64_t>(max_new, 32768) + 256, conversations.longest_tokens() + 256))) {
+                if (ixg.on && !ixg_trim(std::max<int64_t>(n + std::min<int64_t>(max_new, 16384) + 256, conversations.longest_tokens() + 256))) {
                     std::printf("ERR the indexer could not give its VRAM back to the expert cache\n");
                     std::fflush(stdout);
                     return 1;
@@ -18438,7 +18438,7 @@ int main(int argc, char** argv) {
                     if (elastic_end && produced_n < max_new && !stop_req.load()) {
                         finish = "length";
                         std::fprintf(stderr, "strata serve: the elastic context holds %lld cells: the pipelined reply ends at "
-                                             "%lld tokens (admission reserves the prompt + 32768)\n",
+                                             "%lld tokens (admission reserves the prompt + 16384)\n",
                                      (long long) std::min<int64_t>(ixg.cells, strata::core::qsa_kv_host_elastic_cells()),
                                      (long long) produced_n);
                     }
