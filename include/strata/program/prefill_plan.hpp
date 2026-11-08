@@ -173,4 +173,26 @@ inline std::string describe(const Pick& p, const Host& h, int64_t tokens) {
     return b;
 }
 
+/// The one prompt chunk every participant of a multi-card read uses (periodic checkpoints need every stage's part
+/// at the same token).  `fits(i, c)`: participant i can lend chunk c; `fine(i)`: participant i shrinks in 256-token
+/// steps (else halving, its single-card rule).  Each card's own fit first, then 256-token steps down while one of
+/// them still cannot take it (a loan is not monotonic in the chunk).  Never below 256.
+template <class Fits, class Fine>
+inline int64_t common_chunk(int64_t want, size_t n, Fits&& fits, Fine&& fine) {
+    int64_t c = want;
+    for (size_t i = 0; i < n; ++i) {
+        int64_t ci = want;
+        while (!fits(i, ci) && ci > 256)
+            ci = fine(i) ? std::max<int64_t>(256, (ci - 256) / 256 * 256) : std::max<int64_t>(256, ci / 2 / 256 * 256);
+        c = std::min(c, ci);
+    }
+    auto all = [&](int64_t x) {
+        for (size_t i = 0; i < n; ++i)
+            if (!fits(i, x)) return false;
+        return true;
+    };
+    while (!all(c) && c > 256) c = std::max<int64_t>(256, (c - 256) / 256 * 256);
+    return c;
+}
+
 }  // namespace strata::program::prefill_plan

@@ -12005,6 +12005,8 @@ int main(int argc, char** argv) {
         };
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
         bool pp_tail_saved = false;
+        bool pp_periodic_on = false, pp_warned = false;   // this read wants periodic checkpoints / the "none stored" note went out
+        int64_t pp_periodic_saved = 0;                     // periodic checkpoints this read stored
         // #471: the position the prompt pass has read up to (a chunk's or a window's end): what a request cancelled
         // mid-read reports as read, instead of the whole prompt
         int64_t pp_reached = 0;
@@ -12293,8 +12295,10 @@ int main(int argc, char** argv) {
                     bool complete = parts.size() == stages.size() + 1;
                     for (const ConvCheckpoint& k : parts) complete = complete && !k.gdn.empty();
                     saved = !complete || checkpoint_at(done, &parts);   // an incomplete set: no checkpoint here
+                    if (complete && saved && periodic_checkpoint) ++pp_periodic_saved;
                 } else {
                     saved = checkpoint_at(done, nullptr, tail_checkpoint && !periodic_checkpoint);
+                    if (saved && periodic_checkpoint) ++pp_periodic_saved;
                 }
                 if (!saved) {
                     // #3350: only a GPU that is unwell ends the request; a copy that ran out of memory skips this checkpoint
@@ -12307,6 +12311,15 @@ int main(int argc, char** argv) {
                 }
                 if (periodic_checkpoint) pp_next_check = done + o.prompt_cache_every;
                 if (tail_checkpoint) pp_tail_saved = true;
+            }
+            // a read longer than the checkpoint interval that stored no periodic checkpoint: a branch before the live
+            // end would re-read from 0 (multi-GPU parts at different chunk boundaries did this silently)
+            if (done >= pp_total && pp_periodic_on && !pp_warned && pp_periodic_saved == 0 &&
+                pp_total - pp_from > o.prompt_cache_every) {
+                pp_warned = true;
+                std::fprintf(stderr, "strata serve: warning: no periodic prompt checkpoint stored while reading %lld..%lld "
+                             "(every %lld): a branch before the end will re-read the prompt from its start\n",
+                             (long long) pp_from, (long long) pp_total, (long long) o.prompt_cache_every);
             }
             return true;
         };
@@ -16266,6 +16279,9 @@ int main(int argc, char** argv) {
             pp_t0 = r0;
             pp_next_check = reread_to > 0 || !req_ckpt ? INT64_MAX : resume + o.prompt_cache_every;   // ckpt=0: none
             pp_tail_saved = reread_to > 0 || !req_ckpt;   // ckpt=0 (#861): no tail checkpoint either
+            pp_periodic_on = pp_next_check != INT64_MAX && o.prompt_cache > 0 && o.prompt_cache_every > 0;
+            pp_periodic_saved = 0;
+            pp_warned = false;
             {
                 std::lock_guard<std::mutex> lk(part_mu);
                 part_at.clear();
@@ -16768,6 +16784,33 @@ int main(int argc, char** argv) {
                     e = "prefill: cannot lend buffers for an empty request segment";
                     return false;
                 }
+                // Two or more participants read in ONE chunk size: the periodic prompt checkpoints are only stored
+                // where every stage's part sits at the same token (part_at[done]), and per-card shrinking (CUDA0 9984,
+                // CUDA1 9728 at 824K) left none, so a branch re-read the whole prompt.  The common size is the
+                // largest on the 256 grid at or below `want` whose loan every participant can take (each card's own
+                // fit first, then 256-token steps down while one of them still cannot: loans are not monotonic, #2090).
+                int64_t want_common = want;
+                if (!o.prefill_head_alias) {
+                    int64_t n_act = 0;
+                    for (const PfPart& p : pf_parts) n_act += p.first >= 0;
+                    if (n_act > 1) {
+                        auto fits = [&](const PfPart& p, int64_t c) {
+                            const int64_t lf = std::max<int64_t>(128, ixg_lend_floor(p.cache));
+                            const int64_t n = part_slots(p, c);
+                            return n > 0 && n + lf <= p.cache->slots();
+                        };
+                        std::vector<const PfPart*> act;
+                        for (const PfPart& p : pf_parts)
+                            if (p.first >= 0) act.push_back(&p);
+                        want_common = strata::program::prefill_plan::common_chunk(
+                            want, act.size(), [&](size_t i, int64_t c) { return fits(*act[i], c); },
+                            [&](size_t i) { return std::max<int64_t>(128, ixg_lend_floor(act[i]->cache)) > 128; });
+                        if (want_common != want)
+                            std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens on every card for this "
+                                         "request: the smallest loan all of them can take (checkpoints need one chunk "
+                                         "size)\n", (long long) want, (long long) want_common);
+                    }
+                }
                 bool any = false;
                 if (strata::prefill::Prefill::tp_prefill_env()) strata::prefill::Prefill::set_tp_layout(tp_read);
                 for (PfPart& p : pf_parts) {
@@ -16775,7 +16818,7 @@ int main(int argc, char** argv) {
                     // STRATA_PREFILL_MAX: this participant's own chunk.  A stage capped below the chain reads each
                     // hand-off in steps of it, so its loan is only as large as its own layout, and a later request
                     // whose chain chunk is bigger still needs nothing new from it.
-                    const int64_t want_cap = p.cap > 0 && p.cap < want ? p.cap : want;
+                    const int64_t want_cap = p.cap > 0 && p.cap < want_common ? p.cap : want_common;
                     // TP prefill: a loan laid out for the other kind of read is laid out again
                     const bool tp_mismatch = strata::prefill::Prefill::tp_prefill_env() && p.sp->tp_layout_now() != tp_read;
                     if (!p.lent.empty()) {

@@ -123,6 +123,23 @@ int main() {
         CHECK(c <= 3840);
         CHECK(n <= (t + 3839) / 3840 + 1);
     }
+    // common_chunk: a two-card split reads in ONE chunk (824K: CUDA0 fit 9984, CUDA1 9728 -> both 9728, so the
+    // periodic checkpoints' parts meet at the same token)
+    {
+        const int64_t cap[] = {9984, 9728};
+        auto fits = [&](size_t i, int64_t c) { return c <= cap[i]; };
+        auto fine = [](size_t) { return true; };
+        CHECK(common_chunk(10240, 2, fits, fine) == 9728);
+        CHECK(common_chunk(10240, 1, fits, fine) == 9984);          // one card keeps its own fit
+        CHECK(common_chunk(8192, 2, fits, fine) == 8192);           // fits everywhere: unchanged
+        auto coarse = [](size_t i) { return i == 0; };              // card 1 halves: 10240 -> 5120
+        CHECK(common_chunk(10240, 2, fits, coarse) == 5120);
+        // not monotonic: card 1 cannot take 9728 itself but card 0's 9984 is out; steps of 256 until both take one
+        auto odd = [&](size_t i, int64_t c) { return i == 0 ? c <= 9984 : (c <= 9216 || c == 10240); };
+        CHECK(common_chunk(10240, 2, odd, fine) == 9216);
+        auto none = [](size_t, int64_t) { return false; };
+        CHECK(common_chunk(4096, 2, none, fine) == 256);            // never below 256 (the caller reports the failure)
+    }
     std::printf("%s\n", failed ? "FAILED" : "prefill_plan_test: ok");
     return failed ? 1 : 0;
 }
