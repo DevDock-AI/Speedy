@@ -97,7 +97,7 @@ def main():
         new = [m for m in (LINE.search(l) for l in lines()[n0:]) if m]
         if not new:
             return None
-        m = max(new, key=lambda x: int(x[1]))   # the request that carried the prompt (reasoning adds a short follow-up)
+        m = min(new, key=lambda x: int(x[1]))   # the request itself: its reasoning follow-up has a longer prompt (and reuses ~all of it)
         return {"prompt": int(m[1]), "reused": int(m[2]), "read": int(m[3]), "read_ms": int(m[4]),
                 "prefill": float(m[5]), "gen": int(m[6]), "decode": float(m[8]), "wall_s": round(wall, 3)}
 

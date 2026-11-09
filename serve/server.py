@@ -4169,6 +4169,10 @@ class Service:
                  fit_max_tokens: bool = True):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
+        # the thinking of the latest replies, by their answer's text, each beside the end of the prompt it answered
+        # (_restore_reasoning)
+        self.recent_reasoning: collections.OrderedDict[str, list[tuple[str, str]]] = collections.OrderedDict()
+        self.reasoning_mu = threading.Lock()          # recent_reasoning: written by the generating thread, read by request threads
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
@@ -4263,6 +4267,7 @@ class Service:
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+        self.undeclared_tool_calls = "text"               # #4622: config "undeclared_tool_calls": "call" hands a call of an undeclared name to the client
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
@@ -5203,6 +5208,7 @@ class Service:
                     else:
                         part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
+        self._restore_reasoning(messages, log=kwargs.get("enable_thinking") is not False)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
@@ -5454,14 +5460,110 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
+    @staticmethod
+    def _answer_key(content, calls=()) -> str:
+        """An assistant turn's answer text and its tool calls (name and arguments), as the reply wrote them or as a
+        client sends them back; a tool-call turn often has no text."""
+        if isinstance(content, list):
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+        text = content.strip() if isinstance(content, str) else ""
+        norm = []
+        for c in calls or ():
+            if hasattr(c, "name") and hasattr(c, "arguments"):   # the reply's own ToolCall
+                name, args = c.name, c.arguments
+            elif isinstance(c, dict):
+                f = c.get("function") if isinstance(c.get("function"), dict) else c
+                name, args = f.get("name"), f.get("arguments")
+            else:
+                continue
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    pass
+            norm.append([name, args])
+        return text + ("\n\0" + json.dumps(norm, sort_keys=True, ensure_ascii=False) if norm else "")
+
+    def _remember_reasoning(self, ids, thinking, content, calls, reasoning):
+        """A finished reply's thinking, kept by its answer for _restore_reasoning, with the decoded end of its prompt."""
+        key = self._answer_key(content, calls)
+        if key and not reasoning and thinking:
+            print(f"[strata] reasoning not remembered: the reply ({len(key)} chars) had no thinking", flush=True)
+        if not key or not reasoning:
+            return
+        end = self.tok.decode(ids[-160:])
+        with self.reasoning_mu:
+            written = self.recent_reasoning.setdefault(key, [])
+            written.append((end, reasoning))
+            del written[:-32]
+            self.recent_reasoning.move_to_end(key)
+            # every turn of a long agent thread keeps its thinking: a turn whose thinking was forgotten renders without
+            # it, and the prompt leaves the conversation cache at that turn (~2 KB each)
+            while len(self.recent_reasoning) > 4096:
+                self.recent_reasoning.popitem(last=False)
+
+    def _restore_reasoning(self, messages, log=True):
+        """An assistant turn sent back without its thinking (OpenAI chat clients drop reasoning_content) gets the
+        thinking this server wrote for that answer.  The template keeps a turn's thinking (preserve_thinking), so
+        without it the prompt left the conversation cache at that turn and the whole answer was read again (~800
+        tokens, 3-4 s on a streamed arena); with it the prompt is what the model wrote."""
+        with self.reasoning_mu:
+            self._restore_reasoning_locked(messages, log)
+
+    def _restore_reasoning_locked(self, messages, log):
+        if not self.recent_reasoning:
+            return
+        for i, m in enumerate(messages):
+            if m.get("role") != "assistant" or (m.get("reasoning_content") or "").strip():
+                continue
+            key = self._answer_key(m.get("content"), m.get("tool_calls"))
+            r = self._reasoning_for(self.recent_reasoning.get(key), messages[i - 1] if i else None)
+            if r:
+                m["reasoning_content"] = r
+                self.recent_reasoning.move_to_end(key)   # a conversation in use keeps its turns' thinking
+            elif log and key and m is messages[-2 if len(messages) > 1 else -1]:
+                # only the turn before the new message is reported; a request with thinking off is quiet (its replies
+                # have no thinking to restore)
+                best = max(self.recent_reasoning, key=lambda k: len(os.path.commonprefix([k, key])))
+                n = len(os.path.commonprefix([best, key]))
+                print(f"[strata] reasoning not restored: the previous answer ({len(key)} chars) matches none of the "
+                      f"last {len(self.recent_reasoning)}; nearest ({len(best)} chars) differs at char {n}", flush=True)
+
+    @staticmethod
+    def _reasoning_for(written, before):
+        """The thinking of the reply that wrote this turn: among the replies with this answer, the one whose prompt
+        ended with the message this turn follows.  No such reply, none: another turn's thinking would change this
+        turn's text from one request to the next, and every request would leave the conversation cache there."""
+        if not written or before is None:
+            return None
+        text = before.get("content")
+        if isinstance(text, list):
+            text = "".join(p.get("text", "") for p in text if isinstance(p, dict) and p.get("type") == "text")
+        tail = text.strip()[-48:] if isinstance(text, str) else ""
+        if not tail:
+            return None
+        for ctx, r in reversed(written):   # only the template's turn markers may follow it
+            at = ctx.rfind(tail)
+            if at >= 0 and len(ctx) - at - len(tail) <= 80:
+                return r
+        return None
+
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
             declared_only=False, deferred=False) -> Iterator[tuple[str, object]]:
         """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
         ka = self.keep_awake
         if ka is not None:
             ka.acquire()
+        reasoning, content, calls = [], [], []
         try:
-            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, deferred)
+            for item in self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, deferred):
+                if item[0] == "event" and item[1].kind in ("reasoning", "content"):
+                    (reasoning if item[1].kind == "reasoning" else content).append(item[1].text or "")
+                elif item[0] == "event" and item[1].kind == "tool_call" and item[1].call is not None:
+                    calls.append(item[1].call)
+                elif item[0] == "done":
+                    self._remember_reasoning(ids, thinking, "".join(content), calls, "".join(reasoning).strip())
+                yield item
         finally:
             if ka is not None:
                 ka.release()
@@ -5505,7 +5607,7 @@ class Service:
                 budget = max(1, max_new - reserve)
         parser = self.parser_cls(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
                                  recover=self.tool_call_recovery, declared_only=declared_only,
-                                 deferred=deferred)
+                                 deferred=deferred or self.undeclared_tool_calls == "call")   # #4622: opt-in, as for a deferred tool
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -8935,6 +9037,18 @@ def _component_exe(reference: str, cfg: dict) -> str:
         raise SystemExit(e.exit_code) from None
 
 
+def undeclared_tool_calls_setting(cfg: dict) -> str:
+    """#4622: the config's "undeclared_tool_calls": "text" (the default, when the config does not name it) keeps a well-formed call of a tool the request
+    did not declare as the text the model wrote, with strata_rejected_tool_calls beside it; "call" returns it as a tool call, for a client that has
+    its own policy for unknown names (it answers the model with the tool names it has).  Anything else stops the start."""
+    mode = cfg.get("undeclared_tool_calls")
+    if mode is None:                                  # the environment names it too (STRATA_UNDECLARED_TOOL_CALLS); the config wins
+        mode = os.environ.get("STRATA_UNDECLARED_TOOL_CALLS") or "text"
+    if mode not in ("text", "call"):
+        raise SystemExit(f"[strata] config \"undeclared_tool_calls\" must be \"text\" or \"call\", not {mode!r}")
+    return mode
+
+
 def tool_call_recovery_setting(cfg: dict) -> bool:
     """The config's "tool_call_recovery" (see OutputParser's recover): ON when the config does not name it (since 0.2.8; 0.2.7 and before: off),
     "tool_call_recovery": false turns it off. Anything but true or false stops the start."""
@@ -9409,6 +9523,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
     svc.tool_call_recovery = tool_call_recovery_setting(cfg)
+    svc.undeclared_tool_calls = undeclared_tool_calls_setting(cfg)
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
         raise SystemExit(f"[strata] config \"env_to_user\" must be true or false, not {etu!r}")

@@ -134,10 +134,19 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
 }
 
 void session_release(SessionState& s) {
+    // STRATA_IDX_ELASTIC / STRATA_KV_HOST_ELASTIC: each state's own ranges (a no-op for states without them)
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
+        qsa_state_elastic_release(s.qsa_states[s.qsa_ord0 + j]);
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
         if (s.qsa_states[j].owns_rope) {
             strata::kernels::rope_table_release(s.qsa_states[j].cos_tab);
             s.qsa_states[j].owns_rope = false;
+            if (s.qsa_states[j].rope_host != nullptr) {
+                auto& pin = pin_detail::st();
+                std::lock_guard<std::mutex> lock(pin.mu);
+                pin_detail::free_locked(pin, s.qsa_states[j].rope_host);
+                s.qsa_states[j].rope_host = nullptr;
+            }
         }
 }
 

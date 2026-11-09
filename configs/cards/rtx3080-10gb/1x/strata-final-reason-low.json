@@ -26,7 +26,7 @@
     "--kv-resident",
     "20480",
     "--vram-reserve-mib",
-    "700",
+    "444",
     "--conversation-cache-mib",
     "8192",
     "--adapt-async",

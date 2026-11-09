@@ -6277,12 +6277,16 @@ int main(int argc, char** argv) {
             bool remote = false;
             for (const int r : o.expert_cache_remote) remote = remote || r > 0;
             const bool asked = ev != nullptr && ev[0] != '\0' ? ev[0] != '0' : o.kv_grow;
-            const bool on = asked && !multi_gpu && o.kv_resident <= 0 &&
+            bool on = asked && !multi_gpu && o.kv_resident <= 0 &&
                             !o.expert_profile.empty() && !o.resident_cpu_experts && o.expert_cache != 0 && !remote &&
                             strata::core::vmm_available() &&
                             // the batch slots carve their own K/V and --vram-elastic's cache is not one VMM range;
                             // a peer tier is fine - its cache never enables VMM (only the K/V's own cache does)
                             o.batch == 0 && !o.vram_elastic;
+            if (asked && on && strata::core::qsa_idx_elastic()) {   // R20 review: both fund from xcache below the loan
+                std::fprintf(stderr, "strata generate: --kv-grow is off: it does not run beside STRATA_IDX_ELASTIC\n");
+                on = false;
+            }
             if (asked && !on)
                 std::fprintf(stderr, "strata generate: --kv-grow is off (one GPU, a profile, the whole K/V in VRAM, "
                                      "every expert in RAM, no --batch or --vram-elastic)\n");
@@ -7452,7 +7456,7 @@ int main(int argc, char** argv) {
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.
     mem_mark("the weights, the session and the drafter");
     strata::core::ExpertCache xcache;
-    xcache.set_vmm(cache_vmm);
+    xcache.set_vmm(cache_vmm || strata::core::qsa_idx_elastic());   // STRATA_IDX_ELASTIC funds growth from VMM chunks
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena (#620)
     const bool auto_cache = o.expert_cache < 0;
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
@@ -8054,6 +8058,7 @@ int main(int argc, char** argv) {
         // try said.  Nothing changes when the first open works.
         bool stage_open = false;
         st.cache.set_slot_guard(slot_guard);   // STRATA_MMQ_DIRECT: the stages' prompt MMQ reads their own slots
+        st.cache.set_vmm(strata::core::qsa_idx_elastic());   // STRATA_IDX_ELASTIC: this card funds its own indexer
         for (int attempt = 0; !sized.empty(); ++attempt) {
             stage_open = native_pack ? st.cache.open_sized(sized, g.n_layers, g.n_expert, err)
                                      : st.cache.open((int64_t) sized.size(), g.n_layers, g.n_expert, (int64_t) lay.max_blob, err);
@@ -9469,6 +9474,281 @@ int main(int argc, char** argv) {
     // request hands them back and the slots are refilled with the profile's hottest experts.  Neither side's
     // addresses move, so every captured graph stays valid.  The context is never smaller: --max-context cells always
     // fit, the cache simply holds fewer experts while a long one is live.
+    // ---- STRATA_IDX_ELASTIC (opt-in; layer.cpp): the pooled indexer keys of every QSA layer are mapped only up to the
+    // cells the requests reach.  Growth happens at admission (prompt + max_new) on a quiet device: each card takes
+    // whole VMM chunks from the slots just below its own prompt-path loan (those experts become misses, computed as
+    // any miss) and maps them into its own layers' ranges; a later short request gives them back and the slots are
+    // refilled from the profile.  Each card funds its own layers (a layer split: CUDA0 and every stage).  Nothing is
+    // unmapped while a request runs.  Requires each cache's arena in VMM (set_vmm, below).
+    struct IxPart {
+        strata::core::ExpertCache* cache = nullptr;
+        int dev = 0;
+        int64_t lb = 0, le = 0;
+        int64_t top = 0;           // the startup loan's first slot: growth goes down from it, then up into the loan
+        int64_t lo = 0, hi = 0;    // slots [lo, hi) hold no expert; their whole chunks may be with the indexer
+        int64_t hi_max = 0;        // hi stops here: the smallest loan (1024 tokens, the whole context staged) stays
+        std::vector<strata::core::VmmChunk> spare;
+    };
+    struct IdxGrow {
+        bool on = false;
+        int64_t cells = 0, step = 16384, floor = 128;
+        std::vector<IxPart> parts;
+        int64_t grows = 0, trims = 0, evicted = 0, fresh = 0, refilled = 0;
+    } ixg;
+    std::vector<int64_t> ixg_tops;   // per part (CUDA0, then each stage): its first lent slot (set before kvg_start)
+    std::vector<int64_t> ixg_himax;  // per part: the highest slot the indexer may take up to (set with ixg_tops)
+    std::function<bool()> ixg_no_loan = [] { return true; };   // no prompt loan is laid out (set with ixg_tops)
+    // the lowest slot a prompt loan of `cache` may start at: above the indexer's slots (0: no limit)
+    auto ixg_lend_floor = [&](const strata::core::ExpertCache* cache) -> int64_t {
+        if (!ixg.on) return 0;
+        for (const IxPart& p : ixg.parts)
+            if (p.cache == cache && p.lo < p.hi) return p.hi;
+        return 0;
+    };
+    auto ixg_res_put_all = [&]() -> bool {
+        bool ok = true;
+        if (d_res != nullptr) { const strata::core::OnDevice on(primary_device); ok = ok && res_put(d_res) == cudaSuccess; }
+        for (auto& st : stages)
+            if (st->d_res != nullptr) { const strata::core::OnDevice on(st->dev); ok = ok && res_put(st->d_res) == cudaSuccess; }
+        return ok;
+    };
+    auto ixg_sync_all = [&]() {
+        { const strata::core::OnDevice on(primary_device); cudaDeviceSynchronize(); }
+        for (auto& st : stages) { const strata::core::OnDevice on(st->dev); cudaDeviceSynchronize(); }
+    };
+    auto ixg_start = [&]() {
+        ixg.on = false;
+        ixg.parts.clear();
+        if (!strata::core::qsa_idx_elastic() || host_res.empty() || xcache.vmm_range() == nullptr) {
+            if (strata::core::qsa_idx_elastic())
+                std::fprintf(stderr, "strata generate: STRATA_IDX_ELASTIC: no growth (needs the residency table and the "
+                                     "cache in VMM); the indexer stays at %lld cells\n",
+                             (long long) strata::core::qsa_idx_elastic_init());
+            return;
+        }
+        IxPart p0;
+        p0.cache = &xcache; p0.dev = primary_device; p0.lb = 0; p0.le = multi_gpu ? split_at[0] : g.n_layers;
+        p0.top = p0.lo = p0.hi = !ixg_tops.empty() && ixg_tops[0] >= 0 ? ixg_tops[0] : xcache.slots();
+        p0.hi_max = std::max<int64_t>(p0.top, !ixg_himax.empty() ? ixg_himax[0] : xcache.slots());
+        ixg.parts.push_back(p0);
+        for (size_t i = 0; i < stages.size(); ++i) {
+            GpuStage& st = *stages[i];
+            if (st.cache.vmm_range() == nullptr) {
+                std::fprintf(stderr, "strata generate: STRATA_IDX_ELASTIC: CUDA%d's cache is not in VMM: no growth\n", st.dev);
+                ixg.parts.clear();
+                return;
+            }
+            IxPart p;
+            p.cache = &st.cache; p.dev = st.dev; p.lb = st.lb; p.le = st.le;
+            p.top = p.lo = p.hi = i + 1 < ixg_tops.size() && ixg_tops[i + 1] >= 0 ? ixg_tops[i + 1] : st.cache.slots();
+            p.hi_max = std::max<int64_t>(p.top, i + 1 < ixg_himax.size() ? ixg_himax[i + 1] : st.cache.slots());
+            ixg.parts.push_back(p);
+        }
+        if (const char* v = std::getenv("STRATA_IDX_ELASTIC_STEP"); v != nullptr && std::atoll(v) > 0) ixg.step = std::atoll(v);
+        ixg.cells = strata::core::qsa_idx_elastic_cells(-1);
+        ixg.on = true;
+        for (const IxPart& p : ixg.parts) {
+            // the most cells the slots [floor, hi_max) can fund on this card (on top of what is mapped now)
+            const double mapped = (double) strata::core::qsa_idx_elastic_mapped_bytes(p.dev);
+            const double per_cell = ixg.cells > 0 ? mapped / (double) ixg.cells : 0.0;
+            const double room = (double) (p.cache->slot_offset(p.hi_max) - p.cache->slot_offset(ixg.floor));
+            const double reach = per_cell > 0 ? (double) ixg.cells + room / per_cell : 0.0;
+            std::fprintf(stderr, "strata generate: elastic indexer: CUDA%d %lld cells mapped (%.0f MiB); its cache (%lld "
+                                 "slots) gives room below slot %lld, then up to slot %lld (the smallest loan stays): "
+                                 "about %.0f cells reachable%s\n", p.dev, (long long) ixg.cells, mapped / 1048576.0,
+                         (long long) p.cache->slots(), (long long) p.top, (long long) p.hi_max, reach,
+                         reach < (double) o.max_context ? " - WARNING: below --max-context" : "");
+        }
+    };
+    // Room in every card's indexer for `cells` cells (rounded up to a step).  `quiesce`: as kvg_ensure's.
+    auto ixg_ensure = [&](int64_t cells, const std::function<void()>& quiesce) -> bool {
+        if (!ixg.on || (cells <= ixg.cells && cells <= strata::core::qsa_kv_host_elastic_cells())) return true;
+        const int64_t target = std::min<int64_t>(o.max_context, (cells + ixg.step - 1) / ixg.step * ixg.step);
+        bool quiet = false, evicted_any = false;
+        // STRATA_KV_HOST_ELASTIC: the K/V host copies first (RAM; refused when MemAvailable cannot cover it).  They are
+        // re-registered at the same addresses, so nothing may run on either card meanwhile: quiesced here.
+        if (strata::core::qsa_kv_host_elastic() && target > strata::core::qsa_kv_host_elastic_cells()) {
+            quiesce();
+            ixg_sync_all();
+            quiet = true;
+            std::fprintf(stderr, "strata: K/V host copy: growing %lld -> %lld cells (%.2f GiB pinned) for a request of "
+                                 "%lld cells\n", (long long) strata::core::qsa_kv_host_elastic_cells(), (long long) target,
+                         (double) strata::core::qsa_kv_host_bytes() / 1073741824.0, (long long) cells);
+            std::fflush(stderr);
+            std::string why;
+            if (!strata::core::qsa_kv_host_elastic_grow(target, why)) {
+                std::fprintf(stderr, "strata: the K/V host copy could not grow to %lld cells: %s\n", (long long) target,
+                             why.c_str());
+                std::fflush(stderr);
+                return false;
+            }
+            std::fprintf(stderr, "strata: K/V host copy grown to %lld cells (%.2f GiB pinned)\n", (long long) target,
+                         (double) strata::core::qsa_kv_host_bytes() / 1073741824.0);
+            std::fflush(stderr);
+        }
+        for (IxPart& p : ixg.parts) {
+            const strata::core::OnDevice on(p.dev);
+            const int64_t need = strata::core::qsa_idx_elastic_need(target, p.dev);
+            if (need == 0) continue;
+            if (!quiet) { quiesce(); ixg_sync_all(); quiet = true; }
+            const strata::core::OnDevice on2(p.dev);
+            strata::core::VmmRange& r = *p.cache->vmm_range();
+            const uint64_t G = strata::core::vmm_granularity();
+            auto freeable = [&]() -> int64_t {
+                const int64_t c0 = (int64_t) ((p.cache->slot_offset(p.lo) + G - 1) / G);
+                const int64_t c1 = (int64_t) (p.cache->slot_offset(p.hi) / G);
+                int64_t k = 0;
+                for (int64_t c = c0; c < c1; ++c) k += r.mapped(c) ? 1 : 0;
+                return k;
+            };
+            std::vector<int32_t> owner;   // slot -> residency index (this card's layers only)
+            int64_t gave = 0;
+            auto give_up = [&](int64_t slot) {
+                if (owner.empty()) {
+                    owner.assign((size_t) p.cache->slots(), -1);
+                    for (int64_t i = p.lb * g.n_expert; i < p.le * g.n_expert; ++i)
+                        if (host_res[(size_t) i] >= 0 && host_res[(size_t) i] < p.cache->slots())
+                            owner[(size_t) host_res[(size_t) i]] = (int32_t) i;
+                }
+                ++gave;
+                if (const int32_t oi = owner[(size_t) slot]; oi >= 0) {
+                    host_res[(size_t) oi] = strata::core::kNotResident;
+                    ++ixg.evicted;
+                    evicted_any = true;
+                }
+            };
+            // first the slots below the startup loan (middling heat), then up into the loan's own region: the prompt
+            // loan of a long request then starts above them (a smaller chunk for it; the lend clamps to ixg_lend_floor)
+            while ((int64_t) p.spare.size() + freeable() < need && p.lo > ixg.floor) give_up(--p.lo);
+            if ((int64_t) p.spare.size() + freeable() < need && p.hi < p.hi_max) {
+                if (!ixg_no_loan()) {
+                    // the slots given up below the loan stay given up (still mapped, just empty): the tables must say so
+                    if (gave > 0 && !ixg_res_put_all())
+                        std::fprintf(stderr, "strata: the residency table upload failed (elastic indexer)\n");
+                    std::fprintf(stderr, "strata: elastic indexer on CUDA%d: a prompt loan is laid out; growth waits\n", p.dev);
+                    return false;
+                }
+                while ((int64_t) p.spare.size() + freeable() < need && p.hi < p.hi_max) give_up(p.hi++);
+            }
+            // the residency tables first: no reader may name a slot whose memory is about to go
+            if (gave > 0 && !ixg_res_put_all()) {
+                std::fprintf(stderr, "strata: the residency table upload failed (elastic indexer)\n");
+                return false;
+            }
+            {
+                const int64_t c0 = (int64_t) ((p.cache->slot_offset(p.lo) + G - 1) / G);
+                const int64_t c1 = (int64_t) (p.cache->slot_offset(p.hi) / G);
+                for (int64_t c = c0; c < c1; ++c)
+                    if (r.mapped(c))
+                        if (const strata::core::VmmChunk h = r.unmap(c)) p.spare.push_back(h);
+            }
+            int64_t fresh = 0;
+            const bool ok = strata::core::qsa_idx_elastic_grow(target, p.dev, [&]() -> strata::core::VmmChunk {
+                if (p.spare.empty()) { ++fresh; return 0; }
+                const strata::core::VmmChunk h = p.spare.back();
+                p.spare.pop_back();
+                return h;
+            });
+            ixg.fresh += fresh;
+            std::fprintf(stderr, "strata: elastic indexer on CUDA%d grown to %lld cells (%.0f MiB); the expert cache gave "
+                                 "%lld slots (%lld of %lld hold experts)%s\n", p.dev, (long long) target,
+                         (double) strata::core::qsa_idx_elastic_mapped_bytes(p.dev) / 1048576.0, (long long) gave,
+                         (long long) (p.lo + (p.cache->slots() - p.hi)), (long long) p.cache->slots(),
+                         fresh > 0 ? " - and new VRAM, the cache being at its floor" : "");
+            if (!ok) {
+                std::fprintf(stderr, "strata: the elastic indexer could not grow to %lld cells (%s)\n", (long long) target,
+                             cudaGetErrorString(cudaGetLastError()));
+                return false;
+            }
+        }
+        (void) evicted_any;
+        ixg.cells = strata::core::qsa_idx_elastic_cells(-1);
+        ++ixg.grows;
+        return true;
+    };
+    // A request that fits the initial cells (prompt + max_new, and no longer parked conversation) gives every
+    // grown chunk back to the cache; the slots are refilled from the profile.  Run on a quiet device (as kvg_trim).
+    // Only a full return: a partial one would have to leave lent slots half mapped.
+    auto ixg_trim = [&](int64_t cells) -> bool {
+        if (!ixg.on) return true;
+        const int64_t target = strata::core::qsa_idx_elastic_init();
+        const bool idx_grown = ixg.cells > target + ixg.step;
+        const bool host_grown = strata::core::qsa_kv_host_elastic() && strata::core::qsa_kv_host_elastic_cells() > target;
+        if (cells > target || (!idx_grown && !host_grown)) return true;
+        ixg_sync_all();
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        bool any = false;
+        for (IxPart& p : ixg.parts) {
+            if (!idx_grown) break;   // (only the host copy to give back)
+            const strata::core::OnDevice on(p.dev);
+            strata::core::qsa_idx_elastic_shrink(target, p.dev, [&](strata::core::VmmChunk h) { p.spare.push_back(h); });
+            if (p.lo >= p.hi) {   // nothing lent: what came back was new memory
+                for (const strata::core::VmmChunk h : p.spare) strata::core::vmm_chunk_free(h);
+                p.spare.clear();
+                continue;
+            }
+            strata::core::VmmRange& r = *p.cache->vmm_range();
+            const uint64_t G = strata::core::vmm_granularity();
+            const int64_t c1 = (int64_t) ((p.cache->slot_offset(p.hi) + G - 1) / G);
+            const int64_t c0 = (int64_t) (p.cache->slot_offset(p.lo) / G);
+            if (!r.map_range(c0, c1, [&]() -> strata::core::VmmChunk {
+                    if (p.spare.empty()) return 0;
+                    const strata::core::VmmChunk h = p.spare.back();
+                    p.spare.pop_back();
+                    return h;
+                })) {
+                std::fprintf(stderr, "strata: CUDA%d's expert cache could not take its VRAM back from the indexer\n", p.dev);
+                continue;
+            }
+            for (const strata::core::VmmChunk h : p.spare) strata::core::vmm_chunk_free(h);
+            p.spare.clear();
+            // every chunk of [lo, top) is mapped again: refill those slots from the profile (this card's layers)
+            std::vector<std::pair<size_t, int32_t>> filled;
+            size_t pi = 0;
+            for (int64_t sl = p.lo; sl < p.hi; ++sl) {
+                const uint64_t room = p.cache->slot_offset(sl + 1) - p.cache->slot_offset(sl);
+                for (; pi < profile.size(); ++pi) {
+                    const int32_t l = profile[pi].first, e = profile[pi].second;
+                    if (l < p.lb || l >= p.le) continue;
+                    const size_t i = (size_t) l * (size_t) g.n_expert + (size_t) e;
+                    if (host_res[i] >= 0 || lay.blob_bytes(l) > room) continue;
+                    const uint8_t* b = srcp != nullptr ? srcp->blob_stable(l, e) : nullptr;
+                    if (b == nullptr) continue;
+                    nib::guard_raw(l, "the elastic indexer's refill (ixg_trim)");
+                    cudaMemcpyAsync(p.cache->device_slot((int32_t) sl), b, (size_t) lay.blob_bytes(l),
+                                    cudaMemcpyHostToDevice, nullptr);
+                    filled.emplace_back(i, (int32_t) sl);
+                    ++pi;
+                    break;
+                }
+            }
+            if (cudaDeviceSynchronize() != cudaSuccess) {
+                std::fprintf(stderr, "strata: refilling CUDA%d's expert cache failed: %s\n", p.dev,
+                             cudaGetErrorString(cudaGetLastError()));
+                return false;
+            }
+            for (const auto& [i, sl] : filled) host_res[i] = sl;
+            ixg.refilled += (int64_t) filled.size();
+            p.lo = p.hi = p.top;
+            any = true;
+        }
+        if (any && !ixg_res_put_all()) return false;
+        if (strata::core::qsa_kv_host_elastic()) {   // STRATA_KV_HOST_ELASTIC: the host copies back to the initial cells
+            ixg_sync_all();   // re-registered at the same addresses: nothing in flight
+            std::fprintf(stderr, "strata: K/V host copy: giving back %lld -> %lld cells\n",
+                         (long long) strata::core::qsa_kv_host_elastic_cells(), (long long) target);
+            std::fflush(stderr);
+            strata::core::qsa_kv_host_elastic_shrink(target);
+            std::fprintf(stderr, "strata: K/V host copy back to %lld cells (%.2f GiB pinned)\n",
+                         (long long) strata::core::qsa_kv_host_elastic_cells(),
+                         (double) strata::core::qsa_kv_host_bytes() / 1073741824.0);
+        }
+        ixg.cells = strata::core::qsa_idx_elastic_cells(-1);
+        ++ixg.trims;
+        std::fprintf(stderr, "strata: elastic indexer trimmed to %lld cells; slots back to the expert cache\n",
+                     (long long) ixg.cells);
+        return true;
+    };
     struct KvGrow {
         bool on = false;
         int64_t top = 0, lo = 0;          // slots [lo, top) hold no expert; their whole chunks may be with the K/V
@@ -9497,6 +9777,13 @@ int main(int argc, char** argv) {
     // Room for `cells` cells (rounded up to a step).  `quiesce` must leave nothing running on the device and land
     // the adaptive tier's swaps (a swap in flight could still be writing a slot given up here).
     auto kvg_ensure = [&](int64_t cells, const std::function<void()>& quiesce) -> bool {
+        if (ixg.on && !ixg_ensure(cells, quiesce)) return false;   // STRATA_IDX_ELASTIC (off: no-op)
+        if (!ixg.on && strata::core::qsa_idx_elastic() && cells > strata::core::qsa_idx_elastic_cells(-1)) {
+            std::fprintf(stderr, "strata: STRATA_IDX_ELASTIC: %lld cells are past the %lld the indexer holds and it cannot "
+                                 "grow here (serve mode with a profile only)\n", (long long) cells,
+                         (long long) strata::core::qsa_idx_elastic_cells(-1));
+            return false;
+        }
         if (!kvg.on || cells <= kvg.cells) return true;
         const int64_t target = std::min<int64_t>(o.max_context, (cells + kvg.step - 1) / kvg.step * kvg.step);
         const int64_t need = strata::core::qsa_kv_elastic_need(target);
@@ -10698,6 +10985,25 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        if (strata::core::qsa_idx_elastic()) {   // STRATA_IDX_ELASTIC: each card grows below its own loan
+            ixg_tops.clear();
+            ixg_himax.clear();
+            for (const PfPart& p : pf_parts) {
+                ixg_tops.push_back(p.first);
+                // the smallest loan a long request still needs: a 1024-token chunk with the whole context staged
+                const int64_t keep = strata::prefill::Prefill::stage_cells();
+                strata::prefill::Prefill::set_stage_cells(o.max_context);
+                const int64_t k = part_slots(p, 1024);
+                strata::prefill::Prefill::set_stage_cells(keep);
+                ixg_himax.push_back(k > 0 ? std::max<int64_t>(0, p.cache->slots() - k) : p.cache->slots());
+            }
+            ixg_no_loan = [&]() -> bool {
+                for (const PfPart& p : pf_parts)
+                    if (!p.lent.empty()) return false;
+                return true;
+            };
+            ixg_start();
+        }
         kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots());
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
         // `penalty_last_n` tokens that row's pick follows, -1 padded in front.  Allocated once at the cap for
@@ -11699,6 +12005,8 @@ int main(int argc, char** argv) {
         };
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
         bool pp_tail_saved = false;
+        bool pp_periodic_on = false, pp_warned = false;   // this read wants periodic checkpoints / the "none stored" note went out
+        int64_t pp_periodic_saved = 0;                     // periodic checkpoints this read stored
         // #471: the position the prompt pass has read up to (a chunk's or a window's end): what a request cancelled
         // mid-read reports as read, instead of the whole prompt
         int64_t pp_reached = 0;
@@ -11987,8 +12295,10 @@ int main(int argc, char** argv) {
                     bool complete = parts.size() == stages.size() + 1;
                     for (const ConvCheckpoint& k : parts) complete = complete && !k.gdn.empty();
                     saved = !complete || checkpoint_at(done, &parts);   // an incomplete set: no checkpoint here
+                    if (complete && saved && periodic_checkpoint) ++pp_periodic_saved;
                 } else {
                     saved = checkpoint_at(done, nullptr, tail_checkpoint && !periodic_checkpoint);
+                    if (saved && periodic_checkpoint) ++pp_periodic_saved;
                 }
                 if (!saved) {
                     // #3350: only a GPU that is unwell ends the request; a copy that ran out of memory skips this checkpoint
@@ -12001,6 +12311,15 @@ int main(int argc, char** argv) {
                 }
                 if (periodic_checkpoint) pp_next_check = done + o.prompt_cache_every;
                 if (tail_checkpoint) pp_tail_saved = true;
+            }
+            // a read longer than the checkpoint interval that stored no periodic checkpoint: a branch before the live
+            // end would re-read from 0 (multi-GPU parts at different chunk boundaries did this silently)
+            if (done >= pp_total && pp_periodic_on && !pp_warned && pp_periodic_saved == 0 &&
+                pp_total - pp_from > o.prompt_cache_every) {
+                pp_warned = true;
+                std::fprintf(stderr, "strata serve: warning: no periodic prompt checkpoint stored while reading %lld..%lld "
+                             "(every %lld): a branch before the end will re-read the prompt from its start\n",
+                             (long long) pp_from, (long long) pp_total, (long long) o.prompt_cache_every);
             }
             return true;
         };
@@ -12527,6 +12846,65 @@ int main(int argc, char** argv) {
         std::vector<int> res_devs{-1};
         for (auto& st : stages) res_devs.push_back(st->dev);
         int32_t* res_pairs = drive.d.evict_sync ? res_pairs_alloc(kResPatchCap, res_devs) : nullptr;
+        // --pipeline-windows 2 (fix A): while the pipelined loop has windows in flight the tier's changes reached the
+        // cards' tables at the drain alone (--adapt-async), or by a synchronous upload beside the windows (the
+        // blocking tier), while route_prior_top10 reads them every layer: a bonus for an evicted expert, none for a
+        // new one (UD-Q4_K_XL: short greedy answers ending early).  Here every stage (each holds the whole table)
+        // lists the entries changed, and the pre-launch hook of each of its verifiers patches them on the stage's
+        // stream right before its window: stream-ordered, no device-wide sync.  One pairs buffer per verifier - its
+        // next window launches only once the previous one, and the patch queued before it, has completed.  The
+        // blocking tier marks its evictions on its own thread (pl_adapt_thr): the lists are locked.
+        // STRATA_PW_RES_PATCH=0: the old behaviour (=1: also with --pipeline-windows 1).
+        bool pw_res_patch = pipe && d_res != nullptr && !host_res.empty() && !drive.d.usage.empty() && [&] {
+            const char* e = std::getenv("STRATA_PW_RES_PATCH");
+            return e != nullptr ? std::atoi(e) != 0 : o.pipeline_windows >= 2;
+        }();
+        std::mutex pw_res_mu;
+        std::vector<std::vector<int32_t>> pw_res_dirty(pw_res_patch ? (size_t) n_stages : 0);
+        const size_t pw_res_cap = host_res.size();   // a list past it is deduplicated: every entry fits
+        std::vector<int32_t*> pw_res_pairs;          // [stage * 2 + parity], mapped on the stage's card
+        if (pw_res_patch) {
+            for (int st = 0; st < n_stages && pw_res_patch; ++st)
+                for (int par = 0; par < 2; ++par) {
+                    int32_t* p = res_pairs_alloc(pw_res_cap, {st == 0 ? -1 : stages[(size_t) st - 1]->dev});
+                    if (p == nullptr) pw_res_patch = false;
+                    pw_res_pairs.push_back(p);
+                }
+            if (!pw_res_patch) std::fprintf(stderr, "strata serve: --pipeline-windows: no mapped memory for the residency patches: the tables take the tier's changes at the drain\n");
+        }
+        auto pw_res_mark = [&](int32_t i) {   // host_res[i] changed (on this thread or the blocking tier's)
+            if (!pw_res_patch) return;
+            std::lock_guard<std::mutex> lk(pw_res_mu);
+            for (auto& l : pw_res_dirty) l.push_back(i);
+        };
+        auto pw_res_sync = [&](int st, int par, cudaStream_t cs, std::string& e) -> bool {   // the hook, on the stage's device
+            int64_t n = 0;
+            int32_t* pairs = pw_res_pairs[(size_t) st * 2 + (size_t) par];
+            {
+                std::lock_guard<std::mutex> lk(pw_res_mu);
+                std::vector<int32_t>& idx = pw_res_dirty[(size_t) st];
+                if (idx.empty()) return true;
+                if (idx.size() > pw_res_cap) {
+                    std::sort(idx.begin(), idx.end());
+                    idx.erase(std::unique(idx.begin(), idx.end()), idx.end());
+                }
+                n = res_patch_pairs(idx, host_res, pairs, pw_res_cap);
+                idx.clear();
+            }
+            int32_t* table = st == 0 ? d_res : stages[(size_t) st - 1]->d_res;
+            cudaError_t r = cudaSuccess;
+            if (n >= 0) {
+                strata::kernels::res_patch(table, pairs, (int) n, cs);
+                r = cudaGetLastError();
+            } else {   // (not reached: the list fits) the whole table, still on the stream
+                r = cudaMemcpyAsync(table, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice, cs);
+            }
+            if (r != cudaSuccess) {
+                e = std::string("the residency table patch failed: ") + cudaGetErrorString(r);
+                return false;
+            }
+            return true;
+        };
         auto res_sync = [&](bool check, std::string& e) -> bool {
             if (drive.d.res_dirty) {
                 const int64_t n = tp2 ? -1 : res_patch_pairs(drive.d.res_dirty_idx, host_res, res_pairs, kResPatchCap);
@@ -12579,14 +12957,21 @@ int main(int argc, char** argv) {
             strata::core::ExpertDispatch& d;
             int32_t* pairs;
             strata::core::Verifier* tpv0;
+            strata::core::Verifier& vb;         // --pipeline-windows: the odd verifiers' hooks and pairs too
+            std::vector<int32_t*>& pw_pairs;
             ~PreLaunchOff() {
                 v.set_pre_launch(nullptr);
-                for (auto& st : stages) st->ver.set_pre_launch(nullptr);
+                vb.set_pre_launch(nullptr);
+                for (auto& st : stages) {
+                    st->ver.set_pre_launch(nullptr);
+                    st->ver_b.set_pre_launch(nullptr);
+                }
                 if (tpv0 != nullptr) tpv0->set_pre_launch(nullptr);
                 d.dres_check = nullptr;
                 if (pairs != nullptr) cudaFreeHost(pairs);
+                for (int32_t* p : pw_pairs) if (p != nullptr) cudaFreeHost(p);
             }
-        } pre_launch_off{ver, stages, drive.d, res_pairs, tp_on ? &tpv[0] : nullptr};
+        } pre_launch_off{ver, stages, drive.d, res_pairs, tp_on ? &tpv[0] : nullptr, ver_b, pw_res_pairs};
         if (drive.d.evict_sync || res_checking) {
             ver.set_pre_launch([&](cudaStream_t, std::string& e) { return res_sync(res_checking, e); });
             for (auto& st : stages) st->ver.set_pre_launch([&](cudaStream_t, std::string& e) { return res_sync(false, e); });
@@ -12594,6 +12979,12 @@ int main(int argc, char** argv) {
             if (drive.d.evict_sync)
                 std::fprintf(stderr, "strata serve: the adaptive tier's evictions reach the device's table before the next "
                                      "window (STRATA_ADAPT_EVICT_SYNC=0: when its copies land)\n");
+        } else if (pw_res_patch) {   // (exclusive: the serial hooks need serial windows, which --pipeline-windows is not)
+            for (int st = 0; st < n_stages; ++st)
+                for (int par = 0; par < 2; ++par)
+                    stage_ver_p(st, par).set_pre_launch([&, st, par](cudaStream_t cs, std::string& e) { return pw_res_sync(st, par, cs, e); });
+            std::fprintf(stderr, "strata serve: --pipeline-windows: the residency tables take the tier's changes before each "
+                                 "window, on its stream (STRATA_PW_RES_PATCH=0: at the drain)\n");
         }
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
         std::function<void()> adapt_fence;
@@ -12673,6 +13064,7 @@ int main(int argc, char** argv) {
                     tbl_of_swap(s)[out] = strata::core::kNotResident;
                 }
                 std::atomic_thread_fence(std::memory_order_seq_cst);
+                for (const Swap& s : swaps) pw_res_mark((int32_t) (s.layer * g.n_expert + s.out));   // (the next launches' patch)
                 adapt_fence();
             }
             bool main_live = false;
@@ -13168,6 +13560,7 @@ int main(int argc, char** argv) {
                             return false;
                         }
                         host_res[out] = strata::core::kNotResident;   // the CPU computes it from the next window on
+                        if (pl) pw_res_mark((int32_t) out);           // (the pipelined tables at their next launches)
                         srcp->prefetch(w.layer, w.out);
                         aswaps[k++] = w;
                     }
@@ -13202,6 +13595,7 @@ int main(int argc, char** argv) {
                     for (size_t i = pl ? 0 : a_lo; i < (pl ? aswaps.size() : a_hi); ++i) {   // (the batch just landed)
                         const ASwap& w = aswaps[i];
                         host_res[(size_t) w.layer * g.n_expert + w.in] = w.slot;
+                        if (pl) pw_res_mark((int32_t) ((size_t) w.layer * g.n_expert + w.in));   // (landed: a_ready)
                         srcp->release(w.layer, w.in);
                     }
                     if (pl) a_res_dirty = true;
@@ -15340,6 +15734,15 @@ int main(int argc, char** argv) {
                              std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());
             }
             auto kv_quiesce = [&] { adapt_quiesce(); late_apply(true); };
+            // STRATA_IDX_ELASTIC: the indexer grows once at admission for the whole request (prompt + max_new)
+            // (max_new is often the whole rest of the context: only its first 16384 tokens are made room for here, the
+            // window path grows on as the reply goes on).  A failed growth refuses this request; the engine serves on.
+            if (ixg.on && !ixg_ensure(n + std::min<int64_t>(max_new, 16384) + 256, kv_quiesce)) {
+                (void) cudaGetLastError();
+                std::printf("ERR the indexer cannot grow to this request: no VRAM is left\n");
+                std::fflush(stdout);
+                continue;
+            }
             if (kvg.on) {   // the elastic K/V: this prompt's cells (it gives back what it does not need below)
                 // a failed growth may leave the tier half-changed: the engine stops (as for any CUDA failure)
                 if (!kvg_ensure(n + 256, kv_quiesce)) {
@@ -15833,10 +16236,15 @@ int main(int argc, char** argv) {
             live_ok = false;   // until this request has finished, the session is in between
             // the elastic K/V: the outgoing session is parked and this request rewrites every cell from `resume` on,
             // so cells past this prompt's are no longer anyone's - far more than it needs go back to the cache
-            if (kvg.on) {
+            if (kvg.on || ixg.on) {
                 kv_quiesce();
                 // STRATA_KV_GROW_HOLD=1 (opt-in): keep the K/V as long as the longest parked conversation; default: trim to this request alone, as 0.1.40
                 static const bool hold_on = [] { const char* v = std::getenv("STRATA_KV_GROW_HOLD"); return v != nullptr && std::atoi(v) != 0; }();
+                if (ixg.on && !ixg_trim(std::max<int64_t>(n + std::min<int64_t>(max_new, 16384) + 256, conversations.longest_tokens() + 256))) {
+                    std::printf("ERR the indexer could not give its VRAM back to the expert cache\n");
+                    std::fflush(stdout);
+                    return 1;
+                }
                 if (!kvg_trim(n + 256, hold_on ? conversations.longest_tokens() + 256 : 0)) {
                     std::printf("ERR the K/V could not give its VRAM back to the expert cache\n");
                     std::fflush(stdout);
@@ -15946,6 +16354,9 @@ int main(int argc, char** argv) {
             pp_t0 = r0;
             pp_next_check = reread_to > 0 || !req_ckpt ? INT64_MAX : resume + o.prompt_cache_every;   // ckpt=0: none
             pp_tail_saved = reread_to > 0 || !req_ckpt;   // ckpt=0 (#861): no tail checkpoint either
+            pp_periodic_on = pp_next_check != INT64_MAX && o.prompt_cache > 0 && o.prompt_cache_every > 0;
+            pp_periodic_saved = 0;
+            pp_warned = false;
             {
                 std::lock_guard<std::mutex> lk(part_mu);
                 part_at.clear();
@@ -16448,6 +16859,33 @@ int main(int argc, char** argv) {
                     e = "prefill: cannot lend buffers for an empty request segment";
                     return false;
                 }
+                // Two or more participants read in ONE chunk size: the periodic prompt checkpoints are only stored
+                // where every stage's part sits at the same token (part_at[done]), and per-card shrinking (CUDA0 9984,
+                // CUDA1 9728 at 824K) left none, so a branch re-read the whole prompt.  The common size is the
+                // largest on the 256 grid at or below `want` whose loan every participant can take (each card's own
+                // fit first, then 256-token steps down while one of them still cannot: loans are not monotonic, #2090).
+                int64_t want_common = want;
+                if (!o.prefill_head_alias) {
+                    int64_t n_act = 0;
+                    for (const PfPart& p : pf_parts) n_act += p.first >= 0;
+                    if (n_act > 1) {
+                        auto fits = [&](const PfPart& p, int64_t c) {
+                            const int64_t lf = std::max<int64_t>(128, ixg_lend_floor(p.cache));
+                            const int64_t n = part_slots(p, c);
+                            return n > 0 && n + lf <= p.cache->slots();
+                        };
+                        std::vector<const PfPart*> act;
+                        for (const PfPart& p : pf_parts)
+                            if (p.first >= 0) act.push_back(&p);
+                        want_common = strata::program::prefill_plan::common_chunk(
+                            want, act.size(), [&](size_t i, int64_t c) { return fits(*act[i], c); },
+                            [&](size_t i) { return std::max<int64_t>(128, ixg_lend_floor(act[i]->cache)) > 128; });
+                        if (want_common != want)
+                            std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens on every card for this "
+                                         "request: the smallest loan all of them can take (checkpoints need one chunk "
+                                         "size)\n", (long long) want, (long long) want_common);
+                    }
+                }
                 bool any = false;
                 if (strata::prefill::Prefill::tp_prefill_env()) strata::prefill::Prefill::set_tp_layout(tp_read);
                 for (PfPart& p : pf_parts) {
@@ -16455,7 +16893,7 @@ int main(int argc, char** argv) {
                     // STRATA_PREFILL_MAX: this participant's own chunk.  A stage capped below the chain reads each
                     // hand-off in steps of it, so its loan is only as large as its own layout, and a later request
                     // whose chain chunk is bigger still needs nothing new from it.
-                    const int64_t want_cap = p.cap > 0 && p.cap < want ? p.cap : want;
+                    const int64_t want_cap = p.cap > 0 && p.cap < want_common ? p.cap : want_common;
                     // TP prefill: a loan laid out for the other kind of read is laid out again
                     const bool tp_mismatch = strata::prefill::Prefill::tp_prefill_env() && p.sp->tp_layout_now() != tp_read;
                     if (!p.lent.empty()) {
@@ -16477,11 +16915,16 @@ int main(int argc, char** argv) {
                         // loan starts where the chunk itself needs it (the 128-slot floor aside); a chunk that cannot be
                         // lent even then is halved until it can, instead of ending the engine.
                         int64_t need_p = part_slots(p, want_p);
-                        while ((need_p <= 0 || need_p + 128 > p.cache->slots()) && want_p > 256) {
-                            want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
+                        // STRATA_IDX_ELASTIC: the loan starts above the slots the indexer holds (0 when off: unchanged)
+                        const int64_t lend_floor = std::max<int64_t>(128, ixg_lend_floor(p.cache));
+                        while ((need_p <= 0 || need_p + lend_floor > p.cache->slots()) && want_p > 256) {
+                            // with the elastic indexer's floor the loan is just short of room: 256 tokens a step keeps
+                            // the chunk next to the startup one (halving went 9472 -> 4608); off: halving as before
+                            want_p = lend_floor > 128 ? std::max<int64_t>(256, (want_p - 256) / 256 * 256)
+                                                      : std::max<int64_t>(256, want_p / 2 / 256 * 256);
                             need_p = part_slots(p, want_p);
                         }
-                        if (need_p <= 0 || need_p + 128 > p.cache->slots()) {
+                        if (need_p <= 0 || need_p + lend_floor > p.cache->slots()) {
                             e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
                             return false;
                         }
@@ -17270,7 +17713,7 @@ int main(int argc, char** argv) {
                 if (!admit_merge_first_env() || admit_slot < 0 || max_new != 1 || batch_mtp || pipe) return -1;
                 if (hist_n > 0 && !pen_prompt) return -1;   // #4590: the merged window's prompt rows would join the reply-only penalty window
                 if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at) return -1;
-                if (!req_imgs.empty() || kvg.on || peer.valid() || remote_caches || remote_opt || fs_swap) return -1;
+                if (!req_imgs.empty() || kvg.on || ixg.on || peer.valid() || remote_caches || remote_opt || fs_swap) return -1;
                 if (std::getenv("STRATA_LOGPOS") != nullptr) return -1;
                 if (host_res.empty() || !pending.empty() ||
                     std::any_of(host_res.begin(), host_res.end(), [](int32_t r) { return r < 0; }))
@@ -17732,10 +18175,11 @@ int main(int argc, char** argv) {
                     for (const auto& [i, slot] : pending) {
                         host_res[(size_t) i] = slot;
                         pl_landed.push_back(i);
+                        pw_res_mark(i);   // (landed: adapt_ev) the tables at the next launches, not a synchronous upload beside the windows
                     }
                     pending.clear();
                     pending_age = 0;
-                    res_upload();
+                    if (!pw_res_patch) res_upload();
                     stage_record(exch_ev);
                     exch_wait = true;
                 };
@@ -18062,7 +18506,19 @@ int main(int argc, char** argv) {
                     if (nf) finish = "nonfinite";
                     else if (eos) finish = "stop";
                     else if (stop_req.load()) finish = "cancel";
-                    const bool last = nf || eos || produced_n >= max_new || stop_req.load();
+                    // STRATA_IDX_ELASTIC: the pipelined loop does not grow the context; the next window and the speculative
+                    // one after it must fit the mapped cells, else the reply ends here ("length") and the engine serves on
+                    const bool elastic_end = ixg.on && !nf && !eos &&
+                        A.p + a + 1 + 2 * (int64_t) strata::kernels::kVerifyMaxT + 64 >
+                            std::min<int64_t>(ixg.cells, strata::core::qsa_kv_host_elastic_cells());
+                    if (elastic_end && produced_n < max_new && !stop_req.load()) {
+                        finish = "length";
+                        std::fprintf(stderr, "strata serve: the elastic context holds %lld cells: the pipelined reply ends at "
+                                             "%lld tokens (admission reserves the prompt + 16384)\n",
+                                     (long long) std::min<int64_t>(ixg.cells, strata::core::qsa_kv_host_elastic_cells()),
+                                     (long long) produced_n);
+                    }
+                    const bool last = nf || eos || produced_n >= max_new || stop_req.load() || elastic_end;
                     const bool on = !nf && B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
                     if (B.made) {   // the gate's calibration: would B have been on the path, by its estimate p_on
                         const bool would = a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
@@ -18156,6 +18612,12 @@ int main(int argc, char** argv) {
                 // unfenced (the INVARIANT at pl_drain: a checkpoint, a park, the serial loop and the next request find
                 // nothing pipelined in flight) at the next tick, the next request's drain
                 a_pl_settle();
+                if (pw_res_patch) {   // changed after the last launches (the tier's thread has joined): the whole tables, nothing in flight
+                    std::lock_guard<std::mutex> lk(pw_res_mu);
+                    bool any = false;
+                    for (auto& l : pw_res_dirty) { any = any || !l.empty(); l.clear(); }
+                    if (any) res_upload();
+                }
                 for (cudaEvent_t ev : fence_ev) if (ev) cudaEventDestroy(ev);
                 for (cudaEvent_t ev : exch_ev) if (ev) cudaEventDestroy(ev);
                 if (pl_trace_path != nullptr && !pl_trace.empty()) {
@@ -18504,8 +18966,15 @@ int main(int argc, char** argv) {
                                cudaMemcpyHostToDevice);
                 }
                 // the elastic K/V: the window's cells and the drafter's beyond them
-                if (kvg.on && p + T + 64 > kvg.cells &&
+                if ((kvg.on && p + T + 64 > kvg.cells || ixg.on && (p + T + 64 > ixg.cells || p + T + 64 > strata::core::qsa_kv_host_elastic_cells())) &&
                     !kvg_ensure(p + T + 64, [&] { std::string we; (void) dv.wait_commit(we); adapt_quiesce(); late_apply(true); })) {
+                    (void) cudaGetLastError();
+                    if (ixg.on && !kvg.on) {   // STRATA_IDX_ELASTIC: the reply ends here ("length"), the engine serves on
+                        std::fprintf(stderr, "strata serve: the elastic context cannot grow past %lld cells: the reply ends "
+                                             "at %lld tokens\n", (long long) p, (long long) produced_n);
+                        finish = "length";
+                        break;
+                    }
                     std::printf("ERR the K/V cannot grow: no VRAM is left\n");
                     return 1;
                 }

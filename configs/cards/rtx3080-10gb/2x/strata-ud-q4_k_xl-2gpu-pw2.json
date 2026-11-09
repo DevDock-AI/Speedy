@@ -10,7 +10,7 @@
     "--expert-cache",
     "auto",
     "--prefill",
-    "auto",
+    "auto:16384",
     "--spec",
     "4",
     "--spec-min-p",
@@ -22,7 +22,7 @@
     "--kv",
     "int8",
     "--kv-resident",
-    "20480",
+    "24576",
     "--vram-reserve-mib",
     "700",
     "--conversation-cache-mib",
@@ -59,7 +59,7 @@
     "top_p": 0.95,
     "top_k": 20,
     "min_p": 0,
-    "presence_penalty": 1.5
+    "presence_penalty": 0.0
   },
   "reasoning_effort": "medium",
   "env": {
@@ -80,7 +80,12 @@
     "CUDA_VISIBLE_DEVICES": "<GPU1_UUID>,<GPU2_UUID>",
     "STRATA_PREFILL_HELP": "1",
     "STRATA_PIPELINE_PENALTIES": "1",
-    "STRATA_GDN_TC": "0"
+    "STRATA_GDN_TC": "1",
+    "STRATA_PREFILL_ROUTED_STREAM": "1",
+    "STRATA_SELECT_TWO_PASS": "1",
+    "STRATA_SPLIT_MTP_BATCH": "1",
+    "STRATA_PREFILL_STREAM_MIN": "512",
+    "STRATA_PW_RES_PATCH": "1"
   },
   "reasoning_budget_tokens": 16384,
   "reasoning_close_retry": true,

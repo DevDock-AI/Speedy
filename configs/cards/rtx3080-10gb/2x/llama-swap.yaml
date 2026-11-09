@@ -26,7 +26,7 @@ models:
     cmd: <LLAMA_SWAP_DIR>/serve.sh <CONFIG_DIR>/strata-ud-iq4_xs-2gpu-pw2.json ${PORT}
     checkEndpoint: /health
     ttl: 3600
-    aliases: [qwen3.8-flash-next-ud-iq4_xs, q4_xs]
+    aliases: [qwen3.8-flash-next-ud-iq4_xs, q4_xs, ud-iq4_xs-1m]   # one preset from 0 to 1M
   q2_0-1m:
     name: "Qwen3.8 Flash-Next Q2_0 1M (yarn x4 overflow tier, 2 GPUs)"
     cmd: <LLAMA_SWAP_DIR>/serve.sh <CONFIG_DIR>/strata-q2_0-1m-2gpu.json ${PORT}
@@ -40,11 +40,6 @@ models:
   ud-q4_k_xl-1m:
     name: "Qwen3.8 Flash-Next UD-Q4_K_XL 1M (yarn x4 overflow tier)"
     cmd: <LLAMA_SWAP_DIR>/serve.sh <CONFIG_DIR>/strata-ud-q4_k_xl-1m-2gpu.json ${PORT}
-    checkEndpoint: /health
-    ttl: 3600
-  ud-iq4_xs-1m:
-    name: "Qwen3.8 Flash-Next UD-IQ4_XS 1M (yarn x4 overflow tier, 2 GPUs)"
-    cmd: <LLAMA_SWAP_DIR>/serve.sh <CONFIG_DIR>/strata-ud-iq4_xs-1m-2gpu.json ${PORT}
     checkEndpoint: /health
     ttl: 3600
 hooks:

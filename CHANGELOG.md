@@ -1,5 +1,29 @@
 # Changelog
 
+## Speedy 0.4.0 (2026-11-09), two windows fixed, one 0..1M preset, Strata serve fixes
+Measured on 2x / 1x RTX 3080 10 GB (P620, TR 5975WX, 128 GB DDR4-3200).
+- **Two-window cut-off answers fixed** (`STRATA_PW_RES_PATCH`, default on with `--pipeline-windows 2`): the route
+  prior read a residency table the pipelined loop did not keep current, and UD-Q4_K_XL ended short answers early (up
+  to 18 of 48). Each stage now keeps a dirty list and patches its table on its own stream before every window. Both
+  UD-Q4_K_XL presets are back on two windows: decode +25 % (229K) / +30 % (1M), greedy cut-offs 1 of 192.
+- **One UD-IQ4_XS preset from 0 to 1M** (`STRATA_IDX_ELASTIC`, `STRATA_KV_HOST_ELASTIC`, `STRATA_ROPE_HOST`, yarn x4):
+  the indexer and the host K/V copy grow with the request. Growth to 1M: 9/9 recall. With two windows a reply ends
+  ("length") at prompt + 16384 tokens, the reasoning budget admission reserves.
+- **UD-IQ4_XS 2x:** prompt chunk up to 16384 and 24K resident K/V: prefill +7-11 % (55K-185K), decode +3.6 %.
+- **`STRATA_GDN_TC=1`** (split tensor-core GDN) on UD-IQ4_XS and UD-Q4_K_XL 229K, 2x and 1x: prefill +1-4 %.
+- **Presence penalty 1.5 -> 0** on the UD presets (needle and gate tests clean, no loops).
+- **One prompt-chunk size for both cards:** re-sending an 824K prompt takes 7 s instead of 329 s.
+- **Route-prior NaN guard** (as Strata #5655): a non-finite router row still picks 10 real experts.
+- **Strata #5643** (follow-up turns restore the reasoning a client dropped, so the cached prompt is reused): turn-2
+  time to first token 1.44 s -> 0.23-0.28 s median. **#5648**: a tool call whose opener lost its `<` is recovered.
+- **1x presets: `--vram-reserve-mib 444`** (was 700): the engine now reserves 256 MiB more after the expert cache;
+  700 cost single-card prefill 10 % (UD-IQ4_XS) / 17 % (UD-Q4_K_XL). See configs/cards/rtx3080-10gb/CARD.md.
+- **bench/speedbench.py** reads the request's own timing line, not its reasoning follow-up (longer prompt, all reused).
+- 2x `strata-ud-iq4_xs-1m-2gpu.json` removed: `ud-iq4_xs-1m` is now an alias of the 0..1M preset.
+- **Rejected after measurement:** CPU share of short prompt chunks, arena release, HANDOFF_PIPE, GDN_SPLIT, QFUSE,
+  EXPDEC_R=2, CPU prefetch distance, q4_0 K/V for 1M, route prior weaker/off (fixes the cut-offs at -20/-38 % decode),
+  16K chunks / 24K resident on one card (slower), Strata #5595.
+
 ## Speedy 0.3.0 (2026-11-01), unified single- and dual-GPU, on Strata v0.2.7.1
 - **One codebase for one or two GPUs.** The single-GPU edition (1GPU 0.2.0) and the dual-GPU edition are merged. A
   preset with `--layer-split` runs two cards; without it the engine runs on one. Production presets for both are in

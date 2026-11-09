@@ -249,6 +249,7 @@ struct QsaState {
     int32_t* idx_block_pos = nullptr;
 
     float* cos_tab = nullptr;        ///< (max_cells, n_rot/2), built on the HOST in float64
+    float* rope_host = nullptr;      ///< STRATA_ROPE_HOST=1: the cos+sin tables live in this pinned, device-mapped block
     bool owns_rope = false;          ///< built the table above (not borrowed with share_rope): it releases it
     float* sin_tab = nullptr;
 
@@ -288,6 +289,24 @@ void qsa_set_kv_resident(int64_t cells);
 /// captured graphs stay valid.  Set before sizing and initializing the session and the drafter.
 void qsa_set_kv_elastic(bool enabled, int64_t init_cells);
 bool qsa_kv_elastic();
+bool qsa_rope_host();
+/// STRATA_IDX_ELASTIC=<cells> (opt-in): the pooled indexer keys in per-layer VMM ranges mapped up to the cells the
+/// requests reach (layer.cpp). `dev` < 0: every device. Cells are rounded to whole 2 MiB chunks per layer.
+bool qsa_idx_elastic();
+/// Frees this state's elastic indexer range and elastic K/V host copy, if it has them (session_release, a failed init).
+void qsa_state_elastic_release(QsaState& st);
+int64_t qsa_idx_elastic_init();
+int64_t qsa_idx_elastic_cells(int dev);
+int64_t qsa_idx_elastic_need(int64_t cells, int dev);
+bool qsa_idx_elastic_grow(int64_t cells, int dev, const std::function<strata::core::VmmChunk()>& take);
+int64_t qsa_idx_elastic_shrink(int64_t cells, int dev, const std::function<void(strata::core::VmmChunk)>& give);
+uint64_t qsa_idx_elastic_mapped_bytes(int dev);
+/// STRATA_KV_HOST_ELASTIC=1 (opt-in, with STRATA_IDX_ELASTIC): the KV-streaming host copies pinned only up to the
+/// cells requests reach (layer.cpp). grow false: refused (why says so), nothing half-done that matters.
+bool qsa_kv_host_elastic();
+int64_t qsa_kv_host_elastic_cells();
+bool qsa_kv_host_elastic_grow(int64_t cells, std::string& why);
+void qsa_kv_host_elastic_shrink(int64_t cells);   ///< STRATA_ROPE_HOST=1: RoPE cos/sin tables in pinned host memory, not VRAM
 /// Cells every elastic state can hold now (INT64_MAX when none is elastic).
 int64_t qsa_kv_elastic_cells();
 /// Chunks still to map for every elastic state to hold `cells` cells.

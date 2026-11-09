@@ -26,7 +26,7 @@
     "--kv-resident",
     "20480",
     "--vram-reserve-mib",
-    "700",
+    "444",
     "--conversation-cache-mib",
     "8192",
     "--adapt-async",
@@ -52,7 +52,7 @@
     "top_p": 0.95,
     "top_k": 20,
     "min_p": 0,
-    "presence_penalty": 1.5
+    "presence_penalty": 0.0
   },
   "reasoning_effort": "medium",
   "env": {
@@ -68,7 +68,8 @@
     "STRATA_KV_PREFETCH": "1",
     "STRATA_PF_GROUP_SCRATCH": "1",
     "STRATA_PF_HC_REGION": "1",
-    "STRATA_HC_Q8": "1"
+    "STRATA_HC_Q8": "1",
+    "STRATA_GDN_TC": "1"
   },
   "reasoning_budget_tokens": 16384,
   "reasoning_close_retry": true,

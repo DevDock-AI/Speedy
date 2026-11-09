@@ -1124,6 +1124,7 @@ struct PrefillWarmer {
     }
 };
 
+namespace { int64_t pf_sel_batch(int64_t max_blocks); }   // STRATA_PF_SEL_BATCH, below
 struct Prefill::Impl {
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
@@ -1525,6 +1526,26 @@ uint64_t gdn_set_bytes(size_t T) {
     a.take<uint16_t>(T * (ZV + (pf_pad() ? ZV_PAD : 0)), ok);
     return a.used;
 }
+// STRATA_PF_SEL_BATCH=N (opt-in; default 256 = unchanged): queries per prefill selection batch. The score scratch is
+// [sel_batch, max_blocks] fp32 = 256 MiB per card at 1M cells with 256; 64 cuts it to 64 MiB. Each query's scores and
+// top-k do not depend on which batch it is in, only the number of launches changes. Multiple of 16, 16..256.
+// With STRATA_IDX_ELASTIC (and no STRATA_PF_SEL_BATCH) the batch is scaled so the scratch is what an engine of the
+// elastic indexer's initial cells would carve (1M with 262144 initial: 64), so the startup lend plan - and the
+// prompt chunk it picks - is the short-context engine's.
+int64_t pf_sel_batch(int64_t max_blocks) {
+    static const int64_t env = [] {
+        const char* e = std::getenv("STRATA_PF_SEL_BATCH");
+        const long long n = e != nullptr ? std::atoll(e) : 0;
+        return (int64_t) (n >= 16 && n <= 256 && n % 16 == 0 ? n : 0);
+    }();
+    if (env > 0) return env;
+    if (strata::core::qsa_idx_elastic() && max_blocks > 0) {
+        const int64_t init_blocks = strata::core::qsa_idx_elastic_init() / 4 + 2;
+        const int64_t b = 256 * init_blocks / max_blocks / 16 * 16;
+        return std::max<int64_t>(16, std::min<int64_t>(256, b));
+    }
+    return 256;
+}
 uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_batch, int64_t attn_batch,
                        const strata::kernels::QsaShapes& s) {
     Alloc a; a.count_only = true; bool ok = true;
@@ -1544,6 +1565,12 @@ constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the ga
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
 constexpr size_t MMQ_TAIL = 4096;
+// The MMQ row table (`ids_identity`, T*K rows) is read past its end: ggml's stream-k fixup
+// (mul_mat_q_stream_k_fixup) loads ids_dst[col_low + jt*J + j] for a whole J-column tile before it compares the tile
+// with the expert's rows, and its tiles run to ceil(max_rows / J) * J for every expert of the launch.  T + 256 rows
+// of slack keep every such read in the allocation (an exact-sized table can end a 2 MiB page: Xid 31 FAULT_PDE,
+// "prefill copy_i32: an illegal memory access" on a long prompt).  Upstream Strata #5108.
+constexpr size_t mmq_ids_rows(size_t T) { return T * (size_t) K + T + 256; }
 struct MmqPlan {
     bool any = false, fallback = true;
     std::vector<char> layer;                   // per layer: MMQ
@@ -2117,6 +2144,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     strata::kernels::QsaShapes s = core::qsa_shapes(g);
     m.cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     m.max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
+    m.sel_batch = pf_sel_batch(m.max_blocks);
     {
         // one region for the attention half's and the MoE half's scratch (see gdn_set_bytes)
         const bool fz = fused_layout(T, m.src != nullptr);
@@ -2177,7 +2205,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
-        m.ids_identity = o.take<int32_t>(T * K, ok);
+        m.ids_identity = o.take<int32_t>(mmq_ids_rows(T), ok);   // (its over-read slack: mmq_ids_rows)
         m.bounds_dev = o.take<int32_t>(bounds_ints(m.g->n_expert), ok);
         m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
@@ -2360,7 +2388,8 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     float* Vc = (float*) carve((size_t) B * KV * 4);
     int32_t* tok = (int32_t*) carve((size_t) B * 4);
     void* xq = q8 ? carve(mmq::q8_bytes(B * g.hc, Nn)) : nullptr;
-    int32_t* ident = q8 ? (int32_t*) carve((size_t) B * g.hc * 4) : nullptr;
+    // (B + 256 rows of slack: the stream-k fixup reads the row table past its end, as mmq_ids_rows / #5108)
+    int32_t* ident = q8 ? (int32_t*) carve((size_t) (B * g.hc + B + 256) * 4) : nullptr;
     int32_t* bnd = q8 ? (int32_t*) carve(16) : nullptr;
     if ((uint64_t) (q - m.region) > m.region_bytes) return decline("the batch buffers do not fit the scratch region");
     static const bool timing = std::getenv("STRATA_DRAFT_TIMING") != nullptr;   // debug: where this pass's time goes
@@ -2373,7 +2402,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     std::vector<int32_t> tk((size_t) B);
     if (q8) {
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
-        mmq::iota(ident, B * g.hc, m.cs);
+        mmq::iota(ident, B * g.hc + B + 256, m.cs);
     }
     // y[rows, n_out] = x[rows, k] . w^T for a Q8_0 matrix: MMQ from the FP32 rows (bounds slot 0: rows, 1: rows*hc)
     auto proj = [&](const float* x, const uint16_t* x16, const void* w, float* y, int64_t rows, int64_t n_out,
@@ -2743,7 +2772,7 @@ bool Prefill::bind_stage_helper(int64_t T) {
             return false;
     }
     const core::OnDevice on(P.dev);
-    mmq::iota(P.ident, T * K, P.s);           // the helper's row table: a refill may have overwritten its slots
+    mmq::iota(P.ident, (int64_t) mmq_ids_rows((size_t) T), P.s);           // the helper's row table: a refill may have overwritten its slots
     return true;
 }
 
@@ -2978,8 +3007,12 @@ int64_t Prefill::stage_cells() {
     if (v < 0) {   // first use: STRATA_KV_STAGE_REQ=<cells> (unset or 0: the upstream pool, every page of the context)
         const char* e = std::getenv("STRATA_KV_STAGE_REQ");
         v = e != nullptr ? std::max<int64_t>(0, std::atoll(e)) : 0;
-        if (v > 0) std::fprintf(stderr, "prefill: STRATA_KV_STAGE_REQ=%lld: the streamed K/V staging pool holds %lld cells "
+        // STRATA_IDX_ELASTIC without STRATA_KV_STAGE_REQ: the staging pool starts at the indexer's initial cells, so
+        // the startup loan (and the chunk it allows) is the short-context engine's; a longer request's pool grows
+        if (e == nullptr && core::qsa_idx_elastic()) v = core::qsa_idx_elastic_init();
+        if (v > 0) std::fprintf(stderr, "prefill: %s=%lld: the streamed K/V staging pool holds %lld cells "
                                         "at start and each request's end after (not every page of --max-context)\n",
+                                e != nullptr ? "STRATA_KV_STAGE_REQ" : "STRATA_IDX_ELASTIC (initial cells)",
                                 (long long) v, (long long) v);
         int64_t expect = -1;
         g_stage_cells.compare_exchange_strong(expect, v);
@@ -3153,13 +3186,13 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     strata::kernels::QsaShapes s = core::qsa_shapes(g);
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
-    o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
+    o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, pf_sel_batch(max_blocks), 32, s),
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, src)),
                                        hcr ? hc_set_bytes(T, f16_io) : (uint64_t) 0}), ok);
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
-        o.take<int32_t>(T * K, ok);
+        o.take<int32_t>(mmq_ids_rows(T), ok);   // ids_identity
         o.take<int32_t>(bounds_ints(g.n_expert), ok);   // carve's bounds table (STRATA_PF_GROUP_SCRATCH: + sub-ranges)
         o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
@@ -3711,7 +3744,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const cudaStream_t cs = (cudaStream_t) m.cs;
     // the MMQ row table lives in the borrowed cache slots, which the refill after a prompt overwrites with experts:
     // write it again for every prompt (a layout is reused as long as the chunk and the slots are the same)
-    if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, m.T * K, m.cs);
+    if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, (int64_t) mmq_ids_rows((size_t) m.T), m.cs);
     // The PLE rows of a chunk are read from the model file on the host (an SSD read per missed row): the chunk
     // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
     // depend only on the tokens (the two before a position name its n-grams), so this is the same data.
@@ -8282,7 +8315,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     PfTimer pt;
     // the MMQ row table lives in the borrowed cache slots when the prompt path borrows: written for every prompt
     // (none without an MMQ layer: the FP16 path has no such table)
-    if (m.ids_identity) mmq::iota(m.ids_identity, m.T * K, m.cs);
+    if (m.ids_identity) mmq::iota(m.ids_identity, (int64_t) mmq_ids_rows((size_t) m.T), m.cs);
     // ---- the PLE rows, read per chunk on a thread as run_impl does (the same state machine, in chunk order)
     const bool ple_on = ss.ple.ready();
     static const bool ple_batch_env = [] {
