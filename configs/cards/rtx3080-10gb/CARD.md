@@ -20,7 +20,7 @@
 | Folder | Contents |
 |:---|:---|
 | [`1x/`](1x/) | one card: Q2_0 (med/low reasoning), IQ3_S, UD-IQ4_XS, UD-Q4_K_XL at 229K, Q2_0 at 1M, `llama-swap.yaml` |
-| [`2x/`](2x/) | two cards, layer split: every quant at 229K (`-2gpu-pw2`) and 1M (`-1m-2gpu`), `llama-swap.yaml` |
+| [`2x/`](2x/) | two cards, layer split: every quant at 229K (`-2gpu-pw2`) and 1M (`-1m-2gpu`); UD-IQ4_XS is one preset from 0 to 1M (`-2gpu-pw2`), `llama-swap.yaml` |
 | [`2x/parallel2/`](2x/parallel2/) | `"parallel": 2` variants. Measured slower on 2× 10 GB, kept for reference |
 
 ## Measured (tok/s, average ± half spread)
@@ -47,8 +47,12 @@
 
 - Every value in these presets was adopted after a same-window A/B and a quality gate; see
   [docs/TUNING-HISTORY.md](../../../docs/TUNING-HISTORY.md).
-- 10 GB is the limit that shapes these presets: `--kv-resident 20480`, `--vram-reserve-mib 700` and the layer split
-  are sized for it. A card with more VRAM should start from here and raise them.
+- 10 GB is the limit that shapes these presets: `--kv-resident 20480`, `--vram-reserve-mib` (444 on one card, see below) and the
+  layer split are sized for it. A card with more VRAM should start from here and raise them.
 - 2x UD-IQ4_XS (`2x/strata-ud-iq4_xs-2gpu-pw2.json`, 2026-11-06): `--prefill auto:16384` caps the prompt chunk at
   16384 (55K prefill +7 %, 110K +9.5 %, 185K +11 %; 12288 and 20480 were slower) and `--kv-resident 24576`
   keeps more KV cells on the cards (decode +3.6 %, 20K-110K, same VRAM peak). Both: 3 A/B pairs + quality gate 8/8 + 4/4.
+- 1x presets, `--vram-reserve-mib 444` (2026-11-09): the engine now reserves another 256 MiB after the expert cache;
+  at 700 a single 10 GB card lost ~110 expert slots and the automatic prompt chunk dropped (UD-IQ4_XS 5632 -> 4608,
+  UD-Q4_K_XL 3840 -> 3072): prefill -10 % / -17 %. 444 + 256 = the old 700: UD-IQ4_XS 1805-1810 t/s, UD-Q4_K_XL 1136
+  at 57K, the same as Speedy 1GPU 0.2.0 (ABBA, same presets).

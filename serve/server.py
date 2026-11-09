@@ -4172,6 +4172,7 @@ class Service:
         # the thinking of the latest replies, by their answer's text, each beside the end of the prompt it answered
         # (_restore_reasoning)
         self.recent_reasoning: collections.OrderedDict[str, list[tuple[str, str]]] = collections.OrderedDict()
+        self.reasoning_mu = threading.Lock()          # recent_reasoning: written by the generating thread, read by request threads
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
@@ -5490,20 +5491,26 @@ class Service:
             print(f"[strata] reasoning not remembered: the reply ({len(key)} chars) had no thinking", flush=True)
         if not key or not reasoning:
             return
-        written = self.recent_reasoning.setdefault(key, [])
-        written.append((self.tok.decode(ids[-160:]), reasoning))
-        del written[:-32]
-        self.recent_reasoning.move_to_end(key)
-        # every turn of a long agent thread keeps its thinking: a turn whose thinking was forgotten renders without it,
-        # and the prompt leaves the conversation cache at that turn (~2 KB each)
-        while len(self.recent_reasoning) > 4096:
-            self.recent_reasoning.popitem(last=False)
+        end = self.tok.decode(ids[-160:])
+        with self.reasoning_mu:
+            written = self.recent_reasoning.setdefault(key, [])
+            written.append((end, reasoning))
+            del written[:-32]
+            self.recent_reasoning.move_to_end(key)
+            # every turn of a long agent thread keeps its thinking: a turn whose thinking was forgotten renders without
+            # it, and the prompt leaves the conversation cache at that turn (~2 KB each)
+            while len(self.recent_reasoning) > 4096:
+                self.recent_reasoning.popitem(last=False)
 
     def _restore_reasoning(self, messages, log=True):
         """An assistant turn sent back without its thinking (OpenAI chat clients drop reasoning_content) gets the
         thinking this server wrote for that answer.  The template keeps a turn's thinking (preserve_thinking), so
         without it the prompt left the conversation cache at that turn and the whole answer was read again (~800
         tokens, 3-4 s on a streamed arena); with it the prompt is what the model wrote."""
+        with self.reasoning_mu:
+            self._restore_reasoning_locked(messages, log)
+
+    def _restore_reasoning_locked(self, messages, log):
         if not self.recent_reasoning:
             return
         for i, m in enumerate(messages):
@@ -5520,8 +5527,7 @@ class Service:
                 best = max(self.recent_reasoning, key=lambda k: len(os.path.commonprefix([k, key])))
                 n = len(os.path.commonprefix([best, key]))
                 print(f"[strata] reasoning not restored: the previous answer ({len(key)} chars) matches none of the "
-                      f"last {len(self.recent_reasoning)}; nearest ({len(best)} chars) differs at char {n}: "
-                      f"sent {key[n:n + 40]!r}, written {best[n:n + 40]!r}", flush=True)
+                      f"last {len(self.recent_reasoning)}; nearest ({len(best)} chars) differs at char {n}", flush=True)
 
     @staticmethod
     def _reasoning_for(written, before):

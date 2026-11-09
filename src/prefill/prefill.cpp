@@ -3010,8 +3010,9 @@ int64_t Prefill::stage_cells() {
         // STRATA_IDX_ELASTIC without STRATA_KV_STAGE_REQ: the staging pool starts at the indexer's initial cells, so
         // the startup loan (and the chunk it allows) is the short-context engine's; a longer request's pool grows
         if (e == nullptr && core::qsa_idx_elastic()) v = core::qsa_idx_elastic_init();
-        if (v > 0) std::fprintf(stderr, "prefill: STRATA_KV_STAGE_REQ=%lld: the streamed K/V staging pool holds %lld cells "
+        if (v > 0) std::fprintf(stderr, "prefill: %s=%lld: the streamed K/V staging pool holds %lld cells "
                                         "at start and each request's end after (not every page of --max-context)\n",
+                                e != nullptr ? "STRATA_KV_STAGE_REQ" : "STRATA_IDX_ELASTIC (initial cells)",
                                 (long long) v, (long long) v);
         int64_t expect = -1;
         g_stage_cells.compare_exchange_strong(expect, v);
