@@ -12846,6 +12846,65 @@ int main(int argc, char** argv) {
         std::vector<int> res_devs{-1};
         for (auto& st : stages) res_devs.push_back(st->dev);
         int32_t* res_pairs = drive.d.evict_sync ? res_pairs_alloc(kResPatchCap, res_devs) : nullptr;
+        // --pipeline-windows 2 (fix A): while the pipelined loop has windows in flight the tier's changes reached the
+        // cards' tables at the drain alone (--adapt-async), or by a synchronous upload beside the windows (the
+        // blocking tier), while route_prior_top10 reads them every layer: a bonus for an evicted expert, none for a
+        // new one (UD-Q4_K_XL: short greedy answers ending early).  Here every stage (each holds the whole table)
+        // lists the entries changed, and the pre-launch hook of each of its verifiers patches them on the stage's
+        // stream right before its window: stream-ordered, no device-wide sync.  One pairs buffer per verifier - its
+        // next window launches only once the previous one, and the patch queued before it, has completed.  The
+        // blocking tier marks its evictions on its own thread (pl_adapt_thr): the lists are locked.
+        // STRATA_PW_RES_PATCH=0: the old behaviour (=1: also with --pipeline-windows 1).
+        bool pw_res_patch = pipe && d_res != nullptr && !host_res.empty() && !drive.d.usage.empty() && [&] {
+            const char* e = std::getenv("STRATA_PW_RES_PATCH");
+            return e != nullptr ? std::atoi(e) != 0 : o.pipeline_windows >= 2;
+        }();
+        std::mutex pw_res_mu;
+        std::vector<std::vector<int32_t>> pw_res_dirty(pw_res_patch ? (size_t) n_stages : 0);
+        const size_t pw_res_cap = host_res.size();   // a list past it is deduplicated: every entry fits
+        std::vector<int32_t*> pw_res_pairs;          // [stage * 2 + parity], mapped on the stage's card
+        if (pw_res_patch) {
+            for (int st = 0; st < n_stages && pw_res_patch; ++st)
+                for (int par = 0; par < 2; ++par) {
+                    int32_t* p = res_pairs_alloc(pw_res_cap, {st == 0 ? -1 : stages[(size_t) st - 1]->dev});
+                    if (p == nullptr) pw_res_patch = false;
+                    pw_res_pairs.push_back(p);
+                }
+            if (!pw_res_patch) std::fprintf(stderr, "strata serve: --pipeline-windows: no mapped memory for the residency patches: the tables take the tier's changes at the drain\n");
+        }
+        auto pw_res_mark = [&](int32_t i) {   // host_res[i] changed (on this thread or the blocking tier's)
+            if (!pw_res_patch) return;
+            std::lock_guard<std::mutex> lk(pw_res_mu);
+            for (auto& l : pw_res_dirty) l.push_back(i);
+        };
+        auto pw_res_sync = [&](int st, int par, cudaStream_t cs, std::string& e) -> bool {   // the hook, on the stage's device
+            int64_t n = 0;
+            int32_t* pairs = pw_res_pairs[(size_t) st * 2 + (size_t) par];
+            {
+                std::lock_guard<std::mutex> lk(pw_res_mu);
+                std::vector<int32_t>& idx = pw_res_dirty[(size_t) st];
+                if (idx.empty()) return true;
+                if (idx.size() > pw_res_cap) {
+                    std::sort(idx.begin(), idx.end());
+                    idx.erase(std::unique(idx.begin(), idx.end()), idx.end());
+                }
+                n = res_patch_pairs(idx, host_res, pairs, pw_res_cap);
+                idx.clear();
+            }
+            int32_t* table = st == 0 ? d_res : stages[(size_t) st - 1]->d_res;
+            cudaError_t r = cudaSuccess;
+            if (n >= 0) {
+                strata::kernels::res_patch(table, pairs, (int) n, cs);
+                r = cudaGetLastError();
+            } else {   // (not reached: the list fits) the whole table, still on the stream
+                r = cudaMemcpyAsync(table, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice, cs);
+            }
+            if (r != cudaSuccess) {
+                e = std::string("the residency table patch failed: ") + cudaGetErrorString(r);
+                return false;
+            }
+            return true;
+        };
         auto res_sync = [&](bool check, std::string& e) -> bool {
             if (drive.d.res_dirty) {
                 const int64_t n = tp2 ? -1 : res_patch_pairs(drive.d.res_dirty_idx, host_res, res_pairs, kResPatchCap);
@@ -12898,14 +12957,21 @@ int main(int argc, char** argv) {
             strata::core::ExpertDispatch& d;
             int32_t* pairs;
             strata::core::Verifier* tpv0;
+            strata::core::Verifier& vb;         // --pipeline-windows: the odd verifiers' hooks and pairs too
+            std::vector<int32_t*>& pw_pairs;
             ~PreLaunchOff() {
                 v.set_pre_launch(nullptr);
-                for (auto& st : stages) st->ver.set_pre_launch(nullptr);
+                vb.set_pre_launch(nullptr);
+                for (auto& st : stages) {
+                    st->ver.set_pre_launch(nullptr);
+                    st->ver_b.set_pre_launch(nullptr);
+                }
                 if (tpv0 != nullptr) tpv0->set_pre_launch(nullptr);
                 d.dres_check = nullptr;
                 if (pairs != nullptr) cudaFreeHost(pairs);
+                for (int32_t* p : pw_pairs) if (p != nullptr) cudaFreeHost(p);
             }
-        } pre_launch_off{ver, stages, drive.d, res_pairs, tp_on ? &tpv[0] : nullptr};
+        } pre_launch_off{ver, stages, drive.d, res_pairs, tp_on ? &tpv[0] : nullptr, ver_b, pw_res_pairs};
         if (drive.d.evict_sync || res_checking) {
             ver.set_pre_launch([&](cudaStream_t, std::string& e) { return res_sync(res_checking, e); });
             for (auto& st : stages) st->ver.set_pre_launch([&](cudaStream_t, std::string& e) { return res_sync(false, e); });
@@ -12913,6 +12979,12 @@ int main(int argc, char** argv) {
             if (drive.d.evict_sync)
                 std::fprintf(stderr, "strata serve: the adaptive tier's evictions reach the device's table before the next "
                                      "window (STRATA_ADAPT_EVICT_SYNC=0: when its copies land)\n");
+        } else if (pw_res_patch) {   // (exclusive: the serial hooks need serial windows, which --pipeline-windows is not)
+            for (int st = 0; st < n_stages; ++st)
+                for (int par = 0; par < 2; ++par)
+                    stage_ver_p(st, par).set_pre_launch([&, st, par](cudaStream_t cs, std::string& e) { return pw_res_sync(st, par, cs, e); });
+            std::fprintf(stderr, "strata serve: --pipeline-windows: the residency tables take the tier's changes before each "
+                                 "window, on its stream (STRATA_PW_RES_PATCH=0: at the drain)\n");
         }
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
         std::function<void()> adapt_fence;
@@ -12992,6 +13064,7 @@ int main(int argc, char** argv) {
                     tbl_of_swap(s)[out] = strata::core::kNotResident;
                 }
                 std::atomic_thread_fence(std::memory_order_seq_cst);
+                for (const Swap& s : swaps) pw_res_mark((int32_t) (s.layer * g.n_expert + s.out));   // (the next launches' patch)
                 adapt_fence();
             }
             bool main_live = false;
@@ -13487,6 +13560,7 @@ int main(int argc, char** argv) {
                             return false;
                         }
                         host_res[out] = strata::core::kNotResident;   // the CPU computes it from the next window on
+                        if (pl) pw_res_mark((int32_t) out);           // (the pipelined tables at their next launches)
                         srcp->prefetch(w.layer, w.out);
                         aswaps[k++] = w;
                     }
@@ -13521,6 +13595,7 @@ int main(int argc, char** argv) {
                     for (size_t i = pl ? 0 : a_lo; i < (pl ? aswaps.size() : a_hi); ++i) {   // (the batch just landed)
                         const ASwap& w = aswaps[i];
                         host_res[(size_t) w.layer * g.n_expert + w.in] = w.slot;
+                        if (pl) pw_res_mark((int32_t) ((size_t) w.layer * g.n_expert + w.in));   // (landed: a_ready)
                         srcp->release(w.layer, w.in);
                     }
                     if (pl) a_res_dirty = true;
@@ -18100,10 +18175,11 @@ int main(int argc, char** argv) {
                     for (const auto& [i, slot] : pending) {
                         host_res[(size_t) i] = slot;
                         pl_landed.push_back(i);
+                        pw_res_mark(i);   // (landed: adapt_ev) the tables at the next launches, not a synchronous upload beside the windows
                     }
                     pending.clear();
                     pending_age = 0;
-                    res_upload();
+                    if (!pw_res_patch) res_upload();
                     stage_record(exch_ev);
                     exch_wait = true;
                 };
@@ -18536,6 +18612,12 @@ int main(int argc, char** argv) {
                 // unfenced (the INVARIANT at pl_drain: a checkpoint, a park, the serial loop and the next request find
                 // nothing pipelined in flight) at the next tick, the next request's drain
                 a_pl_settle();
+                if (pw_res_patch) {   // changed after the last launches (the tier's thread has joined): the whole tables, nothing in flight
+                    std::lock_guard<std::mutex> lk(pw_res_mu);
+                    bool any = false;
+                    for (auto& l : pw_res_dirty) { any = any || !l.empty(); l.clear(); }
+                    if (any) res_upload();
+                }
                 for (cudaEvent_t ev : fence_ev) if (ev) cudaEventDestroy(ev);
                 for (cudaEvent_t ev : exch_ev) if (ev) cudaEventDestroy(ev);
                 if (pl_trace_path != nullptr && !pl_trace.empty()) {
