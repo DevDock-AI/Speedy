@@ -15,7 +15,7 @@ it was adopted only after a same-window A/B and a quality gate.
 more experts and likely run faster, but the presets are tuned for 10 GB and haven't been measured elsewhere.
 **AMD** (RX 7900 / RDNA3, RDNA4) builds from source through Strata's HIP backend ([docs/AMD_HIP.md](docs/AMD_HIP.md)); it compiles in our CI but we have not run it. Results from other GPUs are very welcome: add a card folder under [`configs/cards/`](configs/README.md#add-a-card).
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: Personal & Non-Commercial](https://img.shields.io/badge/License-Personal%20%26%20Non--Commercial-orange.svg)](LICENSE)
 ![GPU](https://img.shields.io/badge/GPU-RTX%203080%2010%20GB%20(1%20or%202)-76B900)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey)
 ![CUDA](https://img.shields.io/badge/CUDA-13.x-76B900)
@@ -197,6 +197,8 @@ only machine paths and GPU UUIDs are replaced by placeholders.
 **Tuned Speedy on another card?** Copy [`configs/cards/_template/`](configs/cards/_template/), add your presets and
 numbers, and open a PR. See [configs/README.md](configs/README.md#add-a-card).
 
+**Per-GPU-family tuning guides** (RTX 20 / 30 / 40 / 50, for people and AI agents): [docs/cards/](docs/cards/README.md).
+
 | Folder | Contents |
 |---|---|
 | [`configs/cards/rtx3080-10gb/2x/`](configs/cards/rtx3080-10gb/2x/) | `strata-<quant>-2gpu-pw2.json` (229K native) and `strata-<quant>-1m-2gpu.json` (1M tier) for Q2_0, IQ3_S, UD-IQ4_XS, UD-Q4_K_XL, plus `llama-swap.yaml` |
@@ -235,7 +237,7 @@ quality-gate result. See [CONTRIBUTING.md](CONTRIBUTING.md). Report security iss
 
 ## License
 
-MIT ([LICENSE](LICENSE)). Model weights are not included and keep their own licenses.
+Speedy Personal & Non-Commercial License v1.0 ([LICENSE](LICENSE)) for original Speedy contributions: free to run, study, modify and use for personal, non-commercial purposes (AI-assisted changes included); commercial use or public redistribution of modified versions needs written permission. Speedy is built on [Strata](https://github.com/Niko1221/Strata) (MIT, [licenses/Strata-MIT.txt](licenses/Strata-MIT.txt)); third-party components keep their own licenses (see [licenses/](licenses/)). Model weights are not included and keep their own licenses.
 
 ---
 
