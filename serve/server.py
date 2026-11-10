@@ -4267,6 +4267,7 @@ class Service:
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+        self.canonical_tools = False                      # config "canonical_tools": true: tools sorted by name, keys sorted, for rendering only
         self.undeclared_tool_calls = "text"               # #4622: config "undeclared_tool_calls": "call" hands a call of an undeclared name to the client
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
@@ -5119,6 +5120,8 @@ class Service:
         A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
         the control tokens the template writes are control tokens.  `store=False` (a token count) reuses the kept
         prompts without adding or replacing one."""
+        if self.canonical_tools:
+            tools = canonical_tools(tools)
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         plain = ()
@@ -5373,7 +5376,8 @@ class Service:
 
         def head_ids(msgs):
             """The ids the rendered `msgs` start with (a message's trailing marker cut at PREFIX_END when it is there)."""
-            marked, marked_tools, changed = mark_think_literals(msgs, tools, self.literals)
+            marked, marked_tools, changed = mark_think_literals(
+                msgs, canonical_tools(tools) if self.canonical_tools else tools, self.literals)
             effort = kwargs.get("reasoning_effort")
             off = kwargs.get("enable_thinking") is False        # render_prompt's rule for #458's effort_end
             kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
@@ -9037,6 +9041,36 @@ def _component_exe(reference: str, cfg: dict) -> str:
         raise SystemExit(e.exit_code) from None
 
 
+def _sorted_keys(x):
+    """`x` with every dict's keys in sorted order, recursively (lists keep their order)."""
+    if isinstance(x, dict):
+        return {k: _sorted_keys(x[k]) for k in sorted(x, key=str)}
+    if isinstance(x, list):
+        return [_sorted_keys(v) for v in x]
+    return x
+
+
+def canonical_tools(tools):
+    """Config "canonical_tools": the tools as the template renders them: sorted by function name (stable) and each
+    tool's keys sorted recursively, so the same set of tools renders byte-identically whatever order or key order a
+    client sends; the prompt then keeps its cached start.  Only order changes; the parser keeps the request's tools."""
+    if not tools:
+        return tools
+
+    def name(t):
+        f = t.get("function") if isinstance(t, dict) and isinstance(t.get("function"), dict) else t
+        n = f.get("name") if isinstance(f, dict) else None
+        return n if isinstance(n, str) else ""
+    return [_sorted_keys(t) for t in sorted(tools, key=name)]
+
+
+def canonical_tools_setting(cfg: dict) -> bool:
+    """The config's "canonical_tools" (true/false); without it, the environment's STRATA_CANONICAL_TOOLS=1."""
+    if "canonical_tools" in cfg:
+        return cfg.get("canonical_tools") is True
+    return os.environ.get("STRATA_CANONICAL_TOOLS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def undeclared_tool_calls_setting(cfg: dict) -> str:
     """#4622: the config's "undeclared_tool_calls": "text" (the default, when the config does not name it) keeps a well-formed call of a tool the request
     did not declare as the text the model wrote, with strata_rejected_tool_calls beside it; "call" returns it as a tool call, for a client that has
@@ -9461,6 +9495,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                   "Chat settings shared with other apps, can set its own)", flush=True)
     svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default
     svc.codex_compaction_cache = cfg.get("codex_compaction_cache") is True   # #924: opt-in, off by default
+    svc.canonical_tools = canonical_tools_setting(cfg)  # opt-in: tools rendered in a canonical order
     try:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
     except ValueError as e:

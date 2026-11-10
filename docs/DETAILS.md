@@ -890,6 +890,7 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 | `lazy_load` | off | Start without loading the model. |
 | `slot_save_path` | none | Enables session files. |
 | `host`, `api_key`, `cors_origins`, `trusted_origins`, `allowed_hosts` | local only | See [Network access](#network-access). |
+| `canonical_tools` | off | `true` renders the request's tools sorted by function name (stable) with every key sorted, so the same set of tools gives a byte-identical prompt start whatever order or key order the client sends, and the cached prompt is reused instead of read again. Only the rendered order changes; tool-call parsing uses the tools as sent. The environment variable `STRATA_CANONICAL_TOOLS=1` sets the same; the config wins. |
 | `codex_thread_titles`, `codex_compaction_cache` | off | See [Codex CLI](#the-responses-api-and-codex-cli). |
 | `mcp_servers`, `mcp` | none | See [Tools from MCP servers](#tools-from-mcp-servers). |
 
