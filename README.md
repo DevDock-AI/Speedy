@@ -197,6 +197,8 @@ only machine paths and GPU UUIDs are replaced by placeholders.
 **Tuned Speedy on another card?** Copy [`configs/cards/_template/`](configs/cards/_template/), add your presets and
 numbers, and open a PR. See [configs/README.md](configs/README.md#add-a-card).
 
+**Per-GPU-family tuning guides** (RTX 20 / 30 / 40 / 50, for people and AI agents): [docs/cards/](docs/cards/README.md).
+
 | Folder | Contents |
 |---|---|
 | [`configs/cards/rtx3080-10gb/2x/`](configs/cards/rtx3080-10gb/2x/) | `strata-<quant>-2gpu-pw2.json` (229K native) and `strata-<quant>-1m-2gpu.json` (1M tier) for Q2_0, IQ3_S, UD-IQ4_XS, UD-Q4_K_XL, plus `llama-swap.yaml` |

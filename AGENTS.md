@@ -1,5 +1,7 @@
 # AGENTS.md
 
+Speedy: per-GPU-family tuning guides for agents are in [docs/cards/](docs/cards/README.md).
+
 Version 0.2.7, engine 0.1.52. The public model families are DeepSeekV4.1-Flash-1017,
 Qwen3.8-Flash-Next and Qwen3.6-35B-A3B. DeepSeek V4.1-Flash runs in the app and in the Terminal
 (`strata launch --family deepseek41 --model ist-das-2.00bpw`; sets in
