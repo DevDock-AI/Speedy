@@ -11042,7 +11042,7 @@ int main(int argc, char** argv) {
         // `penalty_last_n` tokens that row's pick follows, -1 padded in front.  Allocated once at the cap for
         // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
         // neutral path (no upload, no buffer handed to the sampler).
-        constexpr int kPenaltyWindowCap = 4096;
+        constexpr int kPenaltyWindowCap = strata::kernels::kPenaltyWindowCap;
         constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) strata::kernels::kVerifyMaxT;
         int32_t* d_hist = nullptr;
         std::vector<int32_t> hist_stage(kHistSlots, -1);

@@ -665,7 +665,7 @@ private:
     int32_t last_tokens_[8] = {};
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;
-    int32_t* hist_pin_ = nullptr;   ///< pl_set_history_rows' pinned staging (lazily allocated)
+    int32_t* hist_pin_ = nullptr;   ///< pl_set_history_rows' pinned staging (sized at the cap in capture_all)
     size_t hist_pin_n_ = 0;
     cudaStream_t sh_cs_ = nullptr;
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
