@@ -20,6 +20,10 @@ namespace strata::kernels {
 
 inline constexpr int kVerifyMaxT = 8;
 
+/// The longest penalty history a request may carry (serve caps penalty_last_n at this).  Sizes every history
+/// buffer on both sides of the copy: the verifier's pinned staging and generate.cpp's device d_hist.
+inline constexpr int kPenaltyWindowCap = 4096;
+
 /// For token t of T: conv over [history(3) | qkv_0 .. qkv_t] -> SiLU -> L2 norm of the q/k heads -> h[t].
 /// `history` is NOT written, but with `commit` (one token): it then keeps the token, as gdn_conv_commit.  Bitwise
 /// `fused_gdn_conv_l2` per token.
