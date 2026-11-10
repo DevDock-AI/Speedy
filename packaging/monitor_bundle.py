@@ -38,6 +38,9 @@ SOURCES = (*SOURCES_V5, "strata_cli/consoleinfo.py", "strata_cli/overview.py")
 BOOTSTRAP = b"from strata_cli.monitor_commands import main\nraise SystemExit(main())\n"
 MEMBERS_V1 = ("__main__.py", *SOURCES_V2)
 LICENSE_NOTICE = "LICENSE"
+LICENSE_ID = "Speedy-PNC-1.0"                     # LICENSE: Speedy Personal & Non-Commercial License v1.0
+LICENSE_IDS = (LICENSE_ID, "MIT")                 # bundles built before the license change say MIT
+LICENSE_HEADS = (b"Speedy Personal & Non-Commercial License v1.0\n", b"MIT License\n")
 MEMBERS_V2 = (*MEMBERS_V1, LICENSE_NOTICE)
 MEMBERS_V3 = (*MEMBERS_V2, "strata_cli/dashboard.py")
 MEMBERS_V4 = (*MEMBERS_V3, "strata_cli/detail_dashboard.py")
@@ -81,7 +84,7 @@ def build(bundle: Path) -> dict:
         report = {"schema_version": 6, "kind": "strata-monitor-bundle",
                   "bundle": bundle.name, "sha256": digest(temp_bundle.read_bytes()),
                   "files": files, "interactive_dependency": "textual==8.2.8",
-                  "compatibility": COMPATIBILITY, "license": "MIT", "license_file": LICENSE_NOTICE,
+                  "compatibility": COMPATIBILITY, "license": LICENSE_ID, "license_file": LICENSE_NOTICE,
                   "publisher_signature": None}
         temp_manifest = Path(directory) / manifest_path(bundle).name
         temp_manifest.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
@@ -108,7 +111,7 @@ def verify(bundle: Path) -> dict:
     members = {1: MEMBERS_V1, 2: MEMBERS_V2, 3: MEMBERS_V3, 4: MEMBERS_V4,
                5: MEMBERS_V5, 6: MEMBERS}[report["schema_version"]]
     if report["schema_version"] >= 2:
-        if (report.get("compatibility") != COMPATIBILITY or report.get("license") != "MIT" or
+        if (report.get("compatibility") != COMPATIBILITY or report.get("license") not in LICENSE_IDS or
                 report.get("license_file") != LICENSE_NOTICE):
             raise ValueError("bundle compatibility or license notice mismatch")
     with zipfile.ZipFile(bundle) as archive:
@@ -122,7 +125,7 @@ def verify(bundle: Path) -> dict:
         if archive.testzip() is not None:
             raise ValueError("bundle CRC failure")
         files = {name: digest(archive.read(name)) for name in members}
-        if report["schema_version"] >= 2 and not archive.read(LICENSE_NOTICE).replace(b"\r\n", b"\n").startswith(b"MIT License\n"):
+        if report["schema_version"] >= 2 and not archive.read(LICENSE_NOTICE).replace(b"\r\n", b"\n").startswith(LICENSE_HEADS):
             raise ValueError("bundle license notice is invalid")
     if report.get("files") != files:
         raise ValueError("bundle member checksum mismatch")

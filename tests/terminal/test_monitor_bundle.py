@@ -64,7 +64,7 @@ class MonitorBundleTests(unittest.TestCase):
             with mock.patch.object(BUILDER_MODULE.shutil, "copyfile", crlf_license):
                 build(bundle)
             with zipfile.ZipFile(bundle) as archive:
-                self.assertIn(b"MIT License\r\n", archive.read("LICENSE"))
+                self.assertIn(b"Speedy Personal & Non-Commercial License v1.0\r\n", archive.read("LICENSE"))
             self.assertEqual(verify(bundle)["schema_version"], 6)
 
     def test_update_rollback_and_commit_keep_one_verified_previous_copy(self):
@@ -350,7 +350,7 @@ class MonitorBundleTests(unittest.TestCase):
             self.assertEqual(verify(old_visual)["schema_version"], 3)
             self.assertEqual(verify(modern)["schema_version"], 6)
             with zipfile.ZipFile(modern) as archive:
-                self.assertIn(b"MIT License", archive.read("LICENSE"))
+                self.assertIn(b"Speedy Personal & Non-Commercial License v1.0", archive.read("LICENSE"))
                 self.assertIn(b"render_dashboard", archive.read("strata_cli/dashboard.py"))
                 self.assertIn(b"render_detail_dashboard", archive.read("strata_cli/detail_dashboard.py"))
             target = root / "optional-monitor"
@@ -438,7 +438,7 @@ class MonitorBundleTests(unittest.TestCase):
                                capture_output=True, text=True)
                 self.assertLess(bundle.stat().st_size, 96 * 1024)
                 with zipfile.ZipFile(bundle) as archive:
-                    self.assertIn(b"MIT License", archive.read("LICENSE"))
+                    self.assertIn(b"Speedy Personal & Non-Commercial License v1.0", archive.read("LICENSE"))
                     self.assertIn("strata_cli/dashboard.py", archive.namelist())
                 if importlib.util.find_spec("textual") is not None:
                     import_check = subprocess.run(

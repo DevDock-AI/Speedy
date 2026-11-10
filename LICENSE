@@ -1,22 +1,67 @@
-MIT License
+Speedy Personal & Non-Commercial License v1.0
 
-Copyright (c) 2026 Niko1221 and the Strata contributors
-Copyright (c) 2026 the Speedy contributors (changes in this fork)
+Copyright (c) 2026 DevDock-AI.
+All rights reserved for original Speedy contributions.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This license applies only to original code and other
+copyrightable contributions owned by DevDock-AI.
+Third-party components retain their respective licenses.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+PERMITTED USE
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+You may:
+- Download and run Speedy on your own hardware.
+- Study and learn from the source code.
+- Modify Speedy for personal, non-commercial use.
+- Copy, adapt and integrate original Speedy code into
+  other local, non-commercial projects.
+- Experiment with and benchmark the software.
+
+RESTRICTIONS
+
+Without prior written permission, you may not:
+- Commercialize original Speedy contributions.
+- Incorporate them into commercial products or services.
+- Sell or license copies of those contributions.
+- Publicly redistribute modified versions of those
+  contributions, except as expressly permitted.
+
+AI-ASSISTED DEVELOPMENT AND LOCAL MODIFICATIONS
+
+Users are expressly permitted to use AI coding agents,
+automated development tools, and local or remote AI
+assistants to inspect, analyze, modify, optimize, debug,
+configure, benchmark, and extend the Software.
+
+Such activities are permitted for personal,
+non-commercial purposes, including integration into
+other local, non-commercial projects.
+
+AI-generated modifications and derivative works may
+be retained and used locally for non-commercial purposes.
+
+Use of AI-assisted development tools does not grant
+permission to commercially exploit or publicly
+redistribute the original Speedy contributions.
+
+All third-party licenses remain applicable.
+
+UPSTREAM ATTRIBUTION
+
+Speedy is based on Strata:
+https://github.com/Niko1221/Strata
+
+Strata is licensed under the MIT License.
+Its original copyright notices and license terms
+must be preserved where required. The Strata MIT
+license text is kept in licenses/Strata-MIT.txt;
+other third-party license texts are in licenses/.
+
+This license does not restrict any rights granted
+under the upstream MIT License or other applicable
+third-party licenses.
+
+DISCLAIMER
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY
+OF ANY KIND, TO THE EXTENT PERMITTED BY LAW.
