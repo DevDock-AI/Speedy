@@ -5128,7 +5128,7 @@ class Service:
         A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
         the control tokens the template writes are control tokens.  `store=False` (a token count) reuses the kept
         prompts without adding or replacing one."""
-        if self.canonical_tools:
+        if getattr(self, "canonical_tools", False):
             tools = canonical_tools(tools)
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
@@ -5392,7 +5392,7 @@ class Service:
         def head_ids(msgs):
             """The ids the rendered `msgs` start with (a message's trailing marker cut at PREFIX_END when it is there)."""
             marked, marked_tools, changed = mark_think_literals(
-                msgs, canonical_tools(tools) if self.canonical_tools else tools, self.literals)
+                msgs, canonical_tools(tools) if getattr(self, "canonical_tools", False) else tools, self.literals)
             effort = kwargs.get("reasoning_effort")
             off = kwargs.get("enable_thinking") is False        # render_prompt's rule for #458's effort_end
             kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
