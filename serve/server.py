@@ -3959,6 +3959,14 @@ def vision_env(cfg: dict, env: dict, archs: dict[int, str] | None = None) -> dic
     return env
 
 
+class _Written(str):
+    """Remembered thinking (the text the template renders) with the prompt ids and generated ids of its reply."""
+    def __new__(cls, text, prompt_ids=(), gen_ids=None):
+        self = super().__new__(cls, text)
+        self.prompt_ids, self.gen_ids = list(prompt_ids[-8:]), gen_ids
+        return self
+
+
 class ByteTokenizer:
     """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
     SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
@@ -5127,6 +5135,12 @@ class Service:
         plain = ()
         if changed:
             prompt, plain = unmark_think_literals(prompt, self.literals)
+        spliced = None if plain else self._splice_restored(messages, prompt)
+        if spliced is not None:
+            head, gen, tail = spliced
+            pre = self.prompts.encode(head, (), store) if self.prompts is not None else \
+                self.tok.encode(head, parse_special=True)
+            return pre + gen + self.tok.encode(tail, parse_special=True)
         if self.prompts is not None:            # #567: only what follows the last special shared with a recent prompt
             return self.prompts.encode(prompt, plain, store)
         return self.tok.encode(prompt, parse_special=True, plain=plain) if plain else \
@@ -5488,7 +5502,7 @@ class Service:
             norm.append([name, args])
         return text + ("\n\0" + json.dumps(norm, sort_keys=True, ensure_ascii=False) if norm else "")
 
-    def _remember_reasoning(self, ids, thinking, content, calls, reasoning):
+    def _remember_reasoning(self, ids, thinking, content, calls, reasoning, gen_ids=None):
         """A finished reply's thinking, kept by its answer for _restore_reasoning, with the decoded end of its prompt."""
         key = self._answer_key(content, calls)
         if key and not reasoning and thinking:
@@ -5500,13 +5514,44 @@ class Service:
         end = self.tok.decode(ids[-160:])
         with self.reasoning_mu:
             written = self.recent_reasoning.setdefault(key, [])
-            written.append((end, reasoning))
+            written.append((end, _Written(reasoning, ids, gen_ids)))
             del written[:-32]
             self.recent_reasoning.move_to_end(key)
             # every turn of a long agent thread keeps its thinking: a turn whose thinking was forgotten renders without
             # it, and the prompt leaves the conversation cache at that turn (~2 KB each)
             while len(self.recent_reasoning) > 4096:
                 self.recent_reasoning.popitem(last=False)
+
+    def _splice_restored(self, messages, prompt):
+        """A restored turn's own token ids.  The template renders it as '<think>\\n' + thinking|trim + '\\n</think>\\n\\n'
+        + answer, and that text re-tokenized is not what the model wrote when its thinking began with whitespace (it
+        often writes '\\n' or ' ' first: trimmed away, or merged with the prompt's '\\n' into one '\\n\\n' token), so
+        the prompt left the conversation cache at the end of that turn's prompt and the whole reply was read again.
+        The last restored turn whose generated ids decode to exactly what the template wrote is encoded as those ids:
+        (text before it, its ids, text after it); None keeps the plain encode."""
+        for m in reversed(messages):
+            r = m.get("reasoning_content") if m.get("role") == "assistant" else None
+            if not isinstance(r, _Written) or not r.gen_ids or not isinstance(m.get("content"), str) or m.get("tool_calls"):
+                continue
+            gen = list(r.gen_ids)
+            if gen and gen[-1] in self.stop_ids:
+                gen.pop()                                # the template writes its own <|im_end|> after the answer
+            opener = self.tok.encode("<think>\n", parse_special=True)
+            if list(r.prompt_ids[-len(opener):]) != opener:
+                return None
+            text = self.tok.decode(gen)
+            if text.count("</think>") != 1:
+                return None
+            th, rest = text.split("</think>", 1)
+            body = "<think>\n" + th.strip() + "\n</think>" + rest
+            if th.strip() != r or rest != "\n\n" + m["content"]:
+                return None
+            at = prompt.rfind("<|im_start|>assistant\n" + body)
+            if at < 0:
+                return None
+            at += len("<|im_start|>assistant\n")
+            return prompt[:at], opener + gen, prompt[at + len(body):]
+        return None
 
     def _restore_reasoning(self, messages, log=True):
         """An assistant turn sent back without its thinking (OpenAI chat clients drop reasoning_content) gets the
@@ -5568,7 +5613,8 @@ class Service:
                 elif item[0] == "event" and item[1].kind == "tool_call" and item[1].call is not None:
                     calls.append(item[1].call)
                 elif item[0] == "done":
-                    self._remember_reasoning(ids, thinking, "".join(content), calls, "".join(reasoning).strip())
+                    self._remember_reasoning(ids, thinking, "".join(content), calls, "".join(reasoning).strip(),
+                                             item[1].pop("_gen_ids", None))
                 yield item
         finally:
             if ka is not None:
@@ -6134,6 +6180,7 @@ class Service:
             done["stop_sequence"] = stops.hit
         if rejected:
             done["rejected_tool_calls"] = rejected
+        done["_gen_ids"] = list(raw_ids)               # run() keeps them with the thinking (_Written), then drops the key
         yield "done", done
 
 

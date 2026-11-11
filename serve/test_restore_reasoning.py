@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from serve.frontend import ChatTemplate  # noqa: E402
+from serve.frontend import LITERAL_TAGS, ChatTemplate  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -165,3 +165,56 @@ class RestoreReasoningToolCall(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+PACK_TOK = Path("/srv/models/strata-qwen38/packs/unsloth-ud-iq4_xs/tokenizer")
+
+
+@unittest.skipUnless((PACK_TOK / "vocab.json").exists(), "needs the Qwen3.8 pack tokenizer")
+class RestoredTurnKeepsItsIds(unittest.TestCase):
+    """A reply whose thinking began with whitespace ('\\n', ' ', '\\n\\n'): the template trims it, and '<think>\\n' +
+    '\\nOkay' re-tokenizes as '<think>' '\\n\\n' 'Okay', so the next prompt left the cache at the end of the turn's
+    prompt.  The restored turn is encoded as the ids the engine generated (real tokenizer, no engine)."""
+
+    def setUp(self):
+        import types
+        sys.path.insert(0, str(ROOT / "tools"))
+        import strata_tokenizer as ST
+        from serve.server import Service, _Written
+        vocab = json.loads((PACK_TOK / "vocab.json").read_text(encoding="utf-8"))
+        tokens = [None] * len(vocab)
+        for t, i in vocab.items():
+            tokens[i] = t
+        tcfg = json.loads((PACK_TOK / "tokenizer.json").read_text(encoding="utf-8"))
+        self.tok = ST.Tokenizer(tokens, (PACK_TOK / "merges.txt").read_text(encoding="utf-8").split("\n"),
+                                json.loads((PACK_TOK / "token_type.json").read_text()), tcfg.get("pre") or "qwen35",
+                                tcfg.get("special_ids") or None)
+        self.tpl = ChatTemplate(ROOT / "serve/chat_template.jinja")
+        self.Written = _Written
+        self.svc = types.SimpleNamespace(tok=self.tok, stop_ids=set(self.tok.encode("<|im_end|>", parse_special=True)),
+                                         prompts=None, literals=LITERAL_TAGS)
+        self.svc.render_prompt = lambda m, t, kw: self.tpl.render(m, t, add_generation_prompt=True)
+        self.svc._splice_restored = lambda m, p: Service._splice_restored(self.svc, m, p)
+        self.encode_prompt = lambda m: Service.encode_prompt(self.svc, m, None, {})
+
+    def test_whitespace_started_thinking_stays_in_cache(self):
+        enc = lambda s: self.tok.encode(s, parse_special=True)
+        u1 = {"role": "user", "content": "Explain caching."}
+        prompt_ids = enc(self.tpl.render([u1], add_generation_prompt=True))
+        wrap = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+        for start in ("Okay, so", "\nOkay, so", "\n\nOkay, so", " Okay, so"):
+            for close in ("\n</think>\n\n", wrap):
+                with self.subTest(start=start, close=close[:4]):
+                    gen = enc(start + " caching.") + enc(close) + enc("Caching stores resu")
+                    reasoning = self.tok.decode(gen).split("</think>")[0].strip()
+                    msgs = [u1, {"role": "assistant", "content": "Caching stores resu",
+                                 "reasoning_content": self.Written(reasoning, prompt_ids, gen)},
+                            {"role": "user", "content": "more"}]
+                    ids = self.encode_prompt(msgs)
+                    self.assertEqual(ids[:len(prompt_ids) + len(gen)], prompt_ids + gen)
+                    rendered = self.tpl.render(msgs, add_generation_prompt=True)   # the same turns, the model's whitespace
+                    self.assertEqual(self.tok.decode(ids).partition("Caching stores resu")[2],
+                                     rendered.partition("Caching stores resu")[2])
+                    plain = dict(msgs[1], reasoning_content=str(reasoning))    # not remembered: the plain encode
+                    self.assertEqual(self.encode_prompt([u1, plain, msgs[2]]),
+                                     enc(self.tpl.render([u1, plain, msgs[2]], add_generation_prompt=True)))
