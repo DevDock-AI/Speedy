@@ -1,5 +1,8 @@
 # Changelog
 
+## Speedy 0.4.1 (2026-11-11)
+- UD-Q4_K_XL presets: STRATA_RP_SNAPSHOT=1 - the route prior reads the experts resident at load, so answers no longer depend on expert-swap timing (some UD-Q4_K_XL answers could end early on two windows; greedy test 48/48 x2 with it). Costs ~15-20 % decode on UD-Q4_K_XL; IQ4_XS/IQ3_S/Q2_0 unchanged.
+
 ## Speedy 0.4.0 (2026-11-09), two windows fixed, one 0..1M preset, Strata serve fixes
 Measured on 2x / 1x RTX 3080 10 GB (P620, TR 5975WX, 128 GB DDR4-3200).
 - **Two-window cut-off answers fixed** (`STRATA_PW_RES_PATCH`, default on with `--pipeline-windows 2`): the route
