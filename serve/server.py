@@ -5493,7 +5493,9 @@ class Service:
         key = self._answer_key(content, calls)
         if key and not reasoning and thinking:
             print(f"[strata] reasoning not remembered: the reply ({len(key)} chars) had no thinking", flush=True)
-        if not key or not reasoning:
+        # a reply cut off while thinking (finish "length", no answer yet) has key "": its thinking is kept too, matched by
+        # the message before it (_reasoning_for), else the next turn leaves the conversation cache at that reply
+        if not reasoning:
             return
         end = self.tok.decode(ids[-160:])
         with self.reasoning_mu:
@@ -5525,7 +5527,7 @@ class Service:
             if r:
                 m["reasoning_content"] = r
                 self.recent_reasoning.move_to_end(key)   # a conversation in use keeps its turns' thinking
-            elif log and key and m is messages[-2 if len(messages) > 1 else -1]:
+            elif log and m is messages[-2 if len(messages) > 1 else -1]:
                 # only the turn before the new message is reported; a request with thinking off is quiet (its replies
                 # have no thinking to restore)
                 best = max(self.recent_reasoning, key=lambda k: len(os.path.commonprefix([k, key])))

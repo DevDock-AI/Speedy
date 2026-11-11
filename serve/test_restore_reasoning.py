@@ -55,6 +55,19 @@ class RestoreReasoning(unittest.TestCase):
                                     {"role": "user", "content": "q2"}], stream)
                 self.assertIn("<think>\nmy private plan\n</think>\n\nthe answer", prompt)
 
+    def test_reply_cut_off_while_thinking_keeps_its_thinking(self):
+        # finish "length" inside the thinking: no answer text, the client sends the turn back with content ""
+        ids = self.tok.encode("<|im_start|>user\nwhich one is largest?<|im_end|>\n<|im_start|>assistant\n<think>\n")
+        self.svc._remember_reasoning(ids, "half a plan", "", None, "half a plan")
+        msgs = [{"role": "user", "content": "which one is largest?"}, {"role": "assistant", "content": ""},
+                {"role": "user", "content": "and the smallest?"}]
+        self.svc._restore_reasoning(msgs, log=False)
+        self.assertEqual(msgs[1].get("reasoning_content"), "half a plan")
+        other = [{"role": "user", "content": "a different question"}, {"role": "assistant", "content": ""},
+                 {"role": "user", "content": "next"}]
+        self.svc._restore_reasoning(other, log=False)
+        self.assertNotIn("reasoning_content", other[1])   # another conversation's empty turn gets nothing
+
     def test_client_thinking_and_unknown_answers_stay(self):
         self.chat([{"role": "user", "content": "q1"}])
         prompt = self.chat([{"role": "user", "content": "q1"},
