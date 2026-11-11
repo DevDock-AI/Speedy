@@ -5535,27 +5535,50 @@ class Service:
         parts, at = [], 0
         for m in messages:
             r = m.get("reasoning_content") if m.get("role") == "assistant" else None
-            if not isinstance(r, _Written) or not r.gen_ids or not isinstance(m.get("content"), str) or m.get("tool_calls"):
+            if not isinstance(r, _Written):
                 continue
-            gen = list(r.gen_ids)
-            if gen and gen[-1] in self.stop_ids:
-                gen.pop()                                # the template writes its own <|im_end|> after the answer
-            if list(r.prompt_ids[-len(opener):]) != opener:
-                continue
-            text = self.tok.decode(gen)
-            if text.count("</think>") != 1:
-                continue
-            th, rest = text.split("</think>", 1)
-            if th.strip() != r or rest != "\n\n" + m["content"]:
-                continue
-            body = "<think>\n" + th.strip() + "\n</think>" + rest
-            found = prompt.find(mark + body, at)
-            if found < 0:
-                continue
-            found += len(mark)
-            parts += [prompt[at:found], opener + gen]
-            at = found + len(body)
+            why, gen, body = self._restored_ids(r, m, opener)
+            if why is None:
+                found = prompt.find(mark + body, at)
+                if found >= 0:
+                    found += len(mark)
+                    parts += [prompt[at:found], opener + gen]
+                    at = found + len(body)
+                    continue
+                why = "its text is not in the rendered prompt"
+            print(f"[strata] restored turn not spliced: {why} (thinking {len(r)} chars, answer "
+                  f"{len(m.get('content') or '') if isinstance(m.get('content'), str) else -1} chars, "
+                  f"{len(r.gen_ids or ())} generated ids)", flush=True)
         return parts + [prompt[at:]] if parts else None
+
+    def _restored_ids(self, r, m, opener):
+        """(None, ids, text) for a remembered turn whose generated ids, cut back to what the template renders, decode to
+        exactly that text; else (reason, None, None).  The template trims the answer (content|trim), so a reply cut by
+        max_tokens after a space or newline, or inside a character (a partial UTF-8 byte), has generated ids past the
+        rendered text: the last few are dropped until the rest decodes to it (those few are read again, not the turn)."""
+        if not r.gen_ids:
+            return "no generated ids", None, None
+        if not isinstance(m.get("content"), str) or m.get("tool_calls"):
+            return "answer is not plain text", None, None
+        if list(r.prompt_ids[-len(opener):]) != opener:
+            return "its prompt did not end with the thinking opener", None, None
+        gen = list(r.gen_ids)
+        if gen and gen[-1] in self.stop_ids:
+            gen.pop()                                    # the template writes its own <|im_end|> after the answer
+        text = self.tok.decode(gen)
+        if text.count("</think>") != 1:
+            return f"{text.count('</think>')} thinking closers in the generated text", None, None
+        th = text.split("</think>", 1)[0]
+        if th.strip() != r:
+            return "generated thinking differs from the remembered one", None, None
+        body = "<think>\n" + th.strip() + "\n</think>\n\n" + m["content"].strip()
+        for cut in range(len(gen), max(len(gen) - 16, 0), -1):
+            got = "<think>\n" + th.strip() + "\n</think>" + self.tok.decode(gen[:cut]).split("</think>", 1)[-1]
+            if got == body:
+                return None, gen[:cut], body
+            if len(got) < len(body):
+                break
+        return f"generated answer ({len(text) - len(th) - 8} chars) does not decode to the rendered one", None, None
 
     def _restore_reasoning(self, messages, log=True):
         """An assistant turn sent back without its thinking (OpenAI chat clients drop reasoning_content) gets the

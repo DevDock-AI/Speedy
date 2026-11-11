@@ -195,6 +195,7 @@ class RestoredTurnKeepsItsIds(unittest.TestCase):
                                          prompts=None, literals=LITERAL_TAGS)
         self.svc.render_prompt = lambda m, t, kw: self.tpl.render(m, t, add_generation_prompt=True)
         self.svc._splice_restored = lambda m, p: Service._splice_restored(self.svc, m, p)
+        self.svc._restored_ids = lambda r, m, o: Service._restored_ids(self.svc, r, m, o)
         self.encode_prompt = lambda m: Service.encode_prompt(self.svc, m, None, {})
 
     def test_whitespace_started_thinking_stays_in_cache(self):
@@ -245,3 +246,23 @@ class RestoredTurnKeepsItsIds(unittest.TestCase):
         ids = self.encode_prompt(bad)
         self.assertEqual(self.tok.decode(ids).count("\nFirst, so"), 1)
         self.assertEqual(self.tok.decode(ids).count("\n\nFourth, so"), 1)
+
+    def test_length_cut_answer_is_spliced(self):
+        # finish "length" mid-answer: no stop token, and the cut can fall after a space or newline, which the template
+        # trims (content|trim) while the client sends the streamed text back as it was
+        enc = lambda s: self.tok.encode(s, parse_special=True)
+        u1 = {"role": "user", "content": "Explain caching."}
+        prompt_ids = enc(self.tpl.render([u1], add_generation_prompt=True))
+        for answer in ("Caching stores resu", "Caching stores ", "Caching stores.\n", "Caching stores.\n\n"):
+            with self.subTest(answer=answer):
+                gen = enc("\nOkay, so caching.") + enc("\n</think>\n\n") + enc(answer)
+                reasoning = self.tok.decode(gen).split("</think>")[0].strip()
+                msgs = [u1, {"role": "assistant", "content": answer,
+                             "reasoning_content": self.Written(reasoning, prompt_ids, gen)},
+                        {"role": "user", "content": "more"}]
+                ids = self.encode_prompt(msgs)
+                self.assertEqual(ids[:len(prompt_ids) + 8], prompt_ids + gen[:8])   # past the turn-1 prompt end
+                keep = len(enc(answer.rstrip()))
+                lost = len(prompt_ids) + len(gen) - next(
+                    (i for i, (a, b) in enumerate(zip(ids, prompt_ids + gen)) if a != b), len(prompt_ids) + len(gen))
+                self.assertLessEqual(lost, len(enc(answer)) - keep + 1)
