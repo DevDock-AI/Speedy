@@ -5552,10 +5552,9 @@ class Service:
         return parts + [prompt[at:]] if parts else None
 
     def _restored_ids(self, r, m, opener):
-        """(None, ids, text) for a remembered turn whose generated ids, cut back to what the template renders, decode to
-        exactly that text; else (reason, None, None).  The template trims the answer (content|trim), so a reply cut by
-        max_tokens after a space or newline, or inside a character (a partial UTF-8 byte), has generated ids past the
-        rendered text: the last few are dropped until the rest decodes to it (those few are read again, not the turn)."""
+        """(None, ids, rendered text) for a remembered turn whose generated ids decode to the text the template renders
+        for it, up to the whitespace the template trims (the thinking's, and the answer's: content|trim, so a reply cut
+        by max_tokens after a space or newline ends past the rendered text); else (reason, None, None)."""
         if not r.gen_ids:
             return "no generated ids", None, None
         if not isinstance(m.get("content"), str) or m.get("tool_calls"):
@@ -5571,14 +5570,13 @@ class Service:
         th = text.split("</think>", 1)[0]
         if th.strip() != r:
             return "generated thinking differs from the remembered one", None, None
-        body = "<think>\n" + th.strip() + "\n</think>\n\n" + m["content"].strip()
-        for cut in range(len(gen), max(len(gen) - 16, 0), -1):
-            got = "<think>\n" + th.strip() + "\n</think>" + self.tok.decode(gen[:cut]).split("</think>", 1)[-1]
-            if got == body:
-                return None, gen[:cut], body
-            if len(got) < len(body):
-                break
-        return f"generated answer ({len(text) - len(th) - 8} chars) does not decode to the rendered one", None, None
+        answer = text.split("</think>", 1)[1]
+        if answer.strip().rstrip("\ufffd") != m["content"].strip().rstrip("\ufffd"):   # (a cut inside a character)
+            return f"generated answer ({len(answer)} chars) differs from the sent one", None, None
+        # all of the generated ids, whitespace the template trims included: the engine reuses a session only when ALL
+        # of its held tokens start the new prompt (match_len; the recurrent state cannot step back), so one id less
+        # at the end of the turn sent the prompt back to the session holding the turn's prompt alone
+        return None, gen, "<think>\n" + th.strip() + "\n</think>\n\n" + m["content"].strip()
 
     def _restore_reasoning(self, messages, log=True):
         """An assistant turn sent back without its thinking (OpenAI chat clients drop reasoning_content) gets the

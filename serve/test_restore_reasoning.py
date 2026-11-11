@@ -261,8 +261,25 @@ class RestoredTurnKeepsItsIds(unittest.TestCase):
                              "reasoning_content": self.Written(reasoning, prompt_ids, gen)},
                         {"role": "user", "content": "more"}]
                 ids = self.encode_prompt(msgs)
-                self.assertEqual(ids[:len(prompt_ids) + 8], prompt_ids + gen[:8])   # past the turn-1 prompt end
-                keep = len(enc(answer.rstrip()))
-                lost = len(prompt_ids) + len(gen) - next(
-                    (i for i, (a, b) in enumerate(zip(ids, prompt_ids + gen)) if a != b), len(prompt_ids) + len(gen))
-                self.assertLessEqual(lost, len(enc(answer)) - keep + 1)
+                # the engine reuses a session only when all it holds starts the new prompt: every generated id
+                self.assertEqual(ids[:len(prompt_ids) + len(gen)], prompt_ids + gen)
+
+    def test_two_pass_turn_is_spliced(self):
+        # the thinking budget's wrap-up: pass 1 generates the thinking, the server appends REASONING_WRAP_UP and pass 2
+        # (prompt + pass 1 + wrap-up) answers until max_tokens; the engine then holds prompt + all of raw_ids
+        from serve.server import REASONING_WRAP_UP
+        enc = lambda s: self.tok.encode(s, parse_special=True)
+        u1 = {"role": "user", "content": "Explain caching."}
+        prompt_ids = enc(self.tpl.render([u1], add_generation_prompt=True))
+        for first in ("\nOkay, so caching", "Okay, so caching\n"):
+            for answer in ("Caching stores resu", "Caching stores "):
+                with self.subTest(first=first, answer=answer):
+                    pass1 = enc(first)
+                    pass2_prompt = prompt_ids + pass1 + enc(REASONING_WRAP_UP)
+                    raw = pass2_prompt[len(prompt_ids):] + enc(answer)
+                    reasoning = self.tok.decode(raw).split("</think>")[0].strip()
+                    msgs = [u1, {"role": "assistant", "content": answer,
+                                 "reasoning_content": self.Written(reasoning, prompt_ids, raw)},
+                            {"role": "user", "content": "more"}]
+                    ids = self.encode_prompt(msgs)
+                    self.assertEqual(ids[:len(prompt_ids) + len(raw)], prompt_ids + raw)
