@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from serve.frontend import ChatTemplate  # noqa: E402
+from serve.frontend import LITERAL_TAGS, ChatTemplate  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +54,19 @@ class RestoreReasoning(unittest.TestCase):
                 prompt = self.chat([{"role": "user", "content": "q1"}, {"role": "assistant", "content": "the answer"},
                                     {"role": "user", "content": "q2"}], stream)
                 self.assertIn("<think>\nmy private plan\n</think>\n\nthe answer", prompt)
+
+    def test_reply_cut_off_while_thinking_keeps_its_thinking(self):
+        # finish "length" inside the thinking: no answer text, the client sends the turn back with content ""
+        ids = self.tok.encode("<|im_start|>user\nwhich one is largest?<|im_end|>\n<|im_start|>assistant\n<think>\n")
+        self.svc._remember_reasoning(ids, "half a plan", "", None, "half a plan")
+        msgs = [{"role": "user", "content": "which one is largest?"}, {"role": "assistant", "content": ""},
+                {"role": "user", "content": "and the smallest?"}]
+        self.svc._restore_reasoning(msgs, log=False)
+        self.assertEqual(msgs[1].get("reasoning_content"), "half a plan")
+        other = [{"role": "user", "content": "a different question"}, {"role": "assistant", "content": ""},
+                 {"role": "user", "content": "next"}]
+        self.svc._restore_reasoning(other, log=False)
+        self.assertNotIn("reasoning_content", other[1])   # another conversation's empty turn gets nothing
 
     def test_client_thinking_and_unknown_answers_stay(self):
         self.chat([{"role": "user", "content": "q1"}])
@@ -152,3 +165,121 @@ class RestoreReasoningToolCall(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+PACK_TOK = Path("/srv/models/strata-qwen38/packs/unsloth-ud-iq4_xs/tokenizer")
+
+
+@unittest.skipUnless((PACK_TOK / "vocab.json").exists(), "needs the Qwen3.8 pack tokenizer")
+class RestoredTurnKeepsItsIds(unittest.TestCase):
+    """A reply whose thinking began with whitespace ('\\n', ' ', '\\n\\n'): the template trims it, and '<think>\\n' +
+    '\\nOkay' re-tokenizes as '<think>' '\\n\\n' 'Okay', so the next prompt left the cache at the end of the turn's
+    prompt.  The restored turn is encoded as the ids the engine generated (real tokenizer, no engine)."""
+
+    def setUp(self):
+        import types
+        sys.path.insert(0, str(ROOT / "tools"))
+        import strata_tokenizer as ST
+        from serve.server import Service, _Written
+        vocab = json.loads((PACK_TOK / "vocab.json").read_text(encoding="utf-8"))
+        tokens = [None] * len(vocab)
+        for t, i in vocab.items():
+            tokens[i] = t
+        tcfg = json.loads((PACK_TOK / "tokenizer.json").read_text(encoding="utf-8"))
+        self.tok = ST.Tokenizer(tokens, (PACK_TOK / "merges.txt").read_text(encoding="utf-8").split("\n"),
+                                json.loads((PACK_TOK / "token_type.json").read_text()), tcfg.get("pre") or "qwen35",
+                                tcfg.get("special_ids") or None)
+        self.tpl = ChatTemplate(ROOT / "serve/chat_template.jinja")
+        self.Written = _Written
+        self.svc = types.SimpleNamespace(tok=self.tok, stop_ids=set(self.tok.encode("<|im_end|>", parse_special=True)),
+                                         prompts=None, literals=LITERAL_TAGS)
+        self.svc.render_prompt = lambda m, t, kw: self.tpl.render(m, t, add_generation_prompt=True)
+        self.svc._splice_restored = lambda m, p: Service._splice_restored(self.svc, m, p)
+        self.svc._restored_ids = lambda r, m, o: Service._restored_ids(self.svc, r, m, o)
+        self.encode_prompt = lambda m: Service.encode_prompt(self.svc, m, None, {})
+
+    def test_whitespace_started_thinking_stays_in_cache(self):
+        enc = lambda s: self.tok.encode(s, parse_special=True)
+        u1 = {"role": "user", "content": "Explain caching."}
+        prompt_ids = enc(self.tpl.render([u1], add_generation_prompt=True))
+        wrap = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+        for start in ("Okay, so", "\nOkay, so", "\n\nOkay, so", " Okay, so"):
+            for close in ("\n</think>\n\n", wrap):
+                with self.subTest(start=start, close=close[:4]):
+                    gen = enc(start + " caching.") + enc(close) + enc("Caching stores resu")
+                    reasoning = self.tok.decode(gen).split("</think>")[0].strip()
+                    msgs = [u1, {"role": "assistant", "content": "Caching stores resu",
+                                 "reasoning_content": self.Written(reasoning, prompt_ids, gen)},
+                            {"role": "user", "content": "more"}]
+                    ids = self.encode_prompt(msgs)
+                    self.assertEqual(ids[:len(prompt_ids) + len(gen)], prompt_ids + gen)
+                    rendered = self.tpl.render(msgs, add_generation_prompt=True)   # the same turns, the model's whitespace
+                    self.assertEqual(self.tok.decode(ids).partition("Caching stores resu")[2],
+                                     rendered.partition("Caching stores resu")[2])
+                    plain = dict(msgs[1], reasoning_content=str(reasoning))    # not remembered: the plain encode
+                    self.assertEqual(self.encode_prompt([u1, plain, msgs[2]]),
+                                     enc(self.tpl.render([u1, plain, msgs[2]], add_generation_prompt=True)))
+
+    def test_every_restored_turn_keeps_its_ids(self):
+        # an agent thread: each request's prompt is what the engine cached so far, then the reply it generated
+        enc = lambda s: self.tok.encode(s, parse_special=True)
+        starts = ["\nFirst, so", " Second, so", "Third, so", "\n\nFourth, so"]
+        msgs, cached = [], None
+        for k, start in enumerate(starts):
+            msgs.append({"role": "user", "content": f"question {k}"})
+            prompt_ids = self.encode_prompt(msgs)
+            if cached is not None:
+                self.assertEqual(prompt_ids[:len(cached)], cached, f"turn {k} left the cache")
+            answer = f"Answer {k} is cut of"
+            gen = enc(start + f" thinking {k}.") + enc("\n</think>\n\n") + enc(answer)
+            reasoning = self.tok.decode(gen).split("</think>")[0].strip()
+            msgs.append({"role": "assistant", "content": answer,
+                         "reasoning_content": self.Written(reasoning, prompt_ids, gen)})
+            cached = prompt_ids + gen
+        msgs.append({"role": "user", "content": "last"})
+        ids = self.encode_prompt(msgs)
+        self.assertEqual(ids[:len(cached)], cached)
+        # a turn that cannot be checked (ids that do not decode to its text) falls back alone; the others still splice
+        bad = [dict(m) for m in msgs]
+        bad[3]["reasoning_content"] = self.Written(str(bad[3]["reasoning_content"]), bad[3]["reasoning_content"].prompt_ids,
+                                                   enc("something else\n</think>\n\nnope"))
+        ids = self.encode_prompt(bad)
+        self.assertEqual(self.tok.decode(ids).count("\nFirst, so"), 1)
+        self.assertEqual(self.tok.decode(ids).count("\n\nFourth, so"), 1)
+
+    def test_length_cut_answer_is_spliced(self):
+        # finish "length" mid-answer: no stop token, and the cut can fall after a space or newline, which the template
+        # trims (content|trim) while the client sends the streamed text back as it was
+        enc = lambda s: self.tok.encode(s, parse_special=True)
+        u1 = {"role": "user", "content": "Explain caching."}
+        prompt_ids = enc(self.tpl.render([u1], add_generation_prompt=True))
+        for answer in ("Caching stores resu", "Caching stores ", "Caching stores.\n", "Caching stores.\n\n"):
+            with self.subTest(answer=answer):
+                gen = enc("\nOkay, so caching.") + enc("\n</think>\n\n") + enc(answer)
+                reasoning = self.tok.decode(gen).split("</think>")[0].strip()
+                msgs = [u1, {"role": "assistant", "content": answer,
+                             "reasoning_content": self.Written(reasoning, prompt_ids, gen)},
+                        {"role": "user", "content": "more"}]
+                ids = self.encode_prompt(msgs)
+                # the engine reuses a session only when all it holds starts the new prompt: every generated id
+                self.assertEqual(ids[:len(prompt_ids) + len(gen)], prompt_ids + gen)
+
+    def test_two_pass_turn_is_spliced(self):
+        # the thinking budget's wrap-up: pass 1 generates the thinking, the server appends REASONING_WRAP_UP and pass 2
+        # (prompt + pass 1 + wrap-up) answers until max_tokens; the engine then holds prompt + all of raw_ids
+        from serve.server import REASONING_WRAP_UP
+        enc = lambda s: self.tok.encode(s, parse_special=True)
+        u1 = {"role": "user", "content": "Explain caching."}
+        prompt_ids = enc(self.tpl.render([u1], add_generation_prompt=True))
+        for first in ("\nOkay, so caching", "Okay, so caching\n"):
+            for answer in ("Caching stores resu", "Caching stores "):
+                with self.subTest(first=first, answer=answer):
+                    pass1 = enc(first)
+                    pass2_prompt = prompt_ids + pass1 + enc(REASONING_WRAP_UP)
+                    raw = pass2_prompt[len(prompt_ids):] + enc(answer)
+                    reasoning = self.tok.decode(raw).split("</think>")[0].strip()
+                    msgs = [u1, {"role": "assistant", "content": answer,
+                                 "reasoning_content": self.Written(reasoning, prompt_ids, raw)},
+                            {"role": "user", "content": "more"}]
+                    ids = self.encode_prompt(msgs)
+                    self.assertEqual(ids[:len(prompt_ids) + len(raw)], prompt_ids + raw)

@@ -829,7 +829,7 @@ Verifier::~Verifier() {
     if (p2p_rows_) { strata::core::unregister_p2p_rows(h_ymiss_); cudaFree(p2p_rows_); }
 #endif
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_, h_pflag_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_, h_pflag_, hist_pin_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -2458,8 +2458,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // on an RTX PRO 5000 72 GB -1.9% / -0.5%, on 2x RTX A4000 -4.2% / +11.0%, hence not a default on bigger cards).
         const float route_prior = g_route_prior();
         const int32_t* route_res = hits_.d_route_res != nullptr ? hits_.d_route_res : hits_.d_res;   // R17 P1: the union, not the slots
+        // STRATA_RP_SNAPSHOT: the bias reads a residency snapshot taken at a fixed point (hits_.d_rp), not the live table
+        // the tier's swaps land in at timing-dependent moments; the plan below still reads the live table (d_res)
         if (route_prior > 0.0f && NE == 512 && K == 10 && route_res != nullptr)
-            route_prior_top10(logits_ + tb * NE, route_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
+            route_prior_top10(logits_ + tb * NE, (hits_.d_rp != nullptr ? hits_.d_rp : route_res) + l * g.n_expert,
+                              route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
         if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && route_res != nullptr) {
             // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
             try {
@@ -5861,6 +5864,17 @@ bool Verifier::capture_all(std::string& err) {
         prof_pin_ = nullptr;   // the pipelined windows go unprofiled
         cudaGetLastError();
     }
+    // The penalty-history staging (head stage only) is sized at the widest window once here, while nothing is
+    // in flight: growing it inside pl_set_history_rows would cudaFreeHost/cudaHostAlloc pinned memory under the
+    // other parity's in-flight window and deadlock the pipeline.  Same cap as generate.cpp's device d_hist.
+    if (le_ == g_->n_layers && hist_pin_ == nullptr) {
+        const size_t cap = (size_t) strata::kernels::kVerifyMaxT * (size_t) strata::kernels::kPenaltyWindowCap;
+        if (cudaHostAlloc((void**) &hist_pin_, cap * sizeof(int32_t), cudaHostAllocDefault) != cudaSuccess) {
+            cudaGetLastError(); hist_pin_ = nullptr;
+            err = "verify: history staging allocation failed"; return false;
+        }
+        hist_pin_n_ = cap;
+    }
     pl_ple_rows_.assign((size_t) strata::kernels::kVerifyMaxT * strata::kernels::PLE_N_HEADS, 0u);
     return true;
 }
@@ -6143,12 +6157,13 @@ bool Verifier::pl_set_history_rows(const int32_t* rows, int T, std::string& err)
     if (fl_active_) { err = "pipelined penalties: a window is in flight on this verifier"; return false; }
     const size_t n = (size_t) T * (size_t) hist_len_;
     if (hist_pin_n_ < n) {
-        if (hist_pin_) cudaFreeHost(hist_pin_);
-        hist_pin_ = nullptr; hist_pin_n_ = 0;
-        if (cudaHostAlloc((void**) &hist_pin_, n * sizeof(int32_t), cudaHostAllocDefault) != cudaSuccess) {
-            cudaGetLastError(); hist_pin_ = nullptr; err = "pipelined penalties: no pinned staging"; return false;
-        }
-        hist_pin_n_ = n;
+        // The staging was pre-sized at the cap in capture_all (T <= kVerifyMaxT, hist_len_ <=
+        // kPenaltyWindowCap).  Growing it here would cudaFreeHost/cudaHostAlloc pinned memory under the
+        // pipeline's other in-flight windows - the deadlock this path exists to avoid.  A request over
+        // the cap fails loudly instead.
+        err = "pipelined penalties: history rows over the staging cap (" + std::to_string(n) + " > " +
+              std::to_string(hist_pin_n_) + ")";
+        return false;
     }
     // the previous window on this stream has been synced in pl_finish (its sampler read hist_d_ and the staging is free)
     std::memcpy(hist_pin_, rows, n * sizeof(int32_t));

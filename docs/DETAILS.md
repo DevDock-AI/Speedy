@@ -890,6 +890,7 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 | `lazy_load` | off | Start without loading the model. |
 | `slot_save_path` | none | Enables session files. |
 | `host`, `api_key`, `cors_origins`, `trusted_origins`, `allowed_hosts` | local only | See [Network access](#network-access). |
+| `canonical_tools` | off | `true` renders the request's tools sorted by function name (stable) with every key sorted, so the same set of tools gives a byte-identical prompt start whatever order or key order the client sends, and the cached prompt is reused instead of read again. Only the rendered order changes; tool-call parsing uses the tools as sent. The environment variable `STRATA_CANONICAL_TOOLS=1` sets the same; the config wins. |
 | `codex_thread_titles`, `codex_compaction_cache` | off | See [Codex CLI](#the-responses-api-and-codex-cli). |
 | `mcp_servers`, `mcp` | none | See [Tools from MCP servers](#tools-from-mcp-servers). |
 
@@ -1457,6 +1458,7 @@ them on your own card.
 | `STRATA_HOST_CORE=last\|sibling` (or `--host-core`) | Windows | `last` puts the host thread on the last physical core, away from the core that gets the GPU's interrupts. `sibling` keeps it on the first core's other hardware thread, so the workers keep every core. The default `first` leaves a hybrid CPU as it is. | One layer-split box went from a ±6% swing to steady and 8% faster. |
 | `--pool-affinity measure` | Hybrid CPUs, native packs | Times the `all` and `p-cores` layouts at start (about a second) and takes the faster. The measurement is taken once; where the E-cores' speed changes while the engine runs, `--pool-affinity p-cores` is the steady choice. | |
 | `STRATA_KEEP_EMPTY_TURNS=1`, `STRATA_TOPK_STREAM=0` | | See [TROUBLESHOOTING.md](TROUBLESHOOTING.md). | |
+| `STRATA_TOOL_STEP_SPLIT=0` | `/v1/chat/completions` | Turns off tool-step un-merging, which is on by default. Tool call ids name the response that issued them (`call_<16 hex>_<n>`); when a client sends the calls of several responses in one assistant message followed by all their results, the server puts back one assistant message per response, each followed by its own results (matched by id), so the prompt matches what the model wrote and the cached prefix is reused instead of the turn being read again. Ids of another form, a response's calls not adjacent, repeated ids or a result for an unknown call leave the messages as sent. | A diagnostic. |
 | HIP `STRATA_DENSE_MMQ=1`, `STRATA_HIP_ADAPT_KERNEL_COPY=1` | HIP | See [AMD_HIP.md](AMD_HIP.md#model-and-serving-configuration). | |
 
 ### CUDA opt-in kernels (sm_80 and newer)

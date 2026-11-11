@@ -56,6 +56,7 @@
   },
   "reasoning_effort": "medium",
   "env": {
+    "STRATA_RP_SNAPSHOT": "1",
     "STRATA_ROUTE_TAIL_SKIP": "0",
     "STRATA_PREFILL_CPU_SHARE": "0",
     "STRATA_PIN_BY_NEED": "1",

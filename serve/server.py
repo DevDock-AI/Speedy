@@ -3959,6 +3959,14 @@ def vision_env(cfg: dict, env: dict, archs: dict[int, str] | None = None) -> dic
     return env
 
 
+class _Written(str):
+    """Remembered thinking (the text the template renders) with the prompt ids and generated ids of its reply."""
+    def __new__(cls, text, prompt_ids=(), gen_ids=None):
+        self = super().__new__(cls, text)
+        self.prompt_ids, self.gen_ids = list(prompt_ids[-8:]), gen_ids
+        return self
+
+
 class ByteTokenizer:
     """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
     SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
@@ -4267,6 +4275,7 @@ class Service:
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+        self.canonical_tools = False                      # config "canonical_tools": true: tools sorted by name, keys sorted, for rendering only
         self.undeclared_tool_calls = "text"               # #4622: config "undeclared_tool_calls": "call" hands a call of an undeclared name to the client
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
@@ -5119,11 +5128,20 @@ class Service:
         A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
         the control tokens the template writes are control tokens.  `store=False` (a token count) reuses the kept
         prompts without adding or replacing one."""
+        if getattr(self, "canonical_tools", False):
+            tools = canonical_tools(tools)
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         plain = ()
         if changed:
             prompt, plain = unmark_think_literals(prompt, self.literals)
+        spliced = None if plain else self._splice_restored(messages, prompt)
+        if spliced is not None:                  # text, ids, text, ...: the first text through the kept prompts (#567)
+            out = self.prompts.encode(spliced[0], (), store) if self.prompts is not None else \
+                self.tok.encode(spliced[0], parse_special=True)
+            for i in range(1, len(spliced), 2):
+                out = out + spliced[i] + self.tok.encode(spliced[i + 1], parse_special=True)
+            return out
         if self.prompts is not None:            # #567: only what follows the last special shared with a recent prompt
             return self.prompts.encode(prompt, plain, store)
         return self.tok.encode(prompt, parse_special=True, plain=plain) if plain else \
@@ -5373,7 +5391,8 @@ class Service:
 
         def head_ids(msgs):
             """The ids the rendered `msgs` start with (a message's trailing marker cut at PREFIX_END when it is there)."""
-            marked, marked_tools, changed = mark_think_literals(msgs, tools, self.literals)
+            marked, marked_tools, changed = mark_think_literals(
+                msgs, canonical_tools(tools) if getattr(self, "canonical_tools", False) else tools, self.literals)
             effort = kwargs.get("reasoning_effort")
             off = kwargs.get("enable_thinking") is False        # render_prompt's rule for #458's effort_end
             kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
@@ -5484,23 +5503,80 @@ class Service:
             norm.append([name, args])
         return text + ("\n\0" + json.dumps(norm, sort_keys=True, ensure_ascii=False) if norm else "")
 
-    def _remember_reasoning(self, ids, thinking, content, calls, reasoning):
+    def _remember_reasoning(self, ids, thinking, content, calls, reasoning, gen_ids=None):
         """A finished reply's thinking, kept by its answer for _restore_reasoning, with the decoded end of its prompt."""
         key = self._answer_key(content, calls)
         if key and not reasoning and thinking:
             print(f"[strata] reasoning not remembered: the reply ({len(key)} chars) had no thinking", flush=True)
-        if not key or not reasoning:
+        # a reply cut off while thinking (finish "length", no answer yet) has key "": its thinking is kept too, matched by
+        # the message before it (_reasoning_for), else the next turn leaves the conversation cache at that reply
+        if not reasoning:
             return
         end = self.tok.decode(ids[-160:])
         with self.reasoning_mu:
             written = self.recent_reasoning.setdefault(key, [])
-            written.append((end, reasoning))
+            written.append((end, _Written(reasoning, ids, gen_ids)))
             del written[:-32]
             self.recent_reasoning.move_to_end(key)
             # every turn of a long agent thread keeps its thinking: a turn whose thinking was forgotten renders without
             # it, and the prompt leaves the conversation cache at that turn (~2 KB each)
             while len(self.recent_reasoning) > 4096:
                 self.recent_reasoning.popitem(last=False)
+
+    def _splice_restored(self, messages, prompt):
+        """Restored turns' own token ids.  The template renders a turn as '<think>\\n' + thinking|trim + '\\n</think>\\n\\n'
+        + answer, and that text re-tokenized is not what the model wrote when its thinking began with whitespace (it
+        often writes '\\n' or ' ' first: trimmed away, or merged with the prompt's '\\n' into one '\\n\\n' token), so
+        the prompt left the conversation cache at that turn and everything after it was read again.  Every restored
+        turn whose generated ids decode to exactly what the template wrote is encoded as those ids; a turn that cannot
+        be checked keeps the plain encode.  Returns [text, ids, text, ids, ..., text], or None when no turn is spliced."""
+        opener = self.tok.encode("<think>\n", parse_special=True)
+        mark = "<|im_start|>assistant\n"
+        parts, at = [], 0
+        for m in messages:
+            r = m.get("reasoning_content") if m.get("role") == "assistant" else None
+            if not isinstance(r, _Written):
+                continue
+            why, gen, body = self._restored_ids(r, m, opener)
+            if why is None:
+                found = prompt.find(mark + body, at)
+                if found >= 0:
+                    found += len(mark)
+                    parts += [prompt[at:found], opener + gen]
+                    at = found + len(body)
+                    continue
+                why = "its text is not in the rendered prompt"
+            print(f"[strata] restored turn not spliced: {why} (thinking {len(r)} chars, answer "
+                  f"{len(m.get('content') or '') if isinstance(m.get('content'), str) else -1} chars, "
+                  f"{len(r.gen_ids or ())} generated ids)", flush=True)
+        return parts + [prompt[at:]] if parts else None
+
+    def _restored_ids(self, r, m, opener):
+        """(None, ids, rendered text) for a remembered turn whose generated ids decode to the text the template renders
+        for it, up to the whitespace the template trims (the thinking's, and the answer's: content|trim, so a reply cut
+        by max_tokens after a space or newline ends past the rendered text); else (reason, None, None)."""
+        if not r.gen_ids:
+            return "no generated ids", None, None
+        if not isinstance(m.get("content"), str) or m.get("tool_calls"):
+            return "answer is not plain text", None, None
+        if list(r.prompt_ids[-len(opener):]) != opener:
+            return "its prompt did not end with the thinking opener", None, None
+        gen = list(r.gen_ids)
+        if gen and gen[-1] in self.stop_ids:
+            gen.pop()                                    # the template writes its own <|im_end|> after the answer
+        text = self.tok.decode(gen)
+        if text.count("</think>") != 1:
+            return f"{text.count('</think>')} thinking closers in the generated text", None, None
+        th = text.split("</think>", 1)[0]
+        if th.strip() != r:
+            return "generated thinking differs from the remembered one", None, None
+        answer = text.split("</think>", 1)[1]
+        if answer.strip().rstrip("\ufffd") != m["content"].strip().rstrip("\ufffd"):   # (a cut inside a character)
+            return f"generated answer ({len(answer)} chars) differs from the sent one", None, None
+        # all of the generated ids, whitespace the template trims included: the engine reuses a session only when ALL
+        # of its held tokens start the new prompt (match_len; the recurrent state cannot step back), so one id less
+        # at the end of the turn sent the prompt back to the session holding the turn's prompt alone
+        return None, gen, "<think>\n" + th.strip() + "\n</think>\n\n" + m["content"].strip()
 
     def _restore_reasoning(self, messages, log=True):
         """An assistant turn sent back without its thinking (OpenAI chat clients drop reasoning_content) gets the
@@ -5521,7 +5597,7 @@ class Service:
             if r:
                 m["reasoning_content"] = r
                 self.recent_reasoning.move_to_end(key)   # a conversation in use keeps its turns' thinking
-            elif log and key and m is messages[-2 if len(messages) > 1 else -1]:
+            elif log and m is messages[-2 if len(messages) > 1 else -1]:
                 # only the turn before the new message is reported; a request with thinking off is quiet (its replies
                 # have no thinking to restore)
                 best = max(self.recent_reasoning, key=lambda k: len(os.path.commonprefix([k, key])))
@@ -5562,7 +5638,8 @@ class Service:
                 elif item[0] == "event" and item[1].kind == "tool_call" and item[1].call is not None:
                     calls.append(item[1].call)
                 elif item[0] == "done":
-                    self._remember_reasoning(ids, thinking, "".join(content), calls, "".join(reasoning).strip())
+                    self._remember_reasoning(ids, thinking, "".join(content), calls, "".join(reasoning).strip(),
+                                             item[1].pop("_gen_ids", None))
                 yield item
         finally:
             if ka is not None:
@@ -6128,6 +6205,7 @@ class Service:
             done["stop_sequence"] = stops.hit
         if rejected:
             done["rejected_tool_calls"] = rejected
+        done["_gen_ids"] = list(raw_ids)               # run() keeps them with the thinking (_Written), then drops the key
         yield "done", done
 
 
@@ -9037,6 +9115,36 @@ def _component_exe(reference: str, cfg: dict) -> str:
         raise SystemExit(e.exit_code) from None
 
 
+def _sorted_keys(x):
+    """`x` with every dict's keys in sorted order, recursively (lists keep their order)."""
+    if isinstance(x, dict):
+        return {k: _sorted_keys(x[k]) for k in sorted(x, key=str)}
+    if isinstance(x, list):
+        return [_sorted_keys(v) for v in x]
+    return x
+
+
+def canonical_tools(tools):
+    """Config "canonical_tools": the tools as the template renders them: sorted by function name (stable) and each
+    tool's keys sorted recursively, so the same set of tools renders byte-identically whatever order or key order a
+    client sends; the prompt then keeps its cached start.  Only order changes; the parser keeps the request's tools."""
+    if not tools:
+        return tools
+
+    def name(t):
+        f = t.get("function") if isinstance(t, dict) and isinstance(t.get("function"), dict) else t
+        n = f.get("name") if isinstance(f, dict) else None
+        return n if isinstance(n, str) else ""
+    return [_sorted_keys(t) for t in sorted(tools, key=name)]
+
+
+def canonical_tools_setting(cfg: dict) -> bool:
+    """The config's "canonical_tools" (true/false); without it, the environment's STRATA_CANONICAL_TOOLS=1."""
+    if "canonical_tools" in cfg:
+        return cfg.get("canonical_tools") is True
+    return os.environ.get("STRATA_CANONICAL_TOOLS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def undeclared_tool_calls_setting(cfg: dict) -> str:
     """#4622: the config's "undeclared_tool_calls": "text" (the default, when the config does not name it) keeps a well-formed call of a tool the request
     did not declare as the text the model wrote, with strata_rejected_tool_calls beside it; "call" returns it as a tool call, for a client that has
@@ -9461,6 +9569,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                   "Chat settings shared with other apps, can set its own)", flush=True)
     svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default
     svc.codex_compaction_cache = cfg.get("codex_compaction_cache") is True   # #924: opt-in, off by default
+    svc.canonical_tools = canonical_tools_setting(cfg)  # opt-in: tools rendered in a canonical order
     try:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
     except ValueError as e:

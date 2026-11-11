@@ -56,3 +56,6 @@
   at 700 a single 10 GB card lost ~110 expert slots and the automatic prompt chunk dropped (UD-IQ4_XS 5632 -> 4608,
   UD-Q4_K_XL 3840 -> 3072): prefill -10 % / -17 %. 444 + 256 = the old 700: UD-IQ4_XS 1805-1810 t/s, UD-Q4_K_XL 1136
   at 57K, the same as Speedy 1GPU 0.2.0 (ABBA, same presets).
+- UD-Q4_K_XL presets (1x and 2x), `STRATA_RP_SNAPSHOT=1` (2026-11-11): the route prior reads the expert residency taken
+  at load, not the live table, so expert selection is independent of expert-swap timing. Decode ~15-20 % slower on
+  UD-Q4_K_XL; the other quants do not set it.
