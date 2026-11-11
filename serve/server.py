@@ -5136,11 +5136,12 @@ class Service:
         if changed:
             prompt, plain = unmark_think_literals(prompt, self.literals)
         spliced = None if plain else self._splice_restored(messages, prompt)
-        if spliced is not None:
-            head, gen, tail = spliced
-            pre = self.prompts.encode(head, (), store) if self.prompts is not None else \
-                self.tok.encode(head, parse_special=True)
-            return pre + gen + self.tok.encode(tail, parse_special=True)
+        if spliced is not None:                  # text, ids, text, ...: the first text through the kept prompts (#567)
+            out = self.prompts.encode(spliced[0], (), store) if self.prompts is not None else \
+                self.tok.encode(spliced[0], parse_special=True)
+            for i in range(1, len(spliced), 2):
+                out = out + spliced[i] + self.tok.encode(spliced[i + 1], parse_special=True)
+            return out
         if self.prompts is not None:            # #567: only what follows the last special shared with a recent prompt
             return self.prompts.encode(prompt, plain, store)
         return self.tok.encode(prompt, parse_special=True, plain=plain) if plain else \
@@ -5523,35 +5524,38 @@ class Service:
                 self.recent_reasoning.popitem(last=False)
 
     def _splice_restored(self, messages, prompt):
-        """A restored turn's own token ids.  The template renders it as '<think>\\n' + thinking|trim + '\\n</think>\\n\\n'
+        """Restored turns' own token ids.  The template renders a turn as '<think>\\n' + thinking|trim + '\\n</think>\\n\\n'
         + answer, and that text re-tokenized is not what the model wrote when its thinking began with whitespace (it
         often writes '\\n' or ' ' first: trimmed away, or merged with the prompt's '\\n' into one '\\n\\n' token), so
-        the prompt left the conversation cache at the end of that turn's prompt and the whole reply was read again.
-        The last restored turn whose generated ids decode to exactly what the template wrote is encoded as those ids:
-        (text before it, its ids, text after it); None keeps the plain encode."""
-        for m in reversed(messages):
+        the prompt left the conversation cache at that turn and everything after it was read again.  Every restored
+        turn whose generated ids decode to exactly what the template wrote is encoded as those ids; a turn that cannot
+        be checked keeps the plain encode.  Returns [text, ids, text, ids, ..., text], or None when no turn is spliced."""
+        opener = self.tok.encode("<think>\n", parse_special=True)
+        mark = "<|im_start|>assistant\n"
+        parts, at = [], 0
+        for m in messages:
             r = m.get("reasoning_content") if m.get("role") == "assistant" else None
             if not isinstance(r, _Written) or not r.gen_ids or not isinstance(m.get("content"), str) or m.get("tool_calls"):
                 continue
             gen = list(r.gen_ids)
             if gen and gen[-1] in self.stop_ids:
                 gen.pop()                                # the template writes its own <|im_end|> after the answer
-            opener = self.tok.encode("<think>\n", parse_special=True)
             if list(r.prompt_ids[-len(opener):]) != opener:
-                return None
+                continue
             text = self.tok.decode(gen)
             if text.count("</think>") != 1:
-                return None
+                continue
             th, rest = text.split("</think>", 1)
-            body = "<think>\n" + th.strip() + "\n</think>" + rest
             if th.strip() != r or rest != "\n\n" + m["content"]:
-                return None
-            at = prompt.rfind("<|im_start|>assistant\n" + body)
-            if at < 0:
-                return None
-            at += len("<|im_start|>assistant\n")
-            return prompt[:at], opener + gen, prompt[at + len(body):]
-        return None
+                continue
+            body = "<think>\n" + th.strip() + "\n</think>" + rest
+            found = prompt.find(mark + body, at)
+            if found < 0:
+                continue
+            found += len(mark)
+            parts += [prompt[at:found], opener + gen]
+            at = found + len(body)
+        return parts + [prompt[at:]] if parts else None
 
     def _restore_reasoning(self, messages, log=True):
         """An assistant turn sent back without its thinking (OpenAI chat clients drop reasoning_content) gets the

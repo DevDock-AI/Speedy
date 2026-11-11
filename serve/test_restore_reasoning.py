@@ -218,3 +218,30 @@ class RestoredTurnKeepsItsIds(unittest.TestCase):
                     plain = dict(msgs[1], reasoning_content=str(reasoning))    # not remembered: the plain encode
                     self.assertEqual(self.encode_prompt([u1, plain, msgs[2]]),
                                      enc(self.tpl.render([u1, plain, msgs[2]], add_generation_prompt=True)))
+
+    def test_every_restored_turn_keeps_its_ids(self):
+        # an agent thread: each request's prompt is what the engine cached so far, then the reply it generated
+        enc = lambda s: self.tok.encode(s, parse_special=True)
+        starts = ["\nFirst, so", " Second, so", "Third, so", "\n\nFourth, so"]
+        msgs, cached = [], None
+        for k, start in enumerate(starts):
+            msgs.append({"role": "user", "content": f"question {k}"})
+            prompt_ids = self.encode_prompt(msgs)
+            if cached is not None:
+                self.assertEqual(prompt_ids[:len(cached)], cached, f"turn {k} left the cache")
+            answer = f"Answer {k} is cut of"
+            gen = enc(start + f" thinking {k}.") + enc("\n</think>\n\n") + enc(answer)
+            reasoning = self.tok.decode(gen).split("</think>")[0].strip()
+            msgs.append({"role": "assistant", "content": answer,
+                         "reasoning_content": self.Written(reasoning, prompt_ids, gen)})
+            cached = prompt_ids + gen
+        msgs.append({"role": "user", "content": "last"})
+        ids = self.encode_prompt(msgs)
+        self.assertEqual(ids[:len(cached)], cached)
+        # a turn that cannot be checked (ids that do not decode to its text) falls back alone; the others still splice
+        bad = [dict(m) for m in msgs]
+        bad[3]["reasoning_content"] = self.Written(str(bad[3]["reasoning_content"]), bad[3]["reasoning_content"].prompt_ids,
+                                                   enc("something else\n</think>\n\nnope"))
+        ids = self.encode_prompt(bad)
+        self.assertEqual(self.tok.decode(ids).count("\nFirst, so"), 1)
+        self.assertEqual(self.tok.decode(ids).count("\n\nFourth, so"), 1)
