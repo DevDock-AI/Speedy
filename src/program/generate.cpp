@@ -1441,6 +1441,7 @@ struct GpuStage {
     strata::core::ExpertCache cache;
     std::vector<std::pair<int32_t, int32_t>> profile;   ///< its layers' share of the profile, hottest first
     int32_t* d_res = nullptr;                            ///< the residency table on its device
+    int32_t* d_rp = nullptr;                             ///< STRATA_RP_SNAPSHOT: the route prior's snapshot on its device
     strata::core::Verifier ver;
     strata::core::Verifier ver_b;                        ///< --pipeline-windows: the odd windows' verifier
     strata::prefill::Prefill sp;
@@ -1784,6 +1785,17 @@ bool adapt_evict_sync() {
 
 /// STRATA_ADAPT_CHECKRES=1: before a verify window, the device's residency table read back into `back` and
 /// compared with the host's (the pool's plan); the mismatched entries, the first ones reported.
+/// STRATA_RP_SNAPSHOT: 0 off (the route prior reads the live residency table), 1 the table at load, 2 the table at
+/// each pipelined decode's start.
+int rp_snapshot_mode() {
+    static const int m = [] {
+        const char* e = std::getenv("STRATA_RP_SNAPSHOT");
+        const int v = e != nullptr ? std::atoi(e) : 0;
+        return v == 1 || v == 2 ? v : 0;
+    }();
+    return m;
+}
+
 int64_t res_check(const int32_t* d_res, const std::vector<int32_t>& host_res, std::vector<int32_t>& back,
                   int64_t n_expert, int64_t window) {
     if (cudaMemcpy(back.data(), d_res, host_res.size() * sizeof(int32_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
@@ -8978,6 +8990,7 @@ int main(int argc, char** argv) {
     auto gpu_held = [&](size_t i) { return host_res[i] != strata::core::kNotResident || (tp2 && host_res1[i] != strata::core::kNotResident); };
     int32_t* d_res = nullptr;
     int32_t* d_hit_count = nullptr;
+    int32_t* d_rp = nullptr;   // STRATA_RP_SNAPSHOT (see below)
     strata::core::TokenHits thits;
     const bool graph_hits = hit_fn != nullptr && !profile.empty() && !o.no_pool;
     if (graph_hits && !o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr) {
@@ -9039,6 +9052,26 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: layer split: CUDA%d residency table failed\n", st->dev);
                 return 1;
             }
+        }
+        // STRATA_RP_SNAPSHOT=1: the route prior reads its own copy of the table, the residency at load (the profile's,
+        // a function of the model and the card alone), never the live one: the tier's swaps land between windows at
+        // timing-dependent moments, and the bias read them (greedy output changed with the build's timing).  =2: the
+        // copy is taken again at the start of each pipelined decode (nothing in flight there): deterministic within a
+        // request for a given starting residency.  Only the bias reads it; the plan and the compute use d_res.
+        if (rp_snapshot_mode() > 0) {
+            bool ok_rp = cudaMalloc((void**) &d_rp, host_res.size() * sizeof(int32_t)) == cudaSuccess && res_put(d_rp) == cudaSuccess;
+            for (size_t si = 0; si < stages.size() && ok_rp; ++si) {   // each stage: its own device's table (tp2: its own)
+                auto& st = stages[si];
+                const strata::core::OnDevice on(st->dev);
+                ok_rp = cudaMalloc((void**) &st->d_rp, host_res.size() * sizeof(int32_t)) == cudaSuccess &&
+                        res_put_tbl(st->d_rp, res_of_stage(si)) == cudaSuccess;
+            }
+            if (!ok_rp) {
+                std::fprintf(stderr, "strata generate: STRATA_RP_SNAPSHOT: the route prior's residency snapshot could not be staged\n");
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: STRATA_RP_SNAPSHOT=%d: the route prior reads a residency snapshot (%s)\n",
+                         rp_snapshot_mode(), rp_snapshot_mode() == 1 ? "taken at load" : "taken at each pipelined decode's start");
         }
         thits.cache_base = drive.d.cache_base;
         thits.blob = drive.d.cache_blob;
@@ -11047,6 +11080,7 @@ int main(int argc, char** argv) {
                                      "separate from the slot table\n", (long long) u, (long long) route_res_h.size(), (long long) xcache.slots());
             } else { cudaGetLastError(); d_route_res = nullptr; }
         }
+        vh.d_rp = d_rp;
         // STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, with STRATA_ROUTE_RESIDENT=<margin>; changes the output): the MTP
         // draft's router gets the same residency bias, with the last layer's residency row as its table (single GPU)
         if (use_mtp && stages.empty() && thits.d_res != nullptr && std::getenv("STRATA_ROUTE_RESIDENT") != nullptr &&
@@ -11167,6 +11201,7 @@ int main(int argc, char** argv) {
                     const strata::core::OnDevice on(gs.dev);
                     strata::core::VerifyHits vs;
                     vs.d_res = gs.d_res;
+                    vs.d_rp = gs.d_rp;
                     vs.h_res = host_res.empty() ? nullptr : host_res.data();
                     vs.cache_base = gs.cache.device_slot(0);
                     vs.blob = thits.blob;
@@ -11221,6 +11256,7 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on(gs.dev);
                 strata::core::VerifyHits vs;
                 vs.d_res = gs.d_res;
+                vs.d_rp = gs.d_rp;
                 vs.h_res = host_res.empty() ? nullptr : host_res.data();
                 vs.cache_base = gs.cache.device_slot(0);
                 vs.blob = thits.blob;
@@ -11361,6 +11397,7 @@ int main(int argc, char** argv) {
                 strata::core::VerifyHits hits_r = vh;
                 if (r == 1) {
                     hits_r.d_res = gs.d_res;
+                    hits_r.d_rp = gs.d_rp;   // STRATA_RP_SNAPSHOT: this card's copy (null when off)
                     if (tp2) hits_r.h_res = host_res1.empty() ? nullptr : host_res1.data();
                     hits_r.cache_base = gs.cache.device_slot(0);
                     hits_r.slot_off = gs.cache.slot_offsets();
@@ -18021,6 +18058,13 @@ int main(int argc, char** argv) {
                 int64_t pl_hist_n = 0;
                 std::vector<int32_t> outp(8, 0);
                 bool ending = false;
+                if (rp_snapshot_mode() == 2 && d_rp != nullptr && !host_res.empty()) {   // nothing in flight here
+                    res_put(d_rp);
+                    for (size_t si = 0; si < stages.size(); ++si) {
+                        const strata::core::OnDevice on(stages[si]->dev);
+                        if (stages[si]->d_rp != nullptr) res_put_tbl(stages[si]->d_rp, res_of_stage(si));
+                    }
+                }
                 A.T = 1;
                 A.p = p;
                 A.tok[0] = x;
@@ -20177,6 +20221,7 @@ int main(int argc, char** argv) {
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
+        vh.d_rp = d_rp;
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;

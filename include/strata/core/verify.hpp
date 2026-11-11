@@ -73,6 +73,7 @@ struct VerifyHits {
     /// residency-biased router (route prior / STRATA_ROUTE_RESIDENT).  The plan, the doorbell skip and the hit path keep `d_res`
     /// (THIS card's physical slots).  null = d_res (no tier).
     const int32_t* d_route_res = nullptr;
+    const int32_t* d_rp = nullptr;       ///< STRATA_RP_SNAPSHOT: the route prior's frozen residency table (null: d_res)
     const int32_t* h_res = nullptr;      ///< host [n_layers * n_expert] slot or -1 (when all >= 0 in stage: zero-doorbell)
     const uint8_t* cache_base = nullptr; ///< slot 0 of the VRAM expert arena
     const uint64_t* slot_off = nullptr;   ///< E-6: host per-slot offsets when slots differ in size (null: slot * blob)

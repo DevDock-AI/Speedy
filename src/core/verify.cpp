@@ -2458,8 +2458,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // on an RTX PRO 5000 72 GB -1.9% / -0.5%, on 2x RTX A4000 -4.2% / +11.0%, hence not a default on bigger cards).
         const float route_prior = g_route_prior();
         const int32_t* route_res = hits_.d_route_res != nullptr ? hits_.d_route_res : hits_.d_res;   // R17 P1: the union, not the slots
+        // STRATA_RP_SNAPSHOT: the bias reads a residency snapshot taken at a fixed point (hits_.d_rp), not the live table
+        // the tier's swaps land in at timing-dependent moments; the plan below still reads the live table (d_res)
         if (route_prior > 0.0f && NE == 512 && K == 10 && route_res != nullptr)
-            route_prior_top10(logits_ + tb * NE, route_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
+            route_prior_top10(logits_ + tb * NE, (hits_.d_rp != nullptr ? hits_.d_rp : route_res) + l * g.n_expert,
+                              route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
         if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && route_res != nullptr) {
             // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
             try {
