@@ -1,6 +1,7 @@
 # Changelog
 
 ## Speedy 0.4.1 (2026-11-11)
+- **Two windows + penalties: no deadlock when the penalty-history staging grows** (PR #9 by William Stone): the pinned staging is sized once at capture, instead of being freed and reallocated while the other window is in flight.
 - UD-Q4_K_XL presets: STRATA_RP_SNAPSHOT=1 - the route prior reads the experts resident at load, so answers no longer depend on expert-swap timing (some UD-Q4_K_XL answers could end early on two windows; greedy test 48/48 x2 with it). Costs ~15-20 % decode on UD-Q4_K_XL; IQ4_XS/IQ3_S/Q2_0 unchanged.
 - **Follow-up turns stay in the conversation cache:** an assistant turn sent back without its thinking is re-encoded from the exact ids the model generated (whitespace at the start of the thinking or at a cut-off end no longer breaks the prefix). Follow-up turn 2 cache hits 5/6 vs 3/6 in a fresh-session test; every turn that cannot be re-encoded logs `[strata] restored turn not spliced: <reason>`.
 - **Tool steps a client merged into one assistant message are split back** to the steps the server generated, so the cached prompt is reused (`STRATA_TOOL_STEP_SPLIT=0` turns it off).
