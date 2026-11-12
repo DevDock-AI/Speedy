@@ -4343,7 +4343,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             const char* d = std::getenv("STRATA_PREFILL_COPY_WAIT_DEDUPE");
             return (e == nullptr || std::atoi(e) <= 1) && (d == nullptr || std::atoi(d) == 0);
         }();
-        const bool rs_on = rs_env && stream_all && issuer_on && !m.pp && rs_plain_copies;
+        // STRATA_PREFILL_ROUTED_STREAM_PP=1 (opt-in, needs STRATA_PREFILL_ROUTED_STREAM=1): the same on the primary of
+        // a two-GPU prompt (a peer prompt ring).  This card's ring holds only the experts this card computes (the peer's
+        // held and peer-streamed experts are not in seq) and only this thread's walk reads its slots, which never reads
+        // an unrouted entry's slot: the same bits.  Not with TP or the DP share (other readers of the ring).  At most
+        // STRATA_PREFILL_ROUTED_STREAM_PP_MAX tokens per chunk (default 4096: the short warm chunks, where most of the
+        // streamed experts are unrouted).
+        static const bool rs_pp_env = routed_stream::enabled_from(std::getenv("STRATA_PREFILL_ROUTED_STREAM_PP"));
+        static const int64_t rs_pp_max = [] {
+            const char* v = std::getenv("STRATA_PREFILL_ROUTED_STREAM_PP_MAX");
+            return v && v[0] ? (int64_t) std::max(0LL, std::atoll(v)) : (int64_t) 4096;
+        }();
+        const bool rs_pp_ok = !m.pp || (rs_pp_env && !tp && !ds_chunk && !rmode && T <= rs_pp_max);
+        const bool rs_on = rs_env && stream_all && issuer_on && rs_pp_ok && rs_plain_copies;
         routed_stream::RouteGate rs_gate;
         size_t rs_dropped = 0;
         if (rs_on) {
@@ -4352,6 +4364,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 said = true;
                 std::fprintf(stderr, "strata: STRATA_PREFILL_ROUTED_STREAM=1: a streamed prompt chunk drops the experts no token "
                                      "routes to before they are copied (at most %d copies queued ahead of the link)\n", rs_depth);
+            }
+            if (static bool said_pp = false; m.pp && !said_pp) {
+                said_pp = true;
+                std::fprintf(stderr, "strata: STRATA_PREFILL_ROUTED_STREAM_PP=1: also on the primary of a two-GPU prompt "
+                                     "(chunks of at most %lld tokens)\n", (long long) rs_pp_max);
             }
         }
         std::atomic<size_t> a_issued{0}, a_consumed{0};
