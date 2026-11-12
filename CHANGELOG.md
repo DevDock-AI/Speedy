@@ -1,5 +1,10 @@
 # Changelog
 
+## Speedy 0.4.2 (2026-11-12)
+- **Opt-in `STRATA_PREFILL_ROUTED_STREAM_PP=1`** (with `STRATA_PREFILL_ROUTED_STREAM=1`): the routed expert stream also runs on the primary of a two-GPU prompt (chunks up to `STRATA_PREFILL_ROUTED_STREAM_PP_MAX`, default 4096 tokens). Same bits (in-process off/on gate); UD-IQ4_XS warm turns 4-16 % faster. On in the 2x RTX 3080 presets.
+- **Strata #5805:** a bare `<function=...>` tool call inside the reasoning is read as a tool call; a lone `<parameter=arguments>` is unwrapped.
+- **Strata #3517:** the conversation cache pin follows the system-prompt root, not chain item 0.
+
 ## Speedy 0.4.1 (2026-11-11)
 - **Two windows + penalties: no deadlock when the penalty-history staging grows** (PR #9 by William Stone): the pinned staging is sized once at capture, instead of being freed and reallocated while the other window is in flight.
 - UD-Q4_K_XL presets: STRATA_RP_SNAPSHOT=1 - the route prior reads the experts resident at load, so answers no longer depend on expert-swap timing (some UD-Q4_K_XL answers could end early on two windows; greedy test 48/48 x2 with it). Costs ~15-20 % decode on UD-Q4_K_XL; IQ4_XS/IQ3_S/Q2_0 unchanged.
