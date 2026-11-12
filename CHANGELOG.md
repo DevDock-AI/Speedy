@@ -1,5 +1,9 @@
 # Changelog
 
+## Speedy 0.4.3 (2026-11-12)
+- **Follow-up turns reuse the cache after a reply ends early or hits max_tokens** (Strata #4677 + 13eedf55, now on every backend): a decode window commits only the rows the request can still emit (up to max_new and the first EOS), so the kept conversation is exactly what the client got. Fresh-session test: turn-2 cache hits 10/10 vs 4/10 (median time to first token 0.15 s vs 1.36 s). No emitted token changes; `STRATA_SERVE_STOP_BOUND=0` turns it off.
+- **Route prior: no crash on a degenerate router row** (Strata #5655): a token whose router logits are all NaN/-inf keeps the router's own top-k instead of publishing a sentinel id (which was an out-of-bounds write and an "expert id is out of range" abort). Out-of-range ids are now reported with layer, entry and id.
+
 ## Speedy 0.4.2 (2026-11-12)
 - **Opt-in `STRATA_PREFILL_ROUTED_STREAM_PP=1`** (with `STRATA_PREFILL_ROUTED_STREAM=1`): the routed expert stream also runs on the primary of a two-GPU prompt (chunks up to `STRATA_PREFILL_ROUTED_STREAM_PP_MAX`, default 4096 tokens). Same bits (in-process off/on gate); UD-IQ4_XS warm turns 4-16 % faster. On in the 2x RTX 3080 presets.
 - **Strata #5805:** a bare `<function=...>` tool call inside the reasoning is read as a tool call; a lone `<parameter=arguments>` is unwrapped.
