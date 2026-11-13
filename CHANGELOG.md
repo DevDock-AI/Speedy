@@ -1,5 +1,10 @@
 # Changelog
 
+## Speedy 0.4.5 (2026-11-13)
+- **Tool call repair** (`STRATA_TOOLCALL_REPAIR=1`, on in the presets): when a reply holds a `<tool_call>` that does not parse into a call of a declared tool (seen on UD-Q4_K_XL at 80-220K context: `<4>`, `<=edit>`, `<` where `<function=NAME>` belongs), the broken text is held back and the call is regenerated from the cached prefix with `<function=` forced (up to 2 tries); if every try fails the original reply is returned as before. Logs `tool call repaired`, metric `strata:tool_calls_repaired_total`.
+- **Malformed tool calls are logged** one JSON line each to `STRATA_TOOLCALL_FAIL_LOG` (outcome repaired / failed / off / unrepaired, declared tools, snippet).
+- Strata #5901: finish tool arguments that quote an unclosed call. Strata #5883: keep a value whose text has `</parameter>` then `</function>`. Strata #3371: a CPU image reader starts on demand without elastic VRAM.
+
 ## Speedy 0.4.4 (2026-11-12)
 - **Opt-in `--conversation-cache-rewind-keep N`** (Strata #5862): when a follow-up resumes the live conversation and at most N of its live tokens are past the resume point (shared prefix proven equal), the park is skipped instead of copying the whole K/V image. On 2x RTX 3080 (20 GB + 10 GB) at ~271K tokens, a follow-up whose answer was edited (splice miss): first token 0.90/0.80 s vs 1.50/0.92 s, parks 13 -> 1; normal follow-ups unchanged (0.23-0.25 s, splice hit). Default 0 parks as before.
 
