@@ -17,6 +17,7 @@ import argparse, copy, json, os
 # Engine environment of every preset.  The same values are Speedy's built-in defaults (docs/SPEEDY_DEFAULTS.md);
 # they are repeated here so a preset also pins them under STRATA_UPSTREAM_DEFAULTS=1 or on the Strata control binary.
 PROD_ENV = {
+    "STRATA_TOOLCALL_REPAIR": "1",        # serve: a broken <tool_call> is written again from "<function=" (not the engine)
     "STRATA_ROUTE_TAIL_SKIP": "0",        # lossy route tail skip off (quality)
     "STRATA_PREFILL_CPU_SHARE": "0",      # no CPU share in prefill (GPU + PCIe faster here)
     "STRATA_PIN_BY_NEED": "1",

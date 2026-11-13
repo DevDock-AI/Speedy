@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import collections
+import copy
 import base64
 import hashlib
 import hmac
@@ -60,7 +61,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages, anthropic_tools,  # noqa: E402
+from serve.frontend import (CALL_START, THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages, anthropic_tools,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -222,6 +223,23 @@ ANSWER_RESERVE_MIN = 512     # #984: the tokens kept for the answer when a think
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
 REASONING_CLOSE = "\n</think>\n\n"
+# Opt-in tool call repair (STRATA_TOOLCALL_REPAIR=1, or 2 for two tries): a finished answer whose `<tool_call>` block
+# did not read as a call of a declared tool (the `<function=NAME>` line came out as `<4>`, one wrong token) is not
+# returned as text.  The reply is written again from the tokens before that `<tool_call>`, with
+# "<tool_call>\n<function=" forced, so the model completes the name and the parameters; the engine keeps its cached
+# prefix.  Nothing of the broken block reaches the client first: from that `<tool_call>` on, the events are held until
+# a call comes out or the pass ends.  When every retry fails the first reply goes out as before.
+TOOLCALL_REPAIR_OPEN = "<tool_call>\n<function="
+
+
+def toolcall_repair_tries(value) -> int:
+    """STRATA_TOOLCALL_REPAIR: 0 (unset, off) or the retries per reply, at most 2."""
+    try:
+        return max(0, min(2, int(str(value or "0").strip() or 0)))
+    except ValueError:
+        return 0
+
+
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
@@ -4015,6 +4033,17 @@ class ByteTokenizer:
 
 
 # ------------------------------------------------------------------------------------------------ core
+def _detok_state(detok) -> tuple:
+    """What a Detokenizer has read (tool call repair puts it back)."""
+    return (list(detok.ids), detok.sent, detok.inc.getstate() if detok.inc is not None else None)
+
+
+def _detok_restore(detok, state) -> None:
+    detok.ids, detok.sent = list(state[0]), state[1]
+    if detok.inc is not None:
+        detok.inc.setstate(state[2])
+
+
 class Detokenizer:
     """Incremental decode: each token's bytes go through an incremental UTF-8 decoder, which emits the complete
     characters and holds a multi-byte character split across tokens until it is complete (invalid bytes become
@@ -4192,6 +4221,7 @@ class Service:
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
+        self.toolcall_repair = toolcall_repair_tries(os.environ.get("STRATA_TOOLCALL_REPAIR"))   # retries (0: off)
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -5063,6 +5093,8 @@ class Service:
             ("strata:drafts_accepted_total", "counter", "Speculative draft tokens accepted", t["drafts_accepted"]),
             ("strata:tool_calls_unread_total", "counter", "<tool_call> blocks returned as text (an undeclared name or a form the template does not use)",
              t.get("tool_calls_unread", 0)),
+            ("strata:tool_calls_repaired_total", "counter", "<tool_call> blocks written again and read as a call (STRATA_TOOLCALL_REPAIR)",
+             t.get("tool_calls_repaired", 0)),
             ("strata:tool_args_repaired_total", "counter", "Tool call arguments (a JSON array or object) that were damaged and read as written",
              t.get("tool_args_repaired", 0)),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
@@ -5451,6 +5483,15 @@ class Service:
         if path is not None:
             Path(path).unlink(missing_ok=True)
 
+    def _repaired(self, orig: dict, name: str) -> None:
+        """Tool call repair: the retry wrote a call of a declared tool.  One log line, and /metrics counts it."""
+        with self.status_lock:
+            self.totals["tool_calls_repaired"] = self.totals.get("tool_calls_repaired", 0) + 1
+        broken = orig.get("text", "")
+        broken = broken[broken.find(CALL_START):] if CALL_START in broken else broken
+        print(f"[strata] tool call repaired: {name} (try {orig.get('tries', 1)}; the model had written "
+              f"{broken[:80]!r})", flush=True)
+
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
             s = self.status if st is None else st
@@ -5730,6 +5771,13 @@ class Service:
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
+        # tool call repair (TOOLCALL_REPAIR_OPEN): only the Qwen call format, with tools declared, no stop strings
+        # (their matcher holds text of its own) and no forced call
+        repair_left = self.toolcall_repair if (type(parser) is OutputParser and parser.schemas and stops is None
+                                               and not force) else 0
+        repair_snap = None          # the state before the `<tool_call>` that is being held
+        repair_held = None          # the events held since that `<tool_call>` (None: not holding)
+        repair_orig = None          # the first reply's state, sent as before if every retry fails
         admission_rejected = False                      # #3040: the engine's batch slots refused it before it read anything
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
@@ -5887,6 +5935,13 @@ class Service:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
                                 piece = detok.push(t)
+                                if (repair_left and repair_held is None and CALL_START in piece
+                                        and parser.state == "content"):
+                                    repair_snap = {
+                                        "parser": copy.deepcopy(parser.__dict__), "detok": _detok_state(detok),
+                                        "base": prompt + seg[:-1], "lead": piece[:piece.index(CALL_START)],
+                                        "n": n - 1, "raw": len(raw_ids) - 1, "tail": tail, "answered": answered}
+                                    repair_held = []
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
@@ -5896,6 +5951,16 @@ class Service:
                                         reasoning_text += ev.text or ""
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
+                                    if repair_held is not None:
+                                        if ev.kind not in ("tool_start", "tool_call"):
+                                            repair_held.append(ev)
+                                            continue
+                                        if repair_orig is not None:     # the retry wrote a call: repaired
+                                            self._repaired(repair_orig, ev.call.name)
+                                            repair_orig = None
+                                        for held in repair_held:        # a call came out: what was held goes first
+                                            yield "event", held
+                                        repair_held = repair_snap = None
                                     yield "event", ev
                                 if evs:
                                     last_out = time.perf_counter()
@@ -5960,6 +6025,65 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if repair_held is not None:
+                            peek = None
+                            if (finish == "stop" and not nonfinite and not repeated and not looped
+                                    and recover_prompt is None and not cancel.is_set()):
+                                peek = copy.copy(parser)
+                                peek.__dict__ = copy.deepcopy(parser.__dict__)
+                                peek_evs = peek.finish(finish)
+                            # the block went back as text: the held answer (or what the end of the turn releases)
+                            # carries the `<tool_call>` tag as content
+                            unread = peek is not None and any(e.kind == "content" and CALL_START in (e.text or "")
+                                                              for e in repair_held + peek_evs)
+                            if peek is not None and not unread and any(e.kind in ("tool_start", "tool_call")
+                                                                       for e in peek_evs) and repair_orig is not None:
+                                self._repaired(repair_orig, next(e.call.name for e in peek_evs
+                                                                 if e.kind in ("tool_start", "tool_call")))
+                                repair_orig = None
+                            extra = self.tok.encode(repair_snap["lead"] + TOOLCALL_REPAIR_OPEN, parse_special=True)
+                            room = max_new - repair_snap["n"] - len(extra) >= 16
+                            if unread and repair_left and room:
+                                if repair_orig is None:         # the first reply, kept for the fallback
+                                    repair_orig = {"parser": copy.deepcopy(parser.__dict__), "detok": _detok_state(detok),
+                                                   "n": n, "raw": list(raw_ids), "tail": tail, "answered": answered,
+                                                   "finish": finish, "held": repair_held, "tries": 0,
+                                                   "text": "".join(e.text or "" for e in repair_held + peek_evs
+                                                                   if e.kind == "content")}
+                                repair_left -= 1
+                                repair_orig["tries"] += 1
+                                snap = repair_snap
+                                parser.__dict__.clear()
+                                parser.__dict__.update(copy.deepcopy(snap["parser"]))
+                                _detok_restore(detok, snap["detok"])
+                                n, tail, answered = snap["n"], snap["tail"], snap["answered"]
+                                del raw_ids[snap["raw"]:]
+                                run_tok, run_len, finish = None, 0, "length"
+                                repair_held = []
+                                for t in extra:
+                                    n += 1
+                                    raw_ids.append(t)
+                                repair_held += parser.feed(snap["lead"] + TOOLCALL_REPAIR_OPEN)
+                                print(f"[strata] the answer's <tool_call> did not read as a call of a declared tool: "
+                                      f"writing it again from \"<function=\" (tool call repair, try "
+                                      f"{repair_orig['tries']})", flush=True)
+                                prompt = snap["base"] + extra
+                                continue
+                            if (unread or peek is None) and repair_orig is not None:   # every retry failed: the first reply, as before
+                                o = repair_orig
+                                parser.__dict__.clear()
+                                parser.__dict__.update(o["parser"])
+                                _detok_restore(detok, o["detok"])
+                                n, tail, answered, finish = o["n"], o["tail"], o["answered"], o["finish"]
+                                raw_ids[:] = o["raw"]
+                                repair_held = o["held"]
+                                print(f"[strata] tool call repair failed after {o['tries']} tr"
+                                      f"{'y' if o['tries'] == 1 else 'ies'}: the reply goes back as the model wrote it",
+                                      flush=True)
+                                repair_orig = None
+                            for held in repair_held:
+                                yield "event", held
+                            repair_held = repair_snap = None
                         if nonfinite and not cancel.is_set():
                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
                             # from token 0.  Nothing sent yet: the same request once more, unseen by the client
@@ -9551,6 +9675,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         svc.requested_slots = per_replica * len(groups) if groups else per_replica
     svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    # tool call repair (TOOLCALL_REPAIR_OPEN): the process environment or the config's `env` (the engine ignores it)
+    svc.toolcall_repair = toolcall_repair_tries(os.environ.get("STRATA_TOOLCALL_REPAIR")
+                                                or (cfg.get("env") or {}).get("STRATA_TOOLCALL_REPAIR"))
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)
