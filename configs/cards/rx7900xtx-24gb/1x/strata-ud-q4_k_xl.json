@@ -71,6 +71,7 @@
   },
   "reasoning_effort": "medium",
   "env": {
+    "STRATA_TOOLCALL_REPAIR": "1",
     "STRATA_UPSTREAM_DEFAULTS": "1",
     "STRATA_HIPBLASLT_TUNING": "<SPEEDY_DIR>/tools/hip/gfx1100-hipblaslt-100200.txt",
     "STRATA_RDNA_MMVQ_WAVE": "3",

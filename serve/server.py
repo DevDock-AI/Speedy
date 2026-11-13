@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import collections
+import copy
 import base64
 import hashlib
 import hmac
@@ -60,7 +61,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages, anthropic_tools,  # noqa: E402
+from serve.frontend import (CALL_START, THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages, anthropic_tools,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -222,6 +223,69 @@ ANSWER_RESERVE_MIN = 512     # #984: the tokens kept for the answer when a think
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
 REASONING_CLOSE = "\n</think>\n\n"
+# Opt-in tool call repair (STRATA_TOOLCALL_REPAIR=1, or 2 for two tries): a finished answer whose `<tool_call>` block
+# did not read as a call of a declared tool (the `<function=NAME>` line came out as `<4>`, one wrong token) is not
+# returned as text.  The reply is written again from the tokens before that `<tool_call>`, with
+# "<tool_call>\n<function=" forced, so the model completes the name and the parameters; the engine keeps its cached
+# prefix.  Nothing of the broken block reaches the client first: from that `<tool_call>` on, the events are held until
+# a call comes out or the pass ends.  When every retry fails the first reply goes out as before.
+TOOLCALL_REPAIR_OPEN = "<tool_call>\n<function="
+
+
+TOOLCALL_FAIL_LOG = "/srv/projects/llm/logs/toolcall-failures.jsonl"   # STRATA_TOOLCALL_FAIL_LOG names another
+SESSION_HEADERS = ("x-opencode-session-id", "x-session-id", "x-session-affinity", "session-id", "x-conversation-id",
+                   "x-chat-id")
+
+
+def request_session(headers, req) -> str | None:
+    """The client's session id, if the request carries one (a header, then a body field), for the failure log."""
+    try:
+        for h in SESSION_HEADERS:
+            v = headers.get(h) if headers is not None else None
+            if v:
+                return str(v)[:200]
+        md = (req or {}).get("metadata") if isinstance((req or {}).get("metadata"), dict) else {}
+        for v in ((req or {}).get("prompt_cache_key"), md.get("session_id"), (req or {}).get("conversation_id"),
+                  (req or {}).get("session_id"), md.get("user_id"), (req or {}).get("user")):
+            if v:
+                return str(v)[:200]
+    except Exception:
+        pass
+    return None
+
+
+def toolcall_fail_snippet(text: str, width: int = 300) -> str:
+    """About `width` characters of `text` around its first `<tool_call>` (the broken block)."""
+    at = text.find(CALL_START)
+    if at < 0:
+        return text[-width:]
+    start = max(0, at - width // 6)
+    return text[start:start + width]
+
+
+def log_toolcall_failure(record: dict) -> None:
+    """One JSON line per malformed tool call; a log that cannot be written never fails the request."""
+    try:
+        path = os.environ.get("STRATA_TOOLCALL_FAIL_LOG") or TOOLCALL_FAIL_LOG
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as e:                      # noqa: BLE001 - logging only
+        try:
+            print(f"[strata] tool call failure log not written: {e}", flush=True)
+        except Exception:
+            pass
+
+
+def toolcall_repair_tries(value) -> int:
+    """STRATA_TOOLCALL_REPAIR: 0 (unset, off) or the retries per reply, at most 2."""
+    try:
+        return max(0, min(2, int(str(value or "0").strip() or 0)))
+    except ValueError:
+        return 0
+
+
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
@@ -2872,6 +2936,11 @@ class Vision:
     sends the same picture again (every turn, with most clients) encodes it once."""
 
     @staticmethod
+    def elastic_enabled(cfg: dict, vram_elastic: bool = False) -> bool:
+        """CPU on-demand loading needs no elastic VRAM cache; GPU loading still does."""
+        return cfg.get("elastic") is True and (not cfg.get("gpu") or vram_elastic is True)
+
+    @staticmethod
     def work_dir() -> Path:
         """#480: the directory for the encoder's files.  The engine reads the embeddings file named in a `GENI` line
         and the encoder the output named in an `ENC <image> <out>` line, both split at spaces, so a space in the path
@@ -2903,9 +2972,11 @@ class Vision:
         self.stopped = True
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
-        # opt-in (the vision section's "elastic": true, with the config's "vram_elastic"): the encoder starts with the
-        # first picture and stops after elastic_idle_s without one; while it runs, the engine's expert cache keeps
-        # elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
+        self.gpu = bool(cfg.get("gpu"))
+        # opt-in (the vision section's "elastic": true): the encoder starts with the first picture and stops after
+        # elastic_idle_s without one.  A GPU encoder also needs the config's "vram_elastic": while it runs, the engine's
+        # expert cache keeps elastic_mib of VRAM free for it (Service._vision_up / Service._vision_idle_down).  A CPU
+        # encoder holds no VRAM, so it starts on demand without it.
         self.max_tokens = self.token_limit(cfg)
         self.elastic = cfg.get("elastic") is True
         self.elastic_mib = int(cfg.get("elastic_mib") or 2048)
@@ -4008,6 +4079,17 @@ class ByteTokenizer:
 
 
 # ------------------------------------------------------------------------------------------------ core
+def _detok_state(detok) -> tuple:
+    """What a Detokenizer has read (tool call repair puts it back)."""
+    return (list(detok.ids), detok.sent, detok.inc.getstate() if detok.inc is not None else None)
+
+
+def _detok_restore(detok, state) -> None:
+    detok.ids, detok.sent = list(state[0]), state[1]
+    if detok.inc is not None:
+        detok.inc.setstate(state[2])
+
+
 class Detokenizer:
     """Incremental decode: each token's bytes go through an incremental UTF-8 decoder, which emits the complete
     characters and holds a multi-byte character split across tokens until it is complete (invalid bytes become
@@ -4185,6 +4267,7 @@ class Service:
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
+        self.toolcall_repair = toolcall_repair_tries(os.environ.get("STRATA_TOOLCALL_REPAIR"))   # retries (0: off)
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -4542,14 +4625,15 @@ class Service:
         return self.vram_reserve if self.vram_reserve_asked else 0
 
     def _vision_up(self):
-        """The image turn's start for an elastic encoder that is not running (the caller holds self.fifo): the expert
-        cache first keeps the encoder's elastic_mib of VRAM free on top of the reserve, then the encoder starts (load and
+        """Start an on-demand encoder for an image (the caller holds self.fifo). CPU starts without touching VRAM.
+        For GPU, the expert cache first keeps elastic_mib of VRAM free on top of the reserve, then the encoder starts (load and
         warm-up, a few seconds).  If the cache cannot shrink (an engine without --vram-elastic, the resident low-RAM mode)
         the encoder starts anyway, as a non-elastic one would."""
         v = self.vision
         if not getattr(v, "elastic", False) or v.alive():
             return
-        if hasattr(self.engine, "vram") and self.loaded():
+        gpu = getattr(v, "gpu", True)
+        if gpu and hasattr(self.engine, "vram") and self.loaded():
             try:
                 out = self.engine.vram((self._engine_reserve() or 0) + v.elastic_mib)
                 self.vision_held = True
@@ -4560,12 +4644,12 @@ class Service:
                       "it anyway", flush=True)
         if self.vision_held:
             time.sleep(0.2)          # the driver's free-VRAM counter shows the cache's release a moment later
-        free0, t0 = self.free_vram_mib(), time.time()
+        free0, t0 = (self.free_vram_mib() if gpu else None), time.time()
         try:
             v.restart()
         except Exception as e:      # a 503 as for a non-elastic encoder at a load, not a dropped connection
             raise EngineDied(f"the image encoder failed to start: {e}") from e
-        free1 = self.free_vram_mib()
+        free1 = self.free_vram_mib() if gpu else None
         took = f", {free0 - free1} MiB of VRAM" if free0 is not None and free1 is not None else ""
         print(f"[strata] images: the image encoder started in {time.time() - t0:.1f} s{took}", flush=True)
 
@@ -4587,6 +4671,8 @@ class Service:
                 out = self.engine.vram(self._engine_reserve())
                 back = (f"; the expert cache took its VRAM back ({out.get('expert_cache_mib')} of "
                         f"{out.get('expert_cache_full_mib')} MiB)")
+            elif not getattr(v, "gpu", True):
+                back = "; the CPU encoder holds no VRAM"
             # also when the cache never made room (a layer split, an engine without --vram-elastic): the stop happened
             print(f"[strata] images: the image encoder stopped after {v.elastic_idle_s:g} s without a picture{back}",
                   flush=True)
@@ -4600,7 +4686,8 @@ class Service:
         if not getattr(v, "elastic", False):
             return
         print(f"[strata] images: the image encoder starts with the first picture and stops after {v.elastic_idle_s:g} s "
-              f"without one; while it runs the expert cache keeps {v.elastic_mib} MiB free for it", flush=True)
+              + (f"without one; while it runs the expert cache keeps {v.elastic_mib} MiB free for it"
+                 if getattr(v, "gpu", True) else "without one (CPU; no VRAM reserve)"), flush=True)
 
         def loop():
             while True:
@@ -5052,6 +5139,8 @@ class Service:
             ("strata:drafts_accepted_total", "counter", "Speculative draft tokens accepted", t["drafts_accepted"]),
             ("strata:tool_calls_unread_total", "counter", "<tool_call> blocks returned as text (an undeclared name or a form the template does not use)",
              t.get("tool_calls_unread", 0)),
+            ("strata:tool_calls_repaired_total", "counter", "<tool_call> blocks written again and read as a call (STRATA_TOOLCALL_REPAIR)",
+             t.get("tool_calls_repaired", 0)),
             ("strata:tool_args_repaired_total", "counter", "Tool call arguments (a JSON array or object) that were damaged and read as written",
              t.get("tool_args_repaired", 0)),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
@@ -5440,6 +5529,35 @@ class Service:
         if path is not None:
             Path(path).unlink(missing_ok=True)
 
+    def _toolcall_failed(self, outcome: str, tries: int, text: str, parser, ids, n, cancel,
+                         repaired: str | None = None) -> None:
+        """Appends the failure log's line (log_toolcall_failure) for one malformed tool call."""
+        try:
+            rec = {"ts": round(time.time(), 3), "model": getattr(self, "model", None),
+                   "preset": os.path.basename(str(getattr(self, "config_path", "") or "")) or None,
+                   "session": getattr(cancel, "_strata_session", None),
+                   "request_id": getattr(cancel, "_strata_request_id", None),
+                   "prompt_tokens": len(ids or ()), "output_tokens": n, "outcome": outcome, "tries": tries,
+                   "tools": sorted(str(k) for k in (getattr(parser, "schemas", None) or {})),
+                   "snippet": toolcall_fail_snippet(text or "")}
+            if repaired:
+                rec["repaired_name"] = repaired
+            names = list(getattr(parser, "unread_names", None) or [])
+            if names:
+                rec["undeclared_names"] = names
+            log_toolcall_failure(rec)
+        except Exception:                       # noqa: BLE001 - logging only
+            pass
+
+    def _repaired(self, orig: dict, name: str) -> None:
+        """Tool call repair: the retry wrote a call of a declared tool.  One log line, and /metrics counts it."""
+        with self.status_lock:
+            self.totals["tool_calls_repaired"] = self.totals.get("tool_calls_repaired", 0) + 1
+        broken = orig.get("text", "")
+        broken = broken[broken.find(CALL_START):] if CALL_START in broken else broken
+        print(f"[strata] tool call repaired: {name} (try {orig.get('tries', 1)}; the model had written "
+              f"{broken[:80]!r})", flush=True)
+
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
             s = self.status if st is None else st
@@ -5719,6 +5837,14 @@ class Service:
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
+        # tool call repair (TOOLCALL_REPAIR_OPEN): only the Qwen call format, with tools declared, no stop strings
+        # (their matcher holds text of its own) and no forced call
+        repair_left = self.toolcall_repair if (type(parser) is OutputParser and parser.schemas and stops is None
+                                               and not force) else 0
+        repair_snap = None          # the state before the `<tool_call>` that is being held
+        repair_held = None          # the events held since that `<tool_call>` (None: not holding)
+        repair_orig = None          # the first reply's state, sent as before if every retry fails
+        answer_parts, toolfail_logged = [], False   # the answer's text (failure log), and a line already written
         admission_rejected = False                      # #3040: the engine's batch slots refused it before it read anything
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
@@ -5876,6 +6002,13 @@ class Service:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
                                 piece = detok.push(t)
+                                if (repair_left and repair_held is None and CALL_START in piece
+                                        and parser.state == "content"):
+                                    repair_snap = {
+                                        "parser": copy.deepcopy(parser.__dict__), "detok": _detok_state(detok),
+                                        "base": prompt + seg[:-1], "lead": piece[:piece.index(CALL_START)],
+                                        "n": n - 1, "raw": len(raw_ids) - 1, "tail": tail, "answered": answered}
+                                    repair_held = []
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
@@ -5885,6 +6018,23 @@ class Service:
                                         reasoning_text += ev.text or ""
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
+                                    if repair_held is not None:
+                                        if ev.kind not in ("tool_start", "tool_call"):
+                                            repair_held.append(ev)
+                                            continue
+                                        if repair_orig is not None:     # the retry wrote a call: repaired
+                                            self._repaired(repair_orig, ev.call.name)
+                                            self._toolcall_failed("repaired", repair_orig["tries"], repair_orig["text"],
+                                                                  parser, ids, n, cancel, ev.call.name)
+                                            toolfail_logged = True
+                                            repair_orig = None
+                                        for held in repair_held:        # a call came out: what was held goes first
+                                            if held.kind == "content":
+                                                answer_parts.append(held.text or "")
+                                            yield "event", held
+                                        repair_held = repair_snap = None
+                                    if ev.kind == "content" and parser.schemas:
+                                        answer_parts.append(ev.text or "")
                                     yield "event", ev
                                 if evs:
                                     last_out = time.perf_counter()
@@ -5949,6 +6099,72 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if repair_held is not None:
+                            peek = None
+                            if (finish == "stop" and not nonfinite and not repeated and not looped
+                                    and recover_prompt is None and not cancel.is_set()):
+                                peek = copy.copy(parser)
+                                peek.__dict__ = copy.deepcopy(parser.__dict__)
+                                peek_evs = peek.finish(finish)
+                            # the block went back as text: the held answer (or what the end of the turn releases)
+                            # carries the `<tool_call>` tag as content
+                            unread = peek is not None and any(e.kind == "content" and CALL_START in (e.text or "")
+                                                              for e in repair_held + peek_evs)
+                            if peek is not None and not unread and any(e.kind in ("tool_start", "tool_call")
+                                                                       for e in peek_evs) and repair_orig is not None:
+                                fixed = next(e.call.name for e in peek_evs if e.kind in ("tool_start", "tool_call"))
+                                self._repaired(repair_orig, fixed)
+                                self._toolcall_failed("repaired", repair_orig["tries"], repair_orig["text"],
+                                                      parser, ids, n, cancel, fixed)
+                                toolfail_logged = True
+                                repair_orig = None
+                            extra = self.tok.encode(repair_snap["lead"] + TOOLCALL_REPAIR_OPEN, parse_special=True)
+                            room = max_new - repair_snap["n"] - len(extra) >= 16
+                            if unread and repair_left and room:
+                                if repair_orig is None:         # the first reply, kept for the fallback
+                                    repair_orig = {"parser": copy.deepcopy(parser.__dict__), "detok": _detok_state(detok),
+                                                   "n": n, "raw": list(raw_ids), "tail": tail, "answered": answered,
+                                                   "finish": finish, "held": repair_held, "tries": 0,
+                                                   "text": "".join(e.text or "" for e in repair_held + peek_evs
+                                                                   if e.kind == "content")}
+                                repair_left -= 1
+                                repair_orig["tries"] += 1
+                                snap = repair_snap
+                                parser.__dict__.clear()
+                                parser.__dict__.update(copy.deepcopy(snap["parser"]))
+                                _detok_restore(detok, snap["detok"])
+                                n, tail, answered = snap["n"], snap["tail"], snap["answered"]
+                                del raw_ids[snap["raw"]:]
+                                run_tok, run_len, finish = None, 0, "length"
+                                repair_held = []
+                                for t in extra:
+                                    n += 1
+                                    raw_ids.append(t)
+                                repair_held += parser.feed(snap["lead"] + TOOLCALL_REPAIR_OPEN)
+                                print(f"[strata] the answer's <tool_call> did not read as a call of a declared tool: "
+                                      f"writing it again from \"<function=\" (tool call repair, try "
+                                      f"{repair_orig['tries']})", flush=True)
+                                prompt = snap["base"] + extra
+                                continue
+                            if (unread or peek is None) and repair_orig is not None:   # every retry failed: the first reply, as before
+                                o = repair_orig
+                                parser.__dict__.clear()
+                                parser.__dict__.update(o["parser"])
+                                _detok_restore(detok, o["detok"])
+                                n, tail, answered, finish = o["n"], o["tail"], o["answered"], o["finish"]
+                                raw_ids[:] = o["raw"]
+                                repair_held = o["held"]
+                                print(f"[strata] tool call repair failed after {o['tries']} tr"
+                                      f"{'y' if o['tries'] == 1 else 'ies'}: the reply goes back as the model wrote it",
+                                      flush=True)
+                                self._toolcall_failed("failed", o["tries"], o["text"], parser, ids, n, cancel)
+                                toolfail_logged = True
+                                repair_orig = None
+                            for held in repair_held:
+                                if held.kind == "content":
+                                    answer_parts.append(held.text or "")
+                                yield "event", held
+                            repair_held = repair_snap = None
                         if nonfinite and not cancel.is_set():
                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
                             # from token 0.  Nothing sent yet: the same request once more, unseen by the client
@@ -6172,7 +6388,13 @@ class Service:
             if emb:
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(parser.finish(finish)):
+            if ev.kind == "content" and parser.schemas:
+                answer_parts.append(ev.text or "")
             yield "event", ev
+        if parser.schemas and not toolfail_logged and (parser.unread or any(CALL_START in x for x in answer_parts)):
+            # a malformed or undeclared call that went back as text with no repair tried
+            self._toolcall_failed("off" if not self.toolcall_repair else "unrepaired", 0, "".join(answer_parts),
+                                  parser, ids, n, cancel)
         if parser.rescued or parser.refused:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
             print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
@@ -8070,6 +8292,7 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
+            setattr(cancel, "_strata_session", request_session(self.headers, req))
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
@@ -8135,6 +8358,7 @@ def make_handler(svc: Service):
                 return self._responses_ready(req, title)
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
+            setattr(cancel, "_strata_session", request_session(self.headers, req))
             try:
                 ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req, cancel)
             except ClientGone:
@@ -8307,6 +8531,7 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
+            setattr(cancel, "_strata_session", request_session(self.headers, req))
             try:
                 ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             except ContextOverflow as e:
@@ -9415,7 +9640,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         for line in card_roles_lines(cfg):             # the card roles: said first; every card Off stops here, before anything touches a card
             print(line, flush=True)
         if cfg.get("vision"):
-            elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
+            elastic = Vision.elastic_enabled(cfg["vision"], cfg.get("vram_elastic"))
             print("the vision encoder starts with the first picture (elastic) ..." if elastic else
                   "loading the vision encoder ..." if not lazy else
                   "vision encoder unloaded; it starts with the model ...", flush=True)
@@ -9425,7 +9650,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                     for k, v in cfg["vision"].items() if not (k == "exe" and engine_component.is_reference(v))}
             if engine_component.is_reference(cfg["vision"].get("exe")):     # the engine from the component folder
                 vcfg["exe"] = _component_exe(cfg["vision"]["exe"], cfg)
-            if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
+            if vcfg.get("elastic") is True and not elastic:
                 print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
                       "encoder its VRAM): the encoder starts with the model instead", flush=True)
                 vcfg["elastic"] = False
@@ -9540,6 +9765,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         svc.requested_slots = per_replica * len(groups) if groups else per_replica
     svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    # tool call repair (TOOLCALL_REPAIR_OPEN): the process environment or the config's `env` (the engine ignores it)
+    svc.toolcall_repair = toolcall_repair_tries(os.environ.get("STRATA_TOOLCALL_REPAIR")
+                                                or (cfg.get("env") or {}).get("STRATA_TOOLCALL_REPAIR"))
+    if (cfg.get("env") or {}).get("STRATA_TOOLCALL_FAIL_LOG") and not os.environ.get("STRATA_TOOLCALL_FAIL_LOG"):
+        os.environ["STRATA_TOOLCALL_FAIL_LOG"] = str(cfg["env"]["STRATA_TOOLCALL_FAIL_LOG"])   # log_toolcall_failure
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)

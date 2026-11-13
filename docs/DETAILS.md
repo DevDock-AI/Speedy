@@ -872,6 +872,8 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 | `reasoning_budget_tokens` | `0` (no budget) | Caps the thinking at N tokens: the server ends it with a short wrap-up line and `</think>` and the model answers from there. The wrap-up counts as output tokens. A request's own `reasoning_budget_tokens` (or llama.cpp's `thinking_budget_tokens`) wins. |
 | `answer_room` | on | A request with thinking on, no budget and `max_tokens` of 1,024 or more gets one: thinking is wrapped up when a quarter of the cap (at least 512 tokens) is left. Requests without `max_tokens` get three quarters of the context. `false` turns it off. Clients should not cap the reply far below what the context allows. |
 | `reasoning_close_retry` | off | Closes the thinking once and continues when a reply ended inside its thinking with no answer and no tool call (#1053). |
+| `env.STRATA_TOOLCALL_REPAIR` | off (`1` in the shipped presets) | `1` or `2`: an answer whose `<tool_call>` block does not read as a call of a declared tool is written again (that many tries) from the tokens before it, with `<function=` forced, reusing the cached prefix; the broken text is held, never streamed. When every try fails the first reply goes out as before. Logs `[strata] tool call repaired: NAME`. Serve layer only (also read from the process environment). |
+| `env.STRATA_TOOLCALL_FAIL_LOG` | `/srv/projects/llm/logs/toolcall-failures.jsonl` | Every malformed tool call (repaired, failed, or repair off; undeclared names too) appends one JSON line: ts, model, preset, session, prompt/output tokens, outcome, tries, declared tools, a ~300-character snippet around `<tool_call>`, the repaired name. A failed write never fails the request. |
 | `reasoning_loop_recovery` | off | `"stop"` ends, `"recover"` (or `true`) restarts once, a reply whose reasoning repeats whole passages. Checked every 512 output tokens. It can mistake repeated useful code for a loop, so keep the answer quality alongside the completion rate when testing it (#728). |
 | `repeat_stop_tokens` | `256` | A reply that repeats one token this many times in a row ends as `"length"`. `0` turns it off. |
 | `effort_position` | `"start"` | `"end"` puts a `low` or `medium` effort in a short system turn right before the answer, so a request that only changes the effort reuses the conversation cache. How well the model follows a level in that place is not measured. |
@@ -1384,6 +1386,10 @@ every turn, is encoded once.
 
 On an NVIDIA card under 24 GB the CPU encoder is the default, because the GPU encoder takes ~850 expert slots of a 16 GB card's ~4,500
 (about 5% of decode). `--vision gpu` is kept with a note.
+
+For a CPU encoder (`"gpu": false`), `"elastic": true` uses the same on-demand start and idle stop without
+`"vram_elastic"` or any VRAM reserve; text requests leave it unloaded. See the configuration in
+[VRAM_ELASTIC.md](VRAM_ELASTIC.md#the-image-encoder-on-demand).
 
 ### Sending a picture
 
