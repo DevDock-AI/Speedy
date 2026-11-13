@@ -82,6 +82,7 @@ from serve import ready as ready_file  # noqa: E402
 from serve import owner_guard  # noqa: E402
 from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
+from serve import toolguard  # noqa: E402
 from serve import lifeline  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
@@ -232,7 +233,6 @@ REASONING_CLOSE = "\n</think>\n\n"
 TOOLCALL_REPAIR_OPEN = "<tool_call>\n<function="
 
 
-TOOLCALL_FAIL_LOG = "/srv/projects/llm/logs/toolcall-failures.jsonl"   # STRATA_TOOLCALL_FAIL_LOG names another
 SESSION_HEADERS = ("x-opencode-session-id", "x-session-id", "x-session-affinity", "session-id", "x-conversation-id",
                    "x-chat-id")
 
@@ -264,9 +264,12 @@ def toolcall_fail_snippet(text: str, width: int = 300) -> str:
 
 
 def log_toolcall_failure(record: dict) -> None:
-    """One JSON line per malformed tool call; a log that cannot be written never fails the request."""
+    """One JSON line per malformed tool call to STRATA_TOOLCALL_FAIL_LOG (unset: nothing is written); a log that
+    cannot be written never fails the request."""
     try:
-        path = os.environ.get("STRATA_TOOLCALL_FAIL_LOG") or TOOLCALL_FAIL_LOG
+        path = os.environ.get("STRATA_TOOLCALL_FAIL_LOG")
+        if not path:                            # no default file: unset = not logged
+            return
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
         with open(path, "a", encoding="utf-8") as f:
@@ -4079,6 +4082,15 @@ class ByteTokenizer:
 
 
 # ------------------------------------------------------------------------------------------------ core
+def _prefixed(pre, inner):
+    """`pre`'s ids, then `inner`'s (an engine generation); closing it closes `inner` (the engine's STOP and drain)."""
+    try:
+        yield from pre
+        yield from inner
+    finally:
+        inner.close()
+
+
 def _detok_state(detok) -> tuple:
     """What a Detokenizer has read (tool call repair puts it back)."""
     return (list(detok.ids), detok.sent, detok.inc.getstate() if detok.inc is not None else None)
@@ -4268,6 +4280,7 @@ class Service:
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
         self.toolcall_repair = toolcall_repair_tries(os.environ.get("STRATA_TOOLCALL_REPAIR"))   # retries (0: off)
+        self.configure_toolguard(None)                # 0.4.6: STRATA_TOOLCALL_CONSTRAIN / DROP_THINKING_ABOVE / REPEAT_WARN
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -5141,6 +5154,12 @@ class Service:
              t.get("tool_calls_unread", 0)),
             ("strata:tool_calls_repaired_total", "counter", "<tool_call> blocks written again and read as a call (STRATA_TOOLCALL_REPAIR)",
              t.get("tool_calls_repaired", 0)),
+            ("strata:tool_calls_constrained_total", "counter", "<tool_call> openings written under the declared-name mask (STRATA_TOOLCALL_CONSTRAIN)",
+             t.get("tool_calls_constrained", 0)),
+            ("strata:tool_call_repeats_total", "counter", "Repeated identical tool calls noted (STRATA_REPEAT_WARN)",
+             t.get("tool_call_repeats", 0)),
+            ("strata:thinking_tokens_dropped_total", "counter", "Old-turn thinking tokens left out at long context (STRATA_DROP_THINKING_ABOVE)",
+             t.get("thinking_tokens_dropped", 0)),
             ("strata:tool_args_repaired_total", "counter", "Tool call arguments (a JSON array or object) that were damaged and read as written",
              t.get("tool_args_repaired", 0)),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
@@ -5316,7 +5335,11 @@ class Service:
                         part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
         self._restore_reasoning(messages, log=kwargs.get("enable_thinking") is not False)
+        self._toolguard_prompt(messages, cancel)        # 0.4.6 (opt-in): after the restore, which adds thinking back
+        chars = toolguard.message_chars(messages) if getattr(self, "drop_thinking_above", 0) > 0 else 0
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
+        if chars > 1000:
+            self._tok_per_char = min(1.0, max(0.1, len(ids) / chars))
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
@@ -5528,6 +5551,114 @@ class Service:
         path, self.embeddings.path = getattr(self.embeddings, "path", None), None
         if path is not None:
             Path(path).unlink(missing_ok=True)
+
+    def _constrain_supported(self) -> bool:
+        """The engine takes a per-request logit bias (its INFO line says logit_bias=1) and runs one request at a time."""
+        e = self.engine
+        if getattr(e, "batch", 0):
+            return False
+        return (getattr(e, "info", None) or {}).get("logit_bias") == 1
+
+    def _constrained_opening(self, base, schemas, sampling, cancel) -> list[int] | None:
+        """STRATA_TOOLCALL_CONSTRAIN: the ids after `<tool_call>`: "\n<function=" forced, then a declared tool name
+        picked by the model one token at a time under a logit bias that allows only tokens continuing a declared name
+        (and its ">\n"), the rest forced once one name is left.  Each pick is a one-token request on the cached prefix;
+        the bias is applied where the engine samples (the verifier), so a speculative/MTP draft that breaks it is
+        rejected like any draft the verifier does not pick.  None: the model goes on freely (as without the flag)."""
+        names = [k for k in (schemas or {}) if isinstance(k, str) and k]
+        if not names:
+            return None
+        if getattr(self, "_cto_index", None) is None:
+            t0 = time.perf_counter()
+            self._cto_index = toolguard.vocab_index(self.tok)
+            self._cto_rev = toolguard.reverse_index(self._cto_index)
+            print(f"[strata] constrained tool calls: {len(self._cto_rev)} name tokens indexed in "
+                  f"{time.perf_counter() - t0:.2f} s", flush=True)
+        opening = list(self.tok.encode(toolguard.CONSTRAIN_OPEN, parse_special=True))
+        picked: list[int] = []
+
+        def step(allowed):
+            if cancel.is_set():
+                return None
+            bias = {int(i): toolguard.CONSTRAIN_BIAS for i in allowed}
+            gen = self.engine.generate(base + opening + picked, 1, {**(sampling or {}), "logit_bias": bias}, cancel)
+            got = None
+            try:
+                for t in gen:
+                    if t is None:
+                        continue
+                    got = t
+                    break
+            finally:
+                gen.close()
+            if got is not None:
+                picked.append(got)
+            return got
+
+        t0 = time.perf_counter()
+        try:
+            out = toolguard.constrain_name(step, lambda text: self.tok.encode(text, parse_special=False),
+                                           self._cto_index, names, rev=self._cto_rev)
+        except ValueError as e:                 # the engine refused the bias (an ERR line): write freely
+            print(f"[strata] constrained tool call skipped: {e}", flush=True)
+            return None
+        if out is None:
+            print("[strata] constrained tool call: no declared name could be finished; the model writes freely",
+                  flush=True)
+            return None
+        ids, name = out
+        with self.status_lock:
+            self.totals["tool_calls_constrained"] = self.totals.get("tool_calls_constrained", 0) + 1
+        if os.environ.get("STRATA_TOOLCALL_CONSTRAIN_LOG", "1") != "0":
+            print(f"[strata] constrained tool call: {name} ({len(picked)} picks, "
+                  f"{(time.perf_counter() - t0) * 1000:.0f} ms)", flush=True)
+        return opening + list(ids)
+
+    def configure_toolguard(self, cfg_env) -> None:
+        """0.4.6 opt-in guards (serve/toolguard.py), from the process environment or the config's `env` block."""
+        g = toolguard
+        self.toolcall_constrain = g.flag(g.env_value("STRATA_TOOLCALL_CONSTRAIN", cfg_env))
+        self.drop_thinking_above = g.int_setting(g.env_value("STRATA_DROP_THINKING_ABOVE", cfg_env), 0)
+        self.drop_thinking_step = g.int_setting(g.env_value("STRATA_DROP_THINKING_STEP", cfg_env),
+                                                g.DROP_THINKING_STEP, low=1) or g.DROP_THINKING_STEP
+        self.repeat_warn = g.flag(g.env_value("STRATA_REPEAT_WARN", cfg_env))
+        self.repeat_window = g.int_setting(g.env_value("STRATA_REPEAT_WARN_WINDOW", cfg_env), g.REPEAT_WINDOW,
+                                           low=1) or g.REPEAT_WINDOW
+        self._tok_per_char = getattr(self, "_tok_per_char", 0.3)   # learned from each prompt (drop_thinking estimate)
+
+    def _toolguard_prompt(self, messages, cancel=None) -> None:
+        """Before the render: the repeat note (STRATA_REPEAT_WARN) and old thinking dropped (STRATA_DROP_THINKING_ABOVE).
+        Both are functions of the history alone, so a conversation's prefix renders the same on every request."""
+        if getattr(self, "repeat_warn", False):
+            try:
+                reps = toolguard.mark_repeats(messages, self.repeat_window)
+            except Exception as e:              # noqa: BLE001 - a guard never fails a request
+                reps = []
+                print(f"[strata] repeat warning skipped: {e}", flush=True)
+            for r in reps:
+                with self.status_lock:
+                    self.totals["tool_call_repeats"] = self.totals.get("tool_call_repeats", 0) + 1
+                print(f"[strata] repeated tool call: {r['name']} (same arguments as one of the last "
+                      f"{self.repeat_window} calls, {r['times']} times in the conversation): note added", flush=True)
+                log_toolcall_failure({
+                    "ts": round(time.time(), 3), "model": getattr(self, "model", None),
+                    "preset": os.path.basename(str(getattr(self, "config_path", "") or "")) or None,
+                    "session": getattr(cancel, "_strata_session", None), "outcome": "repeat", "tries": 0,
+                    "name": r["name"], "times": r["times"], "snippet": r["arguments"][:300]})
+        above = getattr(self, "drop_thinking_above", 0)
+        if above > 0:
+            # decided on the conversation as sent (before anything is dropped): it only grows, so once a conversation
+            # is over the threshold it stays over and the same turns keep losing their thinking
+            est = int(toolguard.message_chars(messages) * self._tok_per_char)
+            if est > above:
+                dropped = toolguard.drop_old_thinking(messages, self.drop_thinking_step)
+                if dropped:
+                    saved = sum(len(self.tok.encode(r)) for r in dropped)
+                    with self.status_lock:
+                        self.totals["thinking_tokens_dropped"] = self.totals.get("thinking_tokens_dropped", 0) + saved
+                    print(f"[strata] long context (~{est} tokens > {above}): thinking of {len(dropped)} older turns "
+                          f"left out, {saved} tokens saved (STRATA_DROP_THINKING_ABOVE, step "
+                          f"{self.drop_thinking_step})", flush=True)
 
     def _toolcall_failed(self, outcome: str, tries: int, text: str, parser, ids, n, cancel,
                          repaired: str | None = None) -> None:
@@ -5845,6 +5976,12 @@ class Service:
         repair_held = None          # the events held since that `<tool_call>` (None: not holding)
         repair_orig = None          # the first reply's state, sent as before if every retry fails
         answer_parts, toolfail_logged = [], False   # the answer's text (failure log), and a line already written
+        # 0.4.6 constrained tool-call opening (STRATA_TOOLCALL_CONSTRAIN): the same conditions as the repair, a text
+        # prompt, and an engine that takes a per-request logit bias (not with --batch)
+        cto_ok = bool(getattr(self, "toolcall_constrain", False) and type(parser) is OutputParser and parser.schemas
+                      and stops is None and not force and not getattr(self.embeddings, "path", None)
+                      and self._constrain_supported())
+        cto_now, cto_pre = False, []    # a `<tool_call>` just came out; the opening's ids the next pass starts with
         admission_rejected = False                      # #3040: the engine's batch slots refused it before it read anything
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
@@ -5957,8 +6094,13 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        if cto_pre:     # the constrained opening: its ids go through the loop below as the model's
+                            gen = _prefixed(cto_pre, self.engine.generate(prompt + cto_pre, max_new - n - len(cto_pre),
+                                                                          sampling, cancel))
+                            cto_pre = []
+                        else:
+                            gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
+                                else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
@@ -6009,6 +6151,9 @@ class Service:
                                         "base": prompt + seg[:-1], "lead": piece[:piece.index(CALL_START)],
                                         "n": n - 1, "raw": len(raw_ids) - 1, "tail": tail, "answered": answered}
                                     repair_held = []
+                                if (cto_ok and parser.state == "content" and piece.endswith(CALL_START)
+                                        and max_new - n >= 64):
+                                    cto_now = True      # the name is picked under the bias once this pass stops
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
@@ -6041,6 +6186,8 @@ class Service:
                                 elif time.perf_counter() - last_out >= KEEPALIVE_S:
                                     last_out = time.perf_counter()
                                     yield "ping", None
+                                if cto_now:
+                                    break
                                 if stops is not None and stops.hit is not None:
                                     finish = "stop"         # gen.close() below STOPs the engine, as for a stop token
                                     break
@@ -6099,6 +6246,14 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if cto_now:
+                            cto_now = False
+                            if not cancel.is_set() and not nonfinite:
+                                # the pass stopped right after `<tool_call>`: "\n<function=" + a declared name + ">\n"
+                                # (constrain_name), then the next pass goes on freely from there
+                                cto_pre = self._constrained_opening(prompt + seg, parser.schemas, sampling, cancel) or []
+                                prompt = prompt + seg
+                                continue
                         if repair_held is not None:
                             peek = None
                             if (finish == "stop" and not nonfinite and not repeated and not looped
@@ -9768,6 +9923,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     # tool call repair (TOOLCALL_REPAIR_OPEN): the process environment or the config's `env` (the engine ignores it)
     svc.toolcall_repair = toolcall_repair_tries(os.environ.get("STRATA_TOOLCALL_REPAIR")
                                                 or (cfg.get("env") or {}).get("STRATA_TOOLCALL_REPAIR"))
+    svc.configure_toolguard(cfg.get("env"))            # 0.4.6 guards: the process environment or the config's `env`
     if (cfg.get("env") or {}).get("STRATA_TOOLCALL_FAIL_LOG") and not os.environ.get("STRATA_TOOLCALL_FAIL_LOG"):
         os.environ["STRATA_TOOLCALL_FAIL_LOG"] = str(cfg["env"]["STRATA_TOOLCALL_FAIL_LOG"])   # log_toolcall_failure
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
