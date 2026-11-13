@@ -7,7 +7,10 @@ out as `<4>`; the parser found no call, the block went back as text, and the age
     python -m unittest serve.test_toolcall_repair
 """
 import json
+import os
+import tempfile
 import unittest
+from unittest import mock
 import urllib.request
 from contextlib import redirect_stdout
 from io import StringIO
@@ -59,6 +62,12 @@ class ScriptEngine(MockEngine):
 
 class Repair(unittest.TestCase):
     def start(self, first, retry=None, tries=1):
+        self.logdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.logdir.cleanup)
+        self.failog = os.path.join(self.logdir.name, "logs", "toolcall-failures.jsonl")
+        env = mock.patch.dict(os.environ, {"STRATA_TOOLCALL_FAIL_LOG": self.failog})
+        env.start()
+        self.addCleanup(env.stop)
         self.tok = CallTokenizer()
         self.engine = ScriptEngine(self.tok, first, retry)
         self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
@@ -72,7 +81,7 @@ class Repair(unittest.TestCase):
         body = {"model": "m", "messages": [{"role": "user", "content": "list the project"}], "tools": TOOLS,
                 "max_tokens": 400, "stream": stream}
         req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
-                                     headers={"Content-Type": "application/json"})
+                                     headers={"Content-Type": "application/json", "x-session-id": "ses_test1"})
         log = StringIO()
         with redirect_stdout(log), urllib.request.urlopen(req, timeout=30) as r:
             raw = r.read().decode()
@@ -153,6 +162,57 @@ class Repair(unittest.TestCase):
         c = self.post(False)
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertEqual(c["message"]["content"], "All done.")
+
+    def failures(self):
+        if not os.path.exists(self.failog):
+            return []
+        with open(self.failog, encoding="utf-8") as f:
+            return [json.loads(x) for x in f if x.strip()]
+
+    def test_failure_log_repaired(self):
+        self.start(THINK + "Let me look.\n\n" + BROKEN, FIXED)
+        self.post(False)
+        (r,) = self.failures()
+        self.assertEqual((r["outcome"], r["tries"], r["repaired_name"]), ("repaired", 1, "list"))
+        self.assertEqual(r["session"], "ses_test1")
+        self.assertEqual(r["tools"], ["bash", "list", "read"])
+        self.assertIn("<tool_call>\n<4>", r["snippet"])
+        self.assertLessEqual(len(r["snippet"]), 300)
+        self.assertGreater(r["prompt_tokens"], 0)
+        self.assertGreater(r["output_tokens"], 0)
+        for k in ("ts", "model", "preset"):
+            self.assertIn(k, r)
+
+    def test_failure_log_failed_and_off(self):
+        for tries, outcome in ((1, "failed"), (0, "off")):
+            with self.subTest(outcome=outcome):
+                self.start(THINK + "Let me look.\n\n" + BROKEN, None, tries=tries)
+                self.post(True)
+                (r,) = self.failures()
+                self.assertEqual((r["outcome"], r["tries"]), (outcome, tries))
+                self.assertNotIn("repaired_name", r)
+                self.assertIn("<4>", r["snippet"])
+
+    def test_failure_log_undeclared_name(self):
+        self.start(THINK + CLEAN.replace("=list>", "=nosuch>"), FIXED, tries=0)
+        self.post(False)
+        (r,) = self.failures()
+        self.assertEqual(r["outcome"], "off")
+        self.assertEqual(r.get("undeclared_names"), ["nosuch"])
+
+    def test_no_failure_no_line(self):
+        self.start(THINK + "Let me look.\n\n" + CLEAN, FIXED)
+        self.post(False)
+        self.assertEqual(self.failures(), [])
+
+    def test_an_unwritable_log_does_not_fail_the_request(self):
+        self.start(THINK + "Let me look.\n\n" + BROKEN, FIXED)
+        blocker = os.path.join(self.logdir.name, "file")
+        open(blocker, "w").close()
+        with mock.patch.dict(os.environ, {"STRATA_TOOLCALL_FAIL_LOG": os.path.join(blocker, "x.jsonl")}):
+            c = self.post(False)
+        self.assertEqual(c["finish_reason"], "tool_calls")
+        self.assertIn("failure log not written", self.log)
 
     def test_the_env_value(self):
         self.assertEqual([toolcall_repair_tries(v) for v in (None, "", "0", "1", "2", "5", "x")], [0, 0, 0, 1, 2, 2, 0])
