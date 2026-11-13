@@ -1,5 +1,8 @@
 # Changelog
 
+## Speedy 0.4.4 (2026-11-12)
+- **Opt-in `--conversation-cache-rewind-keep N`** (Strata #5862): when a follow-up resumes the live conversation and at most N of its live tokens are past the resume point (shared prefix proven equal), the park is skipped instead of copying the whole K/V image. On 2x RTX 3080 (20 GB + 10 GB) at ~271K tokens, a follow-up whose answer was edited (splice miss): first token 0.90/0.80 s vs 1.50/0.92 s, parks 13 -> 1; normal follow-ups unchanged (0.23-0.25 s, splice hit). Default 0 parks as before.
+
 ## Speedy 0.4.3 (2026-11-12)
 - **Follow-up turns reuse the cache after a reply ends early or hits max_tokens** (Strata #4677 + 13eedf55, now on every backend): a decode window commits only the rows the request can still emit (up to max_new and the first EOS), so the kept conversation is exactly what the client got. Fresh-session test: turn-2 cache hits 10/10 vs 4/10 (median time to first token 0.15 s vs 1.36 s). No emitted token changes; `STRATA_SERVE_STOP_BOUND=0` turns it off.
 - **Route prior: no crash on a degenerate router row** (Strata #5655): a token whose router logits are all NaN/-inf keeps the router's own top-k instead of publishing a sentinel id (which was an out-of-bounds write and an "expert id is out of range" abort). Out-of-range ids are now reported with layer, entry and id.
