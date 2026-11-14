@@ -8,12 +8,11 @@ Speedy runs **Qwen3.8-Flash-Next** (125B MoE) with a **229K-token native context
 **RTX 3080 10 GB** cards. It is a measured, tuned fork of [Strata](https://github.com/Niko1221/Strata). Every change in
 it was adopted only after a same-window A/B and a quality gate.
 
-**Developed and tested on RTX 3080s, likely fine on many other NVIDIA cards.** Every number below comes from RTX 3080
-10 GB cards, because that is the hardware we own. The engine itself needs any NVIDIA GPU with compute capability 8.0+
-(Ampere or newer: RTX 30xx, 40xx, 50xx, A-series / workstation cards), so other cards should work. Set
-`-DCMAKE_CUDA_ARCHITECTURES` to your card (80 A100, 86 RTX 30xx, 89 RTX 40xx, 120 RTX 50xx). Cards with more VRAM will fit
-more experts and likely run faster, but the presets are tuned for 10 GB and haven't been measured elsewhere.
-**AMD** (RX 7900 / RDNA3, RDNA4) builds from source through Strata's HIP backend ([docs/AMD_HIP.md](docs/AMD_HIP.md)); it compiles in our CI but we have not run it. Results from other GPUs are very welcome: add a card folder under [`configs/cards/`](configs/README.md#add-a-card).
+**Measured on RTX 3080s, should run on other NVIDIA cards.** The engine needs compute capability 7.5+ (RTX 20, 30, 40,
+50 and workstation cards); set `-DCMAKE_CUDA_ARCHITECTURES` to your card (75 RTX 20, 80 A100, 86 RTX 30, 89 RTX 40, 120
+RTX 50). The presets are tuned for 10 GB cards; more VRAM fits more experts but is unmeasured. **AMD** (RDNA3/RDNA4)
+builds through Strata's HIP backend ([docs/AMD_HIP.md](docs/AMD_HIP.md)); it compiles in CI but is untested. Results
+from other GPUs are welcome: add a folder under [`configs/cards/`](configs/README.md#add-a-card).
 
 [![License: Personal & Non-Commercial](https://img.shields.io/badge/License-Personal%20%26%20Non--Commercial-orange.svg)](LICENSE)
 ![GPU](https://img.shields.io/badge/GPU-RTX%203080%2010%20GB%20(1%20or%202)-76B900)
@@ -27,18 +26,6 @@ more experts and likely run faster, but the presets are tuned for 10 GB and have
 </div>
 
 ---
-
-## Contents
-
-| | |
-|---|---|
-| **[Results at a glance](#results-at-a-glance)** | Speed per quant, one GPU and two GPUs |
-| **[Quality](#quality)** | IFBench, long-context recall, quality gates |
-| **[Quick start: Linux](#quick-start-linux)** | Build, presets, serve |
-| **[Quick start: Windows](#quick-start-windows)** | Build and run on Windows 10/11 |
-| **[Presets: replicate our numbers](#presets-replicate-our-numbers)** | The exact production configs |
-| **[Documentation](#documentation)** | Where everything lives |
-| **[Contributing](#contributing)** | Evidence-first pull requests |
 
 ## Results at a glance
 
@@ -60,9 +47,9 @@ Each value is the **average ± half the spread** across the measured runs. All r
 > | Prefill | baseline | **+10-12 %** (Q2_0), more on FP16 prompt paths such as UD-Q4_K_XL |
 > | Decode | unchanged | unchanged (bandwidth-bound) |
 >
-> Output is bit-identical locked and unlocked. Without the module, expect correspondingly lower prefill. Setup and
-> caveats are in [docs/GPU-UNLOCK.md](docs/GPU-UNLOCK.md).
->
+> Output is bit-identical locked and unlocked; without the module expect lower prefill. See
+> [docs/GPU-UNLOCK.md](docs/GPU-UNLOCK.md).
+
 > **Measured on:** Lenovo ThinkStation P620
 >
 > | Part | Spec |
@@ -94,6 +81,23 @@ Each value is the **average ± half the spread** across the measured runs. All r
 | **UD-IQ4_XS** <sub>quality</sub> | 3,297 | 3,400 | 3,397 | **141** ±14 | 59 | 2.05 ±0.25 |
 | **UD-Q4_K_XL** <sub>best</sub> | 2,994 | 3,118 | 3,115 | **111** ±10 | 65 | 2.75 ±0.05 |
 
+### RTX 3080 20 GB + RTX 3080 10 GB (layer split)
+
+Measured differently from the tables above: a short speed screen of four tests on the 0.4.6 engine. **short** is a
+short chat prompt, **code** a coding prompt, **55K** and **110K** are prompts of about 55K and 110K tokens. Decode is
+with MTP. These presets are not in `configs/cards/` yet.
+
+| Quant | Decode short<br>(tok/s) | Decode code<br>(tok/s) | Decode 55K<br>(tok/s) | Decode 110K<br>(tok/s) | Prefill short<br>(tok/s) | Prefill code<br>(tok/s) | Prefill 55K<br>(tok/s) | Prefill 110K<br>(tok/s) |
+|:---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Q2_0** <sub>fastest</sub> | **200** | **216** | **214** | **186** | 1,929 | 2,041 | 3,908 | 3,941 |
+| **IQ3_S** | **205** | **196** | **184** | **195** | 1,644 | 1,726 | 3,990 | 4,037 |
+| **UD-IQ3_XXS** | **197** | **210** | **204** | **180** | 1,590 | 1,710 | 3,679 | 3,957 |
+| **UD-IQ4_XS** <sub>quality</sub> | **184** | **211** | **180** | **176** | 1,536 | 1,629 | 3,607 | 3,728 |
+| **UD-Q4_K_XL** <sub>best</sub> | **168** | **170** | **161** | **155** | 1,226 | 1,300 | 2,950 | 3,150 |
+
+UD-Q4_K_XL 1M preset: a conversation grown to 1.016M tokens kept recall 9/9. Settings: 20 GB card capped at 240 W,
+10 GB card at 280 W, both PCIe 4.0 x16, route prior 1.5, peer-to-peer copies through a patched open NVIDIA kernel driver with BAR1 at 32 GiB / 16 GiB.
+
 ### Against the starting point
 
 These compare Strata 0.1.45 on the same machine with Speedy on two GPUs.
@@ -106,8 +110,8 @@ These compare Strata 0.1.45 on the same machine with Speedy on two GPUs.
 | **UD-Q4_K_XL** | +212 % ±7 | +20 % |
 
 **1M-token context (two GPUs).** A growing coding session reached **1,017,288 tokens in 26 turns (18 min)** with no
-errors. It passed all 9 recall checks, with facts planted early and asked about at 163K to 976K tokens. 93-96 % of each turn was served from cache.
-Needle-in-a-haystack recall was **47/48** single facts across the depth range up to about 1M tokens.
+errors, passed all 9 recall checks (facts asked about at 163K-976K tokens) with 93-96 % of each turn cached, and
+recalled **47/48** needles across depths up to about 1M tokens.
 
 <sub>Method: same packs and configs except the one variable under test, the control in the same window, ABBA order.
 Noise floor: prefill ±0.5 %, decode ±4-8 %. Full tables and every A/B: [docs/BENCHMARKS.md](docs/BENCHMARKS.md),
@@ -119,8 +123,7 @@ Noise floor: prefill ±0.5 %, decode ±4-8 %. Full tables and every A/B: [docs/B
 |---|---|---|
 | **IFBench** (300 prompts, prompt-level loose) | **81.0** (strict 78.7) | 81.3 |
 
-The two scores are within the noise of a 300-prompt run, which is about ±2.3 points. Our run had a 32K reasoning cap and a single sample. It
-generated 2.39M tokens over 8 h at 83 t/s, and no answer hit the cap. The harness is in [`evals/`](evals/).
+Within the ±2.3-point noise of a 300-prompt run (single sample, 32K reasoning cap, none hit). Harness: [`evals/`](evals/).
 
 Every adopted engine change also had to pass:
 - **Tolerance gate v2:** token-by-token comparison against the reference across 60K and 120K prompts.
@@ -154,19 +157,17 @@ ulimit -l unlimited
 ```
 
 With **one GPU**, use the presets in `configs/cards/rtx3080-10gb/1x/` instead. Several quants can share one port through
-llama-swap; see `configs/production-*/llama-swap.yaml` and [docs/LLAMA_SWAP.md](docs/LLAMA_SWAP.md).
+llama-swap; see `configs/cards/rtx3080-10gb/{1x,2x}/llama-swap.yaml` and [docs/LLAMA_SWAP.md](docs/LLAMA_SWAP.md).
 Set an API key before you listen on anything other than `127.0.0.1` ([SECURITY.md](SECURITY.md)).
 
 ## Quick start: Windows
-
-Speedy keeps Strata's Windows support: the same engine source, the same `serve/` server and the same setup scripts.
 
 **Option A, setup does everything:**
 1. Clone the repository, or download and extract a release.
 2. Run `START-HERE.bat`. In PowerShell, run `.\START-HERE.bat`.
 3. Pick the model and quant. On an **RTX 20, 30, 40 or 50** card setup downloads the ready-made engine for that family (`strata-windows-x64-rtx20.zip` ... `rtx50.zip` from the [latest release](https://github.com/DevDock-AI/Speedy/releases/latest)); on other cards (or a PC that mixes families) it compiles from source, so install the build tools in option B.
 
-**Option B, build the engine yourself:**
+**Option B, build the engine yourself** (works with any card):
 1. Install the **Visual Studio 2022 Build Tools** (C++ workload) and **CUDA 13.x** (13.3 or newer also works with VS 2026).
 2. Open the **x64 Native Tools Command Prompt** and run:
 ```bat
@@ -179,29 +180,23 @@ With a CUDA **12.x** toolkit, add `-DCMAKE_CUDA_RUNTIME_LIBRARY=Shared`: MSVC re
 3. Copy a preset from `configs/cards/rtx3080-10gb/1x/` or `configs/cards/rtx3080-10gb/2x/`. Replace the placeholders with Windows paths (use forward slashes or escaped backslashes in JSON), set `"exe"` to `build/strata.exe`, and start it with `python serve\server.py --engine strata --config <preset> --port 8080`.
 
 **Windows notes:**
-- The reference numbers above are from Linux. Under Windows (WDDM), expect somewhat lower prefill.
-- The optional gpu-unlock module is Linux-only. Without it, an LHR card runs at its stock FP16 tensor rate.
+- Numbers above are from Linux; expect somewhat lower prefill under WDDM. gpu-unlock is Linux-only.
 - Pinned host memory is limited by Windows itself, not by `ulimit`. If the engine warns about pinned memory, lower `--kv-resident` or `--conversation-cache-mib`.
 - Windows results are welcome: open an issue with the **Performance report** template.
 
-Strata's desktop app and its auto-update channel are not published for Speedy; use the source install.
-Full Windows steps: [docs/SOURCE_INSTALL.md](docs/SOURCE_INSTALL.md#from-source-windows) and
+Strata's desktop app is not published for Speedy. Full Windows steps: [docs/SOURCE_INSTALL.md](docs/SOURCE_INSTALL.md#from-source-windows) and
 [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Presets: replicate our numbers
 
-Presets live in **one folder per GPU model** under [`configs/cards/`](configs/cards/), with a `CARD.md` holding that
-card's hardware, build flags and measured numbers. The RTX 3080 presets are the production configs exactly as they ran;
-only machine paths and GPU UUIDs are replaced by placeholders.
-
-**Tuned Speedy on another card?** Copy [`configs/cards/_template/`](configs/cards/_template/), add your presets and
-numbers, and open a PR. See [configs/README.md](configs/README.md#add-a-card).
-
-**Per-GPU-family tuning guides** (RTX 20 / 30 / 40 / 50, for people and AI agents): [docs/cards/](docs/cards/README.md).
+Presets live in one folder per GPU model under [`configs/cards/`](configs/cards/), with a `CARD.md` (hardware, build
+flags, numbers). The RTX 3080 presets are the measured configs with paths and GPU UUIDs replaced by placeholders. To add
+a card, copy [`configs/cards/_template/`](configs/cards/_template/) ([how](configs/README.md#add-a-card)). Tuning guides
+per GPU family: [docs/cards/](docs/cards/README.md).
 
 | Folder | Contents |
 |---|---|
-| [`configs/cards/rtx3080-10gb/2x/`](configs/cards/rtx3080-10gb/2x/) | `strata-<quant>-2gpu-pw2.json` (229K native) and `strata-<quant>-1m-2gpu.json` (1M tier) for Q2_0, IQ3_S, UD-IQ4_XS, UD-Q4_K_XL, plus `llama-swap.yaml` |
+| [`configs/cards/rtx3080-10gb/2x/`](configs/cards/rtx3080-10gb/2x/) | `strata-<quant>-2gpu-pw2.json` (229K native) for Q2_0, IQ3_S, UD-IQ4_XS, UD-Q4_K_XL; `strata-<quant>-1m-2gpu.json` (1M tier) for Q2_0, IQ3_S, UD-Q4_K_XL; `llama-swap.yaml` |
 | [`configs/cards/rtx3080-10gb/1x/`](configs/cards/rtx3080-10gb/1x/) | the single-GPU production presets, plus `llama-swap.yaml` |
 | [`configs/cards/rtx3080-10gb/2x/parallel2/`](configs/cards/rtx3080-10gb/2x/parallel2/) | `"parallel": 2` variants (two requests decoded together). **Slower on 2× 10 GB**, see below |
 
@@ -214,9 +209,33 @@ The key two-GPU settings are:
 
 What every flag does: [docs/CONFIGS.md](docs/CONFIGS.md). Built-in defaults: [docs/SPEEDY_DEFAULTS.md](docs/SPEEDY_DEFAULTS.md).
 
-**About `parallel: 2`:** on 2× 10 GB, two clients sending at once finished in **42-48 s** with batch slots, against **33 s**
-when the requests simply queue (Q2_0). With slots on, a single user also loses 15-19 % decode. The two conversations route to
-different experts, so batching saves little while the slots take expert-cache VRAM. It may pay off on cards with more VRAM.
+**About `parallel: 2`:** on 2× 10 GB, two simultaneous clients finished in 42-48 s with batch slots vs 33 s queued
+(Q2_0), and a single user loses 15-19 % decode: the conversations route to different experts while the slots take
+expert-cache VRAM. It may pay off on larger cards.
+
+## Updates
+
+At start and then every 3 hours the server checks in the background (never delaying a request) for a newer release:
+one anonymous request to `api.github.com/repos/DevDock-AI/Speedy/releases/latest`, User-Agent `Speedy/<version>`,
+cached for the same interval in `~/.cache/speedy/update-check.json` (`%LOCALAPPDATA%\speedy\` on Windows). Nothing is
+installed automatically and nothing is added to model answers. A newer release shows up in:
+- the server log, at start and when it is first found:
+  `Speedy v0.4.8 is available (you run v0.4.7): https://github.com/DevDock-AI/Speedy/releases/tag/v0.4.8 — update with: ./speedy-update`
+- `GET /speedy/version` and the `"speedy"` field of `GET /health`: `current`, `latest`, `update_available`, `url`, `notes_excerpt`;
+- the `X-Speedy-Update: 0.4.8` header on API responses.
+
+To update, run it yourself:
+```bash
+./speedy-update --check      # only report (exit code 10 when an update is available)
+./speedy-update              # show the release notes, ask, update   (Windows: python serve\update.py)
+./speedy-update --yes        # the same without the question
+./speedy-update --rollback   # back to what ran before the last update
+```
+A git checkout checks out the release tag and rebuilds in `build/` (`--no-build` skips that), keeping the old commit
+and binary for `--rollback`. A zip install downloads the engine zip for your OS and card family (`--family`), verifies
+it (release SHA256SUMS, else GitHub's size and digest) and unpacks it beside the old one in `engine-vX.Y.Z/`. Restart
+the server afterwards. `STRATA_UPDATE_CHECK=0` disables the check, `STRATA_UPDATE_CHECK_HOURS` sets the interval
+(default 3), and offline mode (`--offline`, `STRATA_OFFLINE=1`) never checks.
 
 ## Documentation
 
@@ -232,8 +251,7 @@ different experts, so batching saves little while the slots take expert-cache VR
 
 ## Contributing
 
-Pull requests are welcome, and speed claims need evidence: numbers from an A/B in the same window, your hardware, and a
-quality-gate result. See [CONTRIBUTING.md](CONTRIBUTING.md). Report security issues privately ([SECURITY.md](SECURITY.md)).
+Speed claims need a same-window A/B, your hardware and a quality-gate result. See [CONTRIBUTING.md](CONTRIBUTING.md). Report security issues privately ([SECURITY.md](SECURITY.md)).
 
 ## License
 
@@ -245,7 +263,7 @@ Speedy Personal & Non-Commercial License v1.0 ([LICENSE](LICENSE)) for original 
 Dual-GPU groundwork from Hardin22's Strata-DualGPU. Upstream work carried: lask3802 (#2689/#2690), Stefano Sinden / bitaccesscomau (#4283, #4119),
 merbanan (#4039), havok2-htwo (#3559), cobra91, chimpera, moses-sun, wannagoxuf, ruibeikaa, Klaus Friedel, Gopi, Jackwwg83 (#4567),
 Zac Chen / xyzzing (#3919), sergqwer (#2968, #2964), gopinath87607 (#3307, #3309, #3310), G0-0000 (#4226).
-Ideas: <a href="https://github.com/jesdga95/basalt">Basalt</a> (Jesús Gulfo), StrataFast, architectds (IMMA attention), Cloudflare Code Mode.
+Ideas: StrataFast, architectds (IMMA attention), Cloudflare Code Mode.
 Optional: <a href="https://github.com/Zagitta/gpu-unlock">gpu-unlock</a> (Zagitta). Kernels derived from <a href="https://github.com/ggml-org/llama.cpp">llama.cpp / ggml</a>.
 Models: <a href="https://huggingface.co/Qwen">Qwen</a>, <a href="https://huggingface.co/unsloth">Unsloth</a> UD quants,
 <a href="https://huggingface.co/ISTA-DASLab">ISTA-DASLab</a> GSQ-RCO quants. Benchmarks: <a href="https://github.com/allenai/IFBench">IFBench</a>, LiveCodeBench.
