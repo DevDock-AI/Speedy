@@ -83,6 +83,8 @@ from serve import owner_guard  # noqa: E402
 from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import toolguard  # noqa: E402
+from serve import update_check  # noqa: E402
+from serve.version import SPEEDY_VERSION  # noqa: E402
 from serve import lifeline  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
@@ -4350,6 +4352,7 @@ class Service:
         self.status_lock = threading.Lock()
         self.admission_changed = threading.Condition(self.status_lock)
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
+        self.update_checker = None                       # serve/update_check.py (0.4.7), set by serve()
         self.offline = False                             # no image URL fetch or MCP subprocess in strict local mode
         self.telemetry_key = ""                         # optional read-only key, valid only on /v1/telemetry
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
@@ -7483,6 +7486,11 @@ def make_handler(svc: Service):
             # before the close reaches it, and that request fails with "response ended prematurely" without the
             # server ever reading it (a .NET agent app, 2026-10-03: 25 of ~1000 requests, 1-24 ms after the previous answer).
             self.send_header("Connection", "close")
+            uc = getattr(svc, "update_checker", None)     # 0.4.7: a newer Speedy release, as a header only
+            if uc is not None and str(getattr(self, "path", "")).startswith(("/v1", "/health", "/api", "/speedy")):
+                v = uc.update_available()
+                if v:
+                    self.send_header("X-Speedy-Update", v)
             super().end_headers()
 
         def _watch_client(self, cancel: threading.Event) -> None:
@@ -7897,7 +7905,9 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
-                                 "loaded": svc.loaded(), "service": "strata"})
+                                 "loaded": svc.loaded(), "service": "strata", "speedy": speedy_version_info(svc)})
+            elif path == "/speedy/version":
+                self._json(200, speedy_version_info(svc))
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
                 f = svc.images.file(path[len("/v1/images/files/"):]) if svc.images is not None else None
@@ -9013,7 +9023,18 @@ def origin_allowed(origin: str, host, names, origins=()) -> bool:
     return bool(name) and (name in LOOPBACK_NAMES or name.endswith(".localhost") or _name_in(name, names))
 
 
+def speedy_version_info(svc) -> dict:
+    """GET /speedy/version and /health's "speedy": the running release and the last update check (never a fetch)."""
+    uc = getattr(svc, "update_checker", None)
+    if uc is None:
+        return {"current": SPEEDY_VERSION, "latest": None, "update_available": False, "url": None,
+                "notes_excerpt": None, "check_enabled": False}
+    return uc.status()
+
+
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
+    if getattr(svc, "update_checker", None) is None and update_check.enabled() and not getattr(svc, "offline", False):
+        svc.update_checker = update_check.UpdateChecker()   # started after "ready:" so it never delays serving
     svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
     svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
@@ -9546,7 +9567,30 @@ def tool_call_recovery_setting(cfg: dict) -> bool:
     return recovery
 
 
+def arm_faulthandler(env=None, stream=None) -> bool:
+    """Strata #5921: a native crash in the server process (a C extension, a segfault, an abort) prints the Python stack
+    of every thread to stderr before the process dies; on POSIX, SIGUSR1 prints them without stopping it (a hang).
+    STRATA_NO_FAULTHANDLER=1 turns it off.  No cost while nothing crashes; the exit code is unchanged."""
+    import faulthandler
+    env = os.environ if env is None else env
+    if str(env.get("STRATA_NO_FAULTHANDLER", "")).strip() not in ("", "0"):
+        return False
+    stream = stream or sys.stderr
+    try:
+        stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        return False                                   # no real stderr (pythonw, a redirected test stream)
+    faulthandler.enable(file=stream, all_threads=True)
+    if hasattr(signal, "SIGUSR1"):
+        try:
+            faulthandler.register(signal.SIGUSR1, file=stream, all_threads=True, chain=False)
+        except (RuntimeError, ValueError):
+            pass
+    return True
+
+
 def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> int:
+    arm_faulthandler()
     try:                                               # files made by a run as administrator still belong to the user
         from strata_control import private_files as _pf
         _pf.adopt_user_defaults()
@@ -10092,6 +10136,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''})", flush=True)
     print(f"       open http://{here}:{bound_port}/ in a browser to chat; close this window to stop the model", flush=True)
+    if getattr(svc, "update_checker", None) is not None:
+        svc.update_checker.start()                     # 0.4.7: background release check; logs a notice if newer
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         # issue #26: reachable from other devices - say at which address, and what can still block it
         ips = [f"[{a.host}]"] if ":" in a.host and a.host != "::" else [] if a.host == "::" else lan_addresses()

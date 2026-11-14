@@ -113,3 +113,5 @@ data/local/
 *.pem
 api_key*
 clients.json
+.speedy-update/
+engine-v*/
