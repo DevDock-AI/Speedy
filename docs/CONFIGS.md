@@ -44,7 +44,31 @@ repeating them pins them on an upstream binary or under `STRATA_UPSTREAM_DEFAULT
 `STRATA_ATTN_DAILY=1`, `STRATA_VERIFY_DEFER_CPU=1` + `_BELOW=0.1`, `STRATA_PROMPT_ATTN_IMMA=1`, `STRATA_KV_PREFETCH=1`,
 `STRATA_PF_GROUP_SCRATCH=1`, `STRATA_PF_HC_REGION=1`.
 
-Sampling (Qwen's recommendation): temperature 0.6, top-p 0.95, top-k 20, min-p 0, presence penalty 1.5.
+Sampling in `configs/generic` (Qwen's recommendation, the `sampling` block): temperature 0.6, top-p 0.95, top-k 20, min-p 0, presence penalty 1.5.
+
+## Default sampling (0.4.8)
+Server-side defaults fill only the sampling fields a request leaves out; a field the client sends always wins, and an
+explicit `"temperature": 0` stays greedy (defaulted penalties are then not applied either). Set it with
+`STRATA_DEFAULT_SAMPLING` (env, wins) or the config key `"default_sampling"`:
+- `"on"`: temperature 0.33, top_k 20, top_p 1.0 (off), min_p 0.08, repetition_penalty 1.0, presence_penalty 0.06.
+  Measured against greedy: same tool-call and coding pass rate, faster decode at long context (higher MTP acceptance).
+  All presets under `configs/cards/` use it.
+- `"off"` (or `false`): no server defaults and no model-card defaults; absent fields are greedy (the engine default).
+- an object of fields (JSON in the env), e.g. `STRATA_DEFAULT_SAMPLING='{"temperature":0.5,"top_k":40}'`.
+
+Without either, the older `sampling` block applies as before (then the model card's values). The active defaults are
+logged once at start and reported in `GET /speedy/version` and `/health` (`"speedy"."default_sampling"`); a request that gets any defaulted field logs `[strata] default sampling for this request: ...`. Benchmarks
+that need greedy should send `"temperature": 0` explicitly.
+
+## Default reasoning effort (0.4.8)
+The server's thinking level for requests that name none: `STRATA_DEFAULT_REASONING_EFFORT` (env, wins) or the config
+key `"default_reasoning_effort"` (the older `"reasoning_effort"` key still works and is read after it): `low`,
+`medium`, `high`, `max`, or `off` (thinking off by default). The client always wins: a request with its own
+`reasoning_effort` / `reasoning`, `chat_template_kwargs` (`enable_thinking` or `reasoning_effort`), Anthropic
+`thinking` / `output_config`, or `reasoning_budget_tokens` gets no default. The presets under `configs/cards/` set
+`"medium"` (`strata-final-reason-low` keeps `"low"`). Logged once at start and reported in `GET /speedy/version` and
+`/health` (`"speedy"."default_reasoning_effort"`: source and value). The Chat settings shared with other apps still
+come before the server default.
 
 ## Context tiers
 - **Native 229K:** `--max-context 229376` (make_configs `--max-context 229376`). Fits every pack on 10 GB at reserve 700.

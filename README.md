@@ -97,6 +97,24 @@ with MTP. These presets are not in `configs/cards/` yet.
 
 UD-Q4_K_XL 1M preset: a conversation grown to 1.016M tokens kept recall 9/9. Settings: 20 GB card capped at 240 W,
 10 GB card at 280 W, both PCIe 4.0 x16, route prior 1.5, peer-to-peer copies through a patched open NVIDIA kernel driver with BAR1 at 32 GiB / 16 GiB.
+Since the 20 GB card was added, the machine has 144 GB of RAM (7x 16 GB + 1x 32 GB).
+
+### RTX 3080 20 GB (one card)
+
+The 20 GB card alone, same four tests as above on the 0.4.8 engine, mean of 2 runs. Card capped at 240 W. Presets:
+[`configs/cards/rtx3080-20gb/1x/`](configs/cards/rtx3080-20gb/1x/).
+
+| Quant | Decode short<br>(tok/s) | Decode code<br>(tok/s) | Decode 55K<br>(tok/s) | Decode 110K<br>(tok/s) | Prefill short<br>(tok/s) | Prefill code<br>(tok/s) | Prefill 55K<br>(tok/s) | Prefill 110K<br>(tok/s) |
+|:---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Q2_0** <sub>fastest</sub> | **147** | **168** | **146** | **146** | 1,229 | 837 | 2,703 | 2,421 |
+| **IQ3_S** | **110** | **125** | **127** | **120** | 1,125 | 765 \* | 2,481 | 2,235 |
+| **UD-IQ3_XXS** | **139** | **151** | **142** | **134** | 968 | 603 | 2,725 | 2,489 |
+| **UD-IQ4_XS** <sub>quality</sub> | **142** | **142** | **129** | **125** | 929 | 474 | 2,725 | 2,477 |
+| **UD-Q4_K_XL** <sub>best</sub> | **122** | **121** | **122** | **115** | 729 | 346 | 2,409 | 2,200 |
+
+\* one run: the other run's code-prompt prefill measured 28 tok/s (a measurement fault) and is left out.
+1M tier: all five `-1m` presets ran to a 250K-token prompt without errors; UD-Q4_K_XL 1M passed a greedy recall test at
+about 150K tokens 48/48.
 
 ### Against the starting point
 
@@ -198,6 +216,7 @@ per GPU family: [docs/cards/](docs/cards/README.md).
 |---|---|
 | [`configs/cards/rtx3080-10gb/2x/`](configs/cards/rtx3080-10gb/2x/) | `strata-<quant>-2gpu-pw2.json` (229K native) for Q2_0, IQ3_S, UD-IQ4_XS, UD-Q4_K_XL; `strata-<quant>-1m-2gpu.json` (1M tier) for Q2_0, IQ3_S, UD-Q4_K_XL; `llama-swap.yaml` |
 | [`configs/cards/rtx3080-10gb/1x/`](configs/cards/rtx3080-10gb/1x/) | the single-GPU production presets, plus `llama-swap.yaml` |
+| [`configs/cards/rtx3080-20gb/1x/`](configs/cards/rtx3080-20gb/1x/) | one RTX 3080 20 GB: every quant at 229K (`strata-<quant>.json`) and 1M (`strata-<quant>-1m.json`) |
 | [`configs/cards/rtx3080-10gb/2x/parallel2/`](configs/cards/rtx3080-10gb/2x/parallel2/) | `"parallel": 2` variants (two requests decoded together). **Slower on 2× 10 GB**, see below |
 
 The key two-GPU settings are:
@@ -214,6 +233,13 @@ What every flag does: [docs/CONFIGS.md](docs/CONFIGS.md). Built-in defaults: [do
 expert-cache VRAM. It may pay off on larger cards.
 
 ## Updates
+
+**Default sampling (0.4.8):** the server fills the sampling fields a request leaves out with temperature 0.33, top_k 20,
+min_p 0.08, presence_penalty 0.06 (`"default_sampling": "on"` in the card presets): the same tool-call and coding pass
+rate as greedy in our tests, with faster decode at long context. Anything the client sends wins, and
+`"temperature": 0` is still greedy. `STRATA_DEFAULT_SAMPLING=off` turns it off, or give your own JSON; see
+[docs/CONFIGS.md](docs/CONFIGS.md#default-sampling-048). Requests that name no reasoning effort get a server default (`medium` in the card presets;
+`STRATA_DEFAULT_REASONING_EFFORT`, see [docs/CONFIGS.md](docs/CONFIGS.md#default-reasoning-effort-048)).
 
 At start and then every 3 hours the server checks in the background (never delaying a request) for a newer release:
 one anonymous request to `api.github.com/repos/DevDock-AI/Speedy/releases/latest`, User-Agent `Speedy/<version>`,

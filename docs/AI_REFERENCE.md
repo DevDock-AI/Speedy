@@ -15,7 +15,7 @@ holds the technical context behind the short [README](../README.md). Use [AI_SET
   graphics card on first start, or installs a file the user already has. The Mac dmg keeps its Metal engine inside.
   The Terminal's `strata launch` downloads the appropriate engine and model.
   See [installation](INSTALL.md) and [Terminal launch](TERMINAL_LAUNCH.md).
-- Strata's code is MIT licensed. Model weights and third-party components have separate licenses.
+- Speedy's own code is under the Speedy Personal & Non-Commercial License (LICENSE); code from Strata is MIT (licenses/Strata-MIT.txt). Model weights and third-party components have separate licenses.
   See [LICENSE](../LICENSE) and [component/model licensing](HOW_IT_WORKS.md#license).
 - Local inference does not mean every feature is offline. Downloads, updates, remote tools and user-enabled
   network access have separate behavior. Use [SAFETY.md](SAFETY.md) for privacy and network claims.

@@ -62,14 +62,8 @@
   "port": 8080,
   "gpu": 0,
   "gpus_asked": true,
-  "sampling": {
-    "temperature": 0.6,
-    "top_p": 0.95,
-    "top_k": 20,
-    "min_p": 0,
-    "presence_penalty": 0
-  },
-  "reasoning_effort": "medium",
+  "default_sampling": "on",
+  "default_reasoning_effort": "medium",
   "env": {
     "STRATA_TOOLCALL_REPAIR": "1",
     "STRATA_UPSTREAM_DEFAULTS": "1",

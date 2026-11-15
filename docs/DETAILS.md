@@ -1767,7 +1767,7 @@ The full story, with measurements, bottlenecks and what comes next: **[docs/pape
 
 ## Credits and licenses
 
-Strata itself: [MIT](../LICENSE). The model files are not part of it; their licenses apply to them.
+Strata itself: MIT ([licenses/Strata-MIT.txt](../licenses/Strata-MIT.txt)); Speedy's own code: Personal & Non-Commercial ([LICENSE](../LICENSE)). The model files are not part of it; their licenses apply to them.
 
 - Model: [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team; quantizations:
   [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF). The Coder:
