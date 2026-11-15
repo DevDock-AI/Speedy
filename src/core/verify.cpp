@@ -1471,6 +1471,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // hit_out (no copy_rows_from_mapped / moe_hit_add launches) and applies the shared gate, which rides in the router
     // GEMV - bitwise the launches it replaces
     static const bool g_cfuse = [] { const char* v = std::getenv("STRATA_COMBINE_CPU"); return v != nullptr && v[0] == '1'; }();
+    static const bool g_dhfuse = [] {
+        const char* v = std::getenv("STRATA_DEFER_HITS_FUSE");
+        const bool on = v != nullptr && v[0] == '1';
+        if (on) std::fprintf(stderr, "strata: STRATA_DEFER_HITS_FUSE=1: deferred layers fold moe_hit_add into the row copy\n");
+        return on;
+    }();
     static const bool g_wait_fuse = [] { const char* v = std::getenv("STRATA_WAIT_FUSE"); return v != nullptr && v[0] == '1'; }();
     auto cfuse_on = [&](int n) {
         return g_cfuse && !ar_on() && !device_plan_ && !remote_opt_ && peer_rows_ == nullptr && K == 10 &&
@@ -2627,6 +2633,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         };
         bool hits_in_combine = false;
+        bool hits_fused = false;   // STRATA_DEFER_HITS_FUSE: the deferred copy wrote the hit rows
         if (tp_gpu_only_) {   // TP by id: this card's hits into zeroed rows, the combine with its half of the shared expert, the all-reduce
             // STRATA_TP_NOMEMSET=1: no memset - the combine reads only the rows this card's experts wrote (the plan's
             // dst[0, counts[1])) and 0.0f for the rest: bitwise the same sums (native_moe_combine_multi_rows).  =2: both, and
@@ -2707,9 +2714,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (heavy) wait_flag_ge(m_pflag_, ring, cs);   // STRATA_VERIFY_DEFER_CPU_BELOW: the heavy rows (waitCPU)
                 stamp(l, 23, grp);   // (no split, no wait: the zeroing counts as copy+combine, as the copy it replaces)
 #if !defined(STRATA_GPU_METAL)   // (as late_add's defer_add_rows)
-                if (heavy)
+                // STRATA_DEFER_HITS_FUSE=1 (opt-in, bitwise): the GPU's hit rows written by this copy (0.0f + hit), so the
+                // moe_hit_add launch below is skipped - one graph node fewer per deferred layer and group
+                hits_fused = g_dhfuse && !prof_on_ && !remote_opt_ && !fuse_hits_on() && (N & 3) == 0;
+                if (heavy || hits_fused)
                     copy_rows_by_weight(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N, p_dst, p_counts + 1,
-                                        w_ + tb * K, defer_heavy_, true, cs);
+                                        w_ + tb * K, heavy ? defer_heavy_ : INFINITY, true, cs,
+                                        hits_fused ? hit_out : nullptr);
                 else
                     fill_zero(parts_out, (long long) n * K * N, cs);
 #endif
@@ -2754,7 +2765,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             hits_in_combine = !cfuse_on(n) && fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 &&
                               native_moe_combine_enabled() && n <= 8 &&
                               native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
-            if (!cfuse_on(n) && !hits_in_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
+            if (!cfuse_on(n) && !hits_in_combine && !hits_fused) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
         }
         // Same condition as `sh_fork` above, which is per group and out of scope here: wait only when the fork
         // actually ran (a wait on an event never recorded is a no-op, but saying it outright reads better).

@@ -1,7 +1,8 @@
 Speedy
 Copyright (c) 2026 Niko1221 and the Strata contributors
 Copyright (c) 2026 the Speedy contributors (changes in this fork)
-Licensed under the MIT License (see LICENSE).
+Speedy's own code is licensed under the Speedy Personal & Non-Commercial License v1.0 (see LICENSE).
+Code taken from Strata stays under the MIT License (see licenses/Strata-MIT.txt).
 
 Speedy is a fork of Strata (https://github.com/Niko1221/Strata, MIT, (c) Niko1221 and the Strata contributors),
 based on Strata v0.2.7.1 (upstream commit 46c152a1). All of Strata's files keep that copyright. Code under

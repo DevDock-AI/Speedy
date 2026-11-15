@@ -47,14 +47,8 @@
   "gpu": 0,
   "gpus_asked": true,
   "draft_vocab": "en",
-  "sampling": {
-    "temperature": 0.6,
-    "top_p": 0.95,
-    "top_k": 20,
-    "min_p": 0,
-    "presence_penalty": 1.5
-  },
-  "reasoning_effort": "low",
+  "default_sampling": "on",
+  "default_reasoning_effort": "low",
   "env": {
     "STRATA_TOOLCALL_REPAIR": "1",
     "STRATA_ROUTE_TAIL_SKIP": "0",

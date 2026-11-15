@@ -4286,6 +4286,7 @@ class Service:
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
+        self.default_sampling_source = "none"         # resolve_default_sampling: env / config / sampling / off / none
         self.model_arch = None                        # the config's family ("qwen4exp", "qwen35moe"): None = no model-card defaults
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
@@ -4972,7 +4973,8 @@ class Service:
         req = dict(req)
         if "max_tokens" in s and not req.get("max_tokens") and not req.get("max_completion_tokens"):
             req["max_tokens"] = s["max_tokens"]
-        if effort:
+        if effort and req.get("reasoning_budget_tokens") in (None, "") and \
+                req.get("thinking_budget_tokens") in (None, ""):    # a request's own budget: no default effort
             if api == "openai":
                 ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
                 if req.get("reasoning_effort") in (None, "") and not req.get("reasoning") and \
@@ -5903,10 +5905,16 @@ class Service:
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
-        defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
-        if defaults:                   # the request's own fields win (explicit 0 stays greedy)
-            req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
-            sampling = {**defaults, **req_values}
+        card = {} if self.default_sampling_source == "off" else model_card_sampling(self.model_arch, thinking)
+        defaults = {**card, **self.sampling_defaults, **self.shared}
+        if defaults:                   # per field, the request's own fields win (explicit 0 stays greedy)
+            asked = {k for k, v in (sampling or {}).items() if v is not None}
+            sampling = merge_default_sampling(defaults, sampling)
+            filled = [k for k in SAMPLING_FIELDS if k in sampling and k not in asked]
+            greedy = not (isinstance(sampling.get("temperature"), (int, float)) and sampling["temperature"] > 0)
+            if filled and not greedy and self.default_sampling_source in ("env", "config"):
+                print("[strata] default sampling for this request: "
+                      + " ".join(f"{k}={sampling[k]}" for k in filled), flush=True)
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
@@ -7938,7 +7946,10 @@ def make_handler(svc: Service):
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
                     loaded = svc.loaded()
-                    model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
+                    # OpenAI compatibility: strict clients require "created" (unix time) and "owned_by"
+                    created = int(getattr(svc, "started_at", 0) or time.time())
+                    model = {"id": svc.model, "object": "model", "created": created, "owned_by": "speedy",
+                             "status": {"value": "loaded"},
                              "meta": {"n_ctx": svc.reported_ctx()},
                              "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
                                               "output_modalities": ["text"]}}
@@ -7950,7 +7961,8 @@ def make_handler(svc: Service):
                     data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
                     data = data if loaded else []
                     if svc.images is not None:            # the image model: POST /v1/images/generations
-                        data.append({"id": svc.images.model, "object": "model", "status": {"value": "loaded"},
+                        data.append({"id": svc.images.model, "object": "model", "created": created,
+                                     "owned_by": "speedy", "status": {"value": "loaded"},
                                      "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}})
                     self._json(200, {"object": "list", "data": data})
             elif path == "/props":
@@ -8210,7 +8222,8 @@ def make_handler(svc: Service):
             if not svc.loaded() and not getattr(svc.engine, "unloaded", False):
                 self._json(503, {"error": {"message": "the engine is not running"}})
                 return
-            defaults = {**model_card_sampling(svc.model_arch, True), **svc.sampling_defaults, **svc.shared}
+            card = {} if svc.default_sampling_source == "off" else model_card_sampling(svc.model_arch, True)
+            defaults = {**card, **svc.sampling_defaults, **svc.shared}
             names = {"repetition_penalty": "repeat_penalty", "penalty_last_n": "repeat_last_n"}
             params = {names.get(k, k): v for k, v in defaults.items()
                       if k in ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
@@ -9027,9 +9040,18 @@ def speedy_version_info(svc) -> dict:
     """GET /speedy/version and /health's "speedy": the running release and the last update check (never a fetch)."""
     uc = getattr(svc, "update_checker", None)
     if uc is None:
-        return {"current": SPEEDY_VERSION, "latest": None, "update_available": False, "url": None,
-                "notes_excerpt": None, "check_enabled": False}
-    return uc.status()
+        out = {"current": SPEEDY_VERSION, "latest": None, "update_available": False, "url": None,
+               "notes_excerpt": None, "check_enabled": False}
+    else:
+        out = dict(uc.status())
+    source = getattr(svc, "default_sampling_source", "none")
+    out["default_sampling"] = {"source": source, "values": {} if source == "off" else
+                               {k: v for k, v in (getattr(svc, "sampling_defaults", None) or {}).items()
+                                if k in SAMPLING_FIELDS}}
+    effort = getattr(svc, "config_effort", None)
+    out["default_reasoning_effort"] = {"source": getattr(svc, "default_effort_source", "none"),
+                                       "value": "off" if effort == "none" else effort}
+    return out
 
 
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
@@ -9282,6 +9304,83 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
         else:
             print(f"[strata] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
     return out
+
+
+# 0.4.8: server-side default sampling.  The values below were checked against greedy on the reference machine (same
+# tool-call and coding pass rate, higher MTP acceptance so faster decode at long context).  They fill only the fields a
+# request leaves out; anything the client sends wins, and an explicit temperature 0 stays greedy.
+DEFAULT_SAMPLING_ON = {"temperature": 0.33, "top_k": 20, "top_p": 1.0, "min_p": 0.08,
+                       "repetition_penalty": 1.0, "presence_penalty": 0.06}
+SAMPLING_FIELDS = ("temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",
+                   "repetition_penalty", "penalty_last_n", "seed")
+PENALTY_FIELDS = ("repetition_penalty", "presence_penalty", "frequency_penalty", "penalty_last_n")
+_OFF_WORDS = ("off", "0", "false", "no", "none", "greedy")
+_ON_WORDS = ("on", "1", "true", "yes", "default", "recommended")
+
+
+def resolve_default_sampling(cfg: dict, env=None) -> tuple[dict, str]:
+    """The sampling defaults for fields a request leaves out, and where they came from ("env", "config", "sampling",
+    "off" or "none").  Order: env STRATA_DEFAULT_SAMPLING, then the config's "default_sampling", then the older
+    `sampling` block.  Each of the first two takes "on" (DEFAULT_SAMPLING_ON), "off" (no server defaults and no
+    model-card defaults: an absent field is greedy) or an object of fields (JSON in the env).  Non-sampling keys of
+    the `sampling` block (strata_tune, experimental_speed_projection) are kept in every case."""
+    env = os.environ if env is None else env
+    block = sampling_defaults_from_config(cfg)
+    extra = {k: v for k, v in block.items() if k not in SAMPLING_FIELDS}
+    raw, source = (env.get("STRATA_DEFAULT_SAMPLING") or "").strip() or None, "env"
+    if raw is None:
+        raw, source = cfg.get("default_sampling"), "config"
+    if raw is None:
+        return block, ("sampling" if len(block) > len(extra) else "none")
+    if raw is False or (isinstance(raw, str) and raw.strip().lower() in _OFF_WORDS):
+        return extra, "off"
+    if raw is True or (isinstance(raw, str) and raw.strip().lower() in _ON_WORDS):
+        return {**extra, **DEFAULT_SAMPLING_ON}, source
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = None
+    if not isinstance(raw, dict) or any(k not in SAMPLING_FIELDS and k not in SAMPLING_ALIASES for k in raw):
+        raise SystemExit(f"[strata] {'STRATA_DEFAULT_SAMPLING' if source == 'env' else 'config default_sampling'}: "
+                         f"expected on, off or an object of sampling fields ({', '.join(SAMPLING_FIELDS)})")
+    return {**extra, **sampling_defaults_from_config({"sampling": raw})}, source
+
+
+DEFAULT_EFFORT_LEVELS = {"none": "none", "off": "none", "low": "low", "medium": "medium", "high": "high",
+                         "max": "max"}
+
+
+def resolve_default_effort(cfg: dict, env=None) -> tuple[str | None, str]:
+    """The server's default reasoning effort and where it came from (env / config / off / none).  Order: env
+    STRATA_DEFAULT_REASONING_EFFORT, then the config's "default_reasoning_effort", then its older "reasoning_effort"
+    (#1641).  Levels: low, medium, high, max, or off/none (thinking off by default).  It only fills requests that name
+    no effort, thinking block or template kwargs of their own: the client always wins (Service.with_shared)."""
+    env = os.environ if env is None else env
+    raw, source = (env.get("STRATA_DEFAULT_REASONING_EFFORT") or "").strip() or None, "env"
+    if raw is None:
+        raw, source = cfg.get("default_reasoning_effort"), "config"
+    if raw is None:
+        raw, source = cfg.get("reasoning_effort"), "config"
+    if raw is None or raw == "":
+        return None, "none"
+    level = DEFAULT_EFFORT_LEVELS.get(str(raw).strip().lower())
+    if level is None:
+        name = "STRATA_DEFAULT_REASONING_EFFORT" if source == "env" else "config default_reasoning_effort"
+        raise SystemExit(f"[strata] {name}: {raw!r}: expected low, medium, high, max or off")
+    return level, ("off" if level == "none" else source)
+
+
+def merge_default_sampling(defaults: dict, sampling) -> dict:
+    """Per field: the request's own non-null fields win over `defaults`.  A request that asks for temperature <= 0
+    (greedy) gets no defaulted penalty, since a penalty changes even the greedy pick; its own penalties still apply."""
+    req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
+    if not defaults:
+        return dict(sampling or {})
+    t = req_values.get("temperature")
+    if isinstance(t, (int, float)) and not isinstance(t, bool) and t <= 0:
+        defaults = {k: v for k, v in defaults.items() if k not in PENALTY_FIELDS}
+    return {**defaults, **req_values}
 
 
 def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: list[str], lazy: bool,
@@ -9831,10 +9930,13 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         # missing shard or a plugin would break the promise the flag makes.
         env = child_env(cfg, offline=a.offline)
         configure_batch_telemetry_env(env, cfg, a.batch_telemetry)
-        sampling_defaults = sampling_defaults_from_config(cfg)
-        if sampling_defaults:
+        sampling_defaults, default_sampling_source = resolve_default_sampling(cfg)
+        if default_sampling_source == "off":
+            print("[strata] default sampling: off (fields a request leaves out are greedy)", flush=True)
+        elif sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
-            print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
+            print(f"[strata] default sampling ({default_sampling_source}): {pretty} "
+                  "(only for fields a request leaves out; STRATA_DEFAULT_SAMPLING=off turns it off)", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
         for line in card_roles_lines(cfg):             # the card roles: said first; every card Off stops here, before anything touches a card
             print(line, flush=True)
@@ -9925,6 +10027,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             "Thinking about it.</think>\n\nHello from the mock engine."],
             cycle=getattr(a, "script_cycle", False),
             delay_s=getattr(a, "script_delay", 0.0) or 0.0), None, {}
+        default_sampling_source = "none"
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
     if (cfg.get("arch") or "") == "deepseek41":
@@ -9938,6 +10041,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
     svc.launch_attestation = launch_attestation
+    svc.default_sampling_source = default_sampling_source
     if (cfg.get("arch") or "") == "deepseek41" and vision is None and a.engine == "strata":
         # DeepSeek-V4.1 reads pictures with the engine's own tower (--vision on, the default): no separate reader process.
         # `--vision off` in the config's args, or a pack without a tower, leaves svc.vision None: pictures are refused with the 400 as before.
@@ -9989,14 +10093,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         raise SystemExit(f"[strata] config \"prevent_sleep\" must be true or false, not {cfg['prevent_sleep']!r}")
     from serve.keepawake import KeepAwake
     svc.keep_awake = KeepAwake.create(cfg.get("prevent_sleep") is True)      # #1727: opt-in, Windows only
-    if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none
-        try:
-            svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}).get("reasoning_effort")
-        except ValueError as e:
-            raise SystemExit(f"[strata] config {e}")
-        if svc.config_effort:
-            print(f"[strata] thinking level: {svc.config_effort} (reasoning_effort in the config; a request, or the "
-                  "Chat settings shared with other apps, can set its own)", flush=True)
+    svc.config_effort, svc.default_effort_source = resolve_default_effort(cfg)   # #1641 + 0.4.8 server default
+    if svc.config_effort:
+        print(f"[strata] default reasoning effort ({svc.default_effort_source}): {svc.config_effort} (used only when a "
+              "request names no effort or thinking budget; a request, or the Chat settings shared with other apps, "
+              "can set its own)", flush=True)
     svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default
     svc.codex_compaction_cache = cfg.get("codex_compaction_cache") is True   # #924: opt-in, off by default
     svc.canonical_tools = canonical_tools_setting(cfg)  # opt-in: tools rendered in a canonical order

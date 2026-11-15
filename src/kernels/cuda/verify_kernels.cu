@@ -1643,18 +1643,28 @@ namespace {
 // copy_rows_from_mapped_kernel (elementwise.cu) with the routing weight's test: block = row
 __global__ void copy_rows_by_weight_kernel(float4* __restrict__ dst, const volatile float4* src, int64_t row4,
                                            const int32_t* __restrict__ hit_rows, const int32_t* __restrict__ count,
-                                           const float* __restrict__ w, float heavy, int take_heavy) {
+                                           const float* __restrict__ w, float heavy, int take_heavy,
+                                           const float4* __restrict__ hit_out) {
     const int row = blockIdx.x;
-    __shared__ int take;
+    __shared__ int take, hit_row;
     if (threadIdx.x == 0) {
         int h = 0;
         const int c = *count;
         for (int i = 0; i < c; ++i) h |= hit_rows[i] == row;
         take = !h && ((w[row] >= heavy ? 1 : 0) == take_heavy);
+        hit_row = h;
     }
     __syncthreads();
     float4* d = dst + (int64_t) row * row4;
-    if (!take) {
+    if (!take && hit_out != nullptr && hit_row) {
+        // STRATA_DEFER_HITS_FUSE: the GPU's own row, zeroed and then moe_hit_add'ed in one step (0.0f + hit, the same
+        // rounding as the two launches it replaces)
+        const float4* hr = hit_out + (int64_t) row * row4;
+        for (int64_t i = threadIdx.x; i < row4; i += blockDim.x) {
+            const float4 v = hr[i];
+            d[i] = make_float4(0.0f + v.x, 0.0f + v.y, 0.0f + v.z, 0.0f + v.w);
+        }
+    } else if (!take) {
         for (int64_t i = threadIdx.x; i < row4; i += blockDim.x) d[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     } else {
         const volatile float4* sr = src + (int64_t) row * row4;
@@ -1663,14 +1673,16 @@ __global__ void copy_rows_by_weight_kernel(float4* __restrict__ dst, const volat
 }
 }  // namespace
 void copy_rows_by_weight(float* dst, const float* src, int64_t rows, int64_t width, const int32_t* hit_rows,
-                         const int32_t* count, const float* w, float heavy, bool take_heavy, void* stream) {
+                         const int32_t* count, const float* w, float heavy, bool take_heavy, void* stream,
+                         const float* hit_out) {
     if (rows <= 0) return;
-    if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+    if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0 || ((uintptr_t) hit_out & 15) != 0) {
         std::fprintf(stderr, "copy_rows_by_weight: width must be a multiple of 4 and both pointers 16-byte aligned\n");
         std::exit(1);
     }
     copy_rows_by_weight_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>(
-        (float4*) dst, (const volatile float4*) src, width / 4, hit_rows, count, w, heavy, take_heavy ? 1 : 0);
+        (float4*) dst, (const volatile float4*) src, width / 4, hit_rows, count, w, heavy, take_heavy ? 1 : 0,
+        (const float4*) hit_out);
     check("copy_rows_by_weight");
 }
 void defer_add_rows(const float* parts, const float* w, const float* inject, float* R, int64_t n_embd, int k, int hc,

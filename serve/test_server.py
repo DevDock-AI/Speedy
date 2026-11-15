@@ -3529,6 +3529,8 @@ class WebApp(unittest.TestCase):
                     model = models[0]
                     self.assertEqual(model["id"], svc.model)
                     self.assertEqual(model["status"]["value"], "loaded")
+                    self.assertIsInstance(model["created"], int)   # OpenAI compatibility
+                    self.assertEqual(model["owned_by"], "speedy")
                     self.assertEqual(model["meta"]["n_ctx"], 262144)
                     self.assertEqual(model["architecture"]["input_modalities"],
                                      ["text", "image"] if vision else ["text"])

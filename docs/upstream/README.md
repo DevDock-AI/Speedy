@@ -186,7 +186,7 @@ Run **`strata connect`** to see setup instructions for your tool. [Connection gu
 
 <a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee: support Strata" height="48"></a>
 
-[MIT license](../../LICENSE) · [Credits and model licenses](../../docs/HOW_IT_WORKS.md#credits) · [Privacy](../../docs/SAFETY.md)
+[MIT license](../../licenses/Strata-MIT.txt) · [Credits and model licenses](../../docs/HOW_IT_WORKS.md#credits) · [Privacy](../../docs/SAFETY.md)
 
 <a id="option-c-let-your-ai-set-it-up"></a>
 
