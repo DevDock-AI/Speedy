@@ -50,6 +50,14 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_FUSE_DECODE", "1"},         // -1.3
             {"STRATA_GR_UP75", "1"},             // -1.2
         };
+    } else if (mj == 12 && mn == 0) {
+        // RTX 50 (sm_120): NVFP4 prompt experts on the FP4 tensor cores (W4A4, mmq_nvfp4_w4a4.cu, the one unit built for
+        // 120a).  Experimental on RTX 50, community results welcome: we have no sm_120 card, so it is not measured here;
+        // the same path is the measured default on GB10 (row below).  STRATA_NVFP4_PROMPT=0 (or STRATA_DEFAULTS=026)
+        // leaves the W4A8 default; it only touches NVFP4 experts, and a build without a 120a image falls back to W4A8
+        // at run time (fp4_activations).  No other architecture reads STRATA_NVFP4_PROMPT.
+        if (off("STRATA_NVFP4_PROMPT") || defaults026) return t;
+        t = {{"STRATA_PREFILL_NVFP4", "w4a4"}};
     } else if (mj == 12 && mn == 1) {
         // GB10 (NVIDIA DGX Spark, 48 SMs, unified memory): only what was measured on that part goes in.  New in 0.2.7.1, so
         // STRATA_DEFAULTS=026 (the master switch of everything since 0.2.6) leaves the table out, like STRATA_SM121_PERF=0.
@@ -94,12 +102,14 @@ std::vector<std::string> apply_nv_defaults(int major, int minor) {
     if (!set.empty()) {
         const bool sm86 = mj == 8;
         const bool sm121 = mj == 12 && mn == 1;
+        const bool sm120 = mj == 12 && mn == 0;
         // sm_86 / sm_60: bit-exact switches.  sm_121: the fused prompt path and the FP4-activation NVFP4 prompt round differently from the
         // paths they replace (24 of 24 greedy answers were identical on the Spark; no KL run), so the line does not say "exact".
         std::fprintf(stderr, "strata: %s: %zu %sspeed switches on by default (%s=0 turns them off%s; a switch you set is kept): ",
-                     sm86 ? "sm_86 (Ampere)" : sm121 ? "sm_121 (GB10)" : "sm_60 (Pascal)", set.size(), sm121 ? "" : "exact ",
-                     sm86 ? "STRATA_SM86_PERF" : sm121 ? "STRATA_SM121_PERF" : "STRATA_SM60_PERF",
-                     sm121 ? ", as does STRATA_DEFAULTS=026" : "");
+                     sm86 ? "sm_86 (Ampere)" : sm121 ? "sm_121 (GB10)" : sm120 ? "sm_120 (RTX 50, experimental)" : "sm_60 (Pascal)",
+                     set.size(), (sm121 || sm120) ? "" : "exact ",
+                     sm86 ? "STRATA_SM86_PERF" : sm121 ? "STRATA_SM121_PERF" : sm120 ? "STRATA_NVFP4_PROMPT" : "STRATA_SM60_PERF",
+                     (sm121 || sm120) ? ", as does STRATA_DEFAULTS=026" : "");
         for (size_t i = 0; i < set.size(); ++i) std::fprintf(stderr, "%s%s", i ? " " : "", set[i].c_str() + 7);
         std::fprintf(stderr, "\n");
     }

@@ -110,6 +110,14 @@ against a 120a build) falls back to `w4a8` with a note.
 `w4a8` is the default. It is 4.5x closer to the reference than `w4a4`, at 86% of its speed, and it is the precision every
 generated token already runs at. `fp16` is the choice when the prompt must be read exactly.
 
+**RTX 50 (sm_120): `w4a4` on by default, experimental, community results welcome.** On a GeForce Blackwell card the
+engine sets `STRATA_PREFILL_NVFP4=w4a4` at start (the same way the GB10 table does), so NVFP4 prompt experts run on the
+FP4 tensor cores. It changes nothing else: only NVFP4 experts take this path, other quants and every other architecture
+(RTX 30/40, sm_121, sm_100) are untouched, and a build without a `120a` image falls back to `w4a8` at run time. We have
+no sm_120 card, so this default is not measured by us; the KL row above is the price (about 4x `w4a8`'s KL for ~16%
+more prompt speed). `STRATA_NVFP4_PROMPT=0` (or `STRATA_DEFAULTS=026`) keeps `w4a8`; an explicit
+`STRATA_PREFILL_NVFP4` always wins. Please report prompt tok/s at 4K/16K and any quality difference with it on and off.
+
 `STRATA_DUMP_MOE_INPUT` with `mmq_nvfp4_parity --real` tests one product on a real prompt's rows: layer 20, its 12
 busiest experts, max|x|/rms 4 median and 9 at most.
 

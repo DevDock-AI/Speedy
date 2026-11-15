@@ -53,8 +53,27 @@ int main() {
     put("STRATA_SM121_PERF", "1");
     CHECK(nv_default_env(12, 1, false).size() == 4);
     unset("STRATA_SM121_PERF");
-    // the other cards: sm_120 (RTX 50) and sm_100 get nothing from this file; the sm_86 / sm_60 tables are unchanged by the flag
+    // the other cards: sm_100 gets nothing from this file; the sm_86 / sm_60 tables are unchanged by the flag
+    // sm_120 (RTX 50): only the NVFP4 FP4 prompt switch, auto on; STRATA_NVFP4_PROMPT=0 or STRATA_DEFAULTS=026 empties it
+    unset("STRATA_NVFP4_PROMPT");
+    {
+        const auto t = nv_default_env(12, 0, false);
+        CHECK(t.size() == 1);
+        CHECK(find(t, "STRATA_PREFILL_NVFP4") && *find(t, "STRATA_PREFILL_NVFP4") == "w4a4");
+    }
+    CHECK(nv_default_env(12, 0, true).empty());
+    put("STRATA_NVFP4_PROMPT", "0");
     CHECK(nv_default_env(12, 0, false).empty());
+    put("STRATA_NVFP4_PROMPT", "auto");
+    CHECK(nv_default_env(12, 0, false).size() == 1);
+    // the flag never reaches another architecture: sm_86 / sm_89 / sm_121 tables are the same with it on or off
+    put("STRATA_NVFP4_PROMPT", "1");
+    const auto a86on = nv_default_env(8, 6, false), a121on = nv_default_env(12, 1, false);
+    CHECK(nv_default_env(8, 9, false).empty() && nv_default_env(10, 0, false).empty());
+    put("STRATA_NVFP4_PROMPT", "0");
+    CHECK(a86on == nv_default_env(8, 6, false) && a121on == nv_default_env(12, 1, false));
+    CHECK(!find(a86on, "STRATA_PREFILL_NVFP4"));
+    unset("STRATA_NVFP4_PROMPT");
     CHECK(nv_default_env(10, 0, false).empty());
     CHECK(nv_default_env(8, 9, false).empty());
     CHECK(nv_default_env(7, 5, false).empty());
