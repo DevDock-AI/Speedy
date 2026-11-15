@@ -50,7 +50,7 @@ Sampling in `configs/generic` (Qwen's recommendation, the `sampling` block): tem
 Server-side defaults fill only the sampling fields a request leaves out; a field the client sends always wins, and an
 explicit `"temperature": 0` stays greedy (defaulted penalties are then not applied either). Set it with
 `STRATA_DEFAULT_SAMPLING` (env, wins) or the config key `"default_sampling"`:
-- `"on"`: temperature 0.33, top_k 20, top_p 1.0 (off), min_p 0.08, repetition_penalty 1.0, presence_penalty 0.06.
+- `"on"`: temperature 0.6, top_k 20, top_p 0.95, min_p 0 (off), repetition_penalty 1.0, presence_penalty 0.
   Measured against greedy: same tool-call and coding pass rate, faster decode at long context (higher MTP acceptance).
   All presets under `configs/cards/` use it.
 - `"off"` (or `false`): no server defaults and no model-card defaults; absent fields are greedy (the engine default).
