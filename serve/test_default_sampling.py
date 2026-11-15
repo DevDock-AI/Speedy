@@ -19,8 +19,8 @@ from serve.server import (DEFAULT_SAMPLING_ON, ByteTokenizer, MockEngine, Servic
                           merge_default_sampling, resolve_default_sampling, serve)
 
 ROOT = Path(__file__).resolve().parents[1]
-ON = {"temperature": 0.33, "top_k": 20, "top_p": 1.0, "min_p": 0.08, "repetition_penalty": 1.0,
-      "presence_penalty": 0.06}
+ON = {"temperature": 0.6, "top_k": 20, "top_p": 0.95, "min_p": 0.0, "repetition_penalty": 1.0,
+      "presence_penalty": 0.0}
 
 
 class Resolve(unittest.TestCase):
@@ -112,11 +112,11 @@ class Routes(unittest.TestCase):
 
     def test_absent_fields_get_defaults(self):
         for keys in (self.chat(), self.anthropic()):
-            self.assertIn("temperature=0.33", keys)
+            self.assertIn("temperature=0.6", keys)
             self.assertIn("top_k=20", keys)
-            self.assertIn("min_p=0.08", keys)
-            self.assertIn("penalty_present=0.06", keys)
-            self.assertNotIn("top_p", keys)                 # 1.0 = off
+            self.assertIn("top_p=0.95", keys)
+            self.assertNotIn("min_p", keys)                 # 0 = off
+            self.assertNotIn("penalty_present", keys)       # 0 = off
             self.assertNotIn("penalty_repeat", keys)        # 1.0 = off
 
     def test_filled_fields_are_logged(self):
@@ -127,7 +127,7 @@ class Routes(unittest.TestCase):
             self.chat(top_k=5)
         line = [x for x in out.getvalue().splitlines() if "default sampling for this request" in x]
         self.assertEqual(len(line), 1)
-        self.assertIn("temperature=0.33", line[0])
+        self.assertIn("temperature=0.6", line[0])
         self.assertNotIn("top_k", line[0])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -145,8 +145,8 @@ class Routes(unittest.TestCase):
                 send()
             line = [x for x in out.getvalue().splitlines() if "default sampling for this request" in x]
             self.assertEqual(len(line), 1, out.getvalue())
-            for field in ("temperature=0.33", "top_k=20", "top_p=1.0", "min_p=0.08",
-                          "repetition_penalty=1.0", "presence_penalty=0.06"):
+            for field in ("temperature=0.6", "top_k=20", "top_p=0.95", "min_p=0.0",
+                          "repetition_penalty=1.0", "presence_penalty=0.0"):
                 self.assertIn(field, line[0])
 
     def test_client_fields_win(self):
@@ -154,7 +154,7 @@ class Routes(unittest.TestCase):
             self.assertIn("temperature=0.9", keys)
             self.assertIn("top_p=0.5", keys)
             self.assertIn("top_k=5", keys)
-            self.assertIn("min_p=0.08", keys)               # the field it left out still defaults
+            self.assertNotIn("min_p", keys)                 # the field it left out defaults to 0 (off)
 
     def test_explicit_temperature_zero_is_greedy(self):
         for keys in (self.chat(temperature=0), self.anthropic(temperature=0)):
@@ -170,7 +170,7 @@ class Routes(unittest.TestCase):
     def test_forced_tool_choice_still_works(self):
         tools = [{"type": "function", "function": {"name": "get", "parameters": {"type": "object", "properties": {}}}}]
         keys = self.chat(tools=tools, tool_choice={"type": "function", "function": {"name": "get"}})
-        self.assertIn("temperature=0.33", keys)
+        self.assertIn("temperature=0.6", keys)
 
     def test_version_and_health_expose_defaults(self):
         for path in ("/speedy/version", "/health"):

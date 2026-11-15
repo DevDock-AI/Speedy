@@ -234,9 +234,9 @@ expert-cache VRAM. It may pay off on larger cards.
 
 ## Updates
 
-**Default sampling (0.4.8):** the server fills the sampling fields a request leaves out with temperature 0.33, top_k 20,
-min_p 0.08, presence_penalty 0.06 (`"default_sampling": "on"` in the card presets): the same tool-call and coding pass
-rate as greedy in our tests, with faster decode at long context. Anything the client sends wins, and
+**Default sampling (0.4.8, values 0.4.9):** the server fills the sampling fields a request leaves out with temperature
+0.6, top_p 0.95, top_k 20, min_p 0, presence_penalty 0 (`"default_sampling"` in the card presets; some presets keep
+their older presence_penalty 1.5 as a JSON object). Anything the client sends wins, and
 `"temperature": 0` is still greedy. `STRATA_DEFAULT_SAMPLING=off` turns it off, or give your own JSON; see
 [docs/CONFIGS.md](docs/CONFIGS.md#default-sampling-048). Requests that name no reasoning effort get a server default (`medium` in the card presets;
 `STRATA_DEFAULT_REASONING_EFFORT`, see [docs/CONFIGS.md](docs/CONFIGS.md#default-reasoning-effort-048)).

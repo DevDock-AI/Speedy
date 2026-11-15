@@ -9306,11 +9306,10 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     return out
 
 
-# 0.4.8: server-side default sampling.  The values below were checked against greedy on the reference machine (same
-# tool-call and coding pass rate, higher MTP acceptance so faster decode at long context).  They fill only the fields a
-# request leaves out; anything the client sends wins, and an explicit temperature 0 stays greedy.
-DEFAULT_SAMPLING_ON = {"temperature": 0.33, "top_k": 20, "top_p": 1.0, "min_p": 0.08,
-                       "repetition_penalty": 1.0, "presence_penalty": 0.06}
+# Server-side default sampling (0.4.8; values reverted in 0.4.9 to the proven set after an IFBench comparison).  They
+# fill only the fields a request leaves out; anything the client sends wins, and an explicit temperature 0 stays greedy.
+DEFAULT_SAMPLING_ON = {"temperature": 0.6, "top_k": 20, "top_p": 0.95, "min_p": 0.0,
+                       "repetition_penalty": 1.0, "presence_penalty": 0.0}
 SAMPLING_FIELDS = ("temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",
                    "repetition_penalty", "penalty_last_n", "seed")
 PENALTY_FIELDS = ("repetition_penalty", "presence_penalty", "frequency_penalty", "penalty_last_n")
