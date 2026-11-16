@@ -304,6 +304,15 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count());
     if (ckpt_async_on() && c.gdn.size() >= ((size_t) 1 << 20)) {
         CkptAsync& a = ckpt_async();
+        // one lock over the resize, the device copy into the staging buffer and the submit (upstream Strata #6075): a
+        // layer split saves from one thread per stage, and without it one stage freed (or overwrote) the buffer another
+        // stage's copy was still reading (invalid resource handle, SIGSEGV).  A copy another stage queued since the
+        // join above lands first.
+        std::unique_lock<std::mutex> lk(a.mu);
+        if (a.pending.valid()) {
+            const cudaError_t pe = a.pending.get();
+            if (pe != cudaSuccess) std::fprintf(stderr, "strata: STRATA_CKPT_ASYNC: a checkpoint copy failed (%s)\n", cudaGetErrorString(pe));
+        }
         int dev = 0;
         (void) cudaGetDevice(&dev);
         if (a.stage != nullptr && (a.cap < c.gdn.size() || a.dev != dev)) {
@@ -337,7 +346,6 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
             cudaStream_t st = a.stream;
             if (atr) std::fprintf(stderr, "strata parktrace: async ckpt d2d %.2f ms\n",
                 std::chrono::duration<double, std::milli>(q1 - q0).count());
-            std::lock_guard<std::mutex> lk(a.mu);
             // the DMA in 4 MiB pieces, one in flight: a D2H copy queues behind the one before it on the copy engine, and
             // the decode's own small reads would otherwise wait for the whole 100+ MB at the link's ~1.6 GB/s
             a.dst = dst;

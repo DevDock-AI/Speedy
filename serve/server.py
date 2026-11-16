@@ -6257,6 +6257,16 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if (self.draining and finish == "length" and n < max_new and not cancel.is_set()
+                                and not nonfinite):
+                            # upstream Strata #6055: the server is stopping and the engine was closed under this
+                            # request (its STOP ended the pass early): an error the client can retry, not a reply of
+                            # 0 tokens (or a cut-off one) that reads as "length"
+                            finish = "error"
+                            print(f"[strata] the server is stopping: the request was cut off after {n} tokens and ends "
+                                  "with an error", flush=True)
+                            raise EngineDied("the server is stopping; the request was cut off before it finished - "
+                                             "retry against the next instance")
                         if cto_now:
                             cto_now = False
                             if not cancel.is_set() and not nonfinite:
@@ -10289,8 +10299,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
     finally:
         cancelled = 0
+        # upstream Strata #6055: new inference requests are refused (503 server_draining) from the moment the server
+        # stops, with or without --shutdown-timeout; before, without it, admission stayed open while the engine closed
+        pending = svc.begin_drain()
         if a.shutdown_timeout is not None:
-            pending = svc.begin_drain()
             notify_lifecycle("draining", {"instance_id": svc.instance_id,
                                           "pending_requests": pending,
                                           "deadline_s": a.shutdown_timeout})

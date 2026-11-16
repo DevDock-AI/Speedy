@@ -131,7 +131,8 @@ NativeEmbed::~NativeEmbed() {
     else if (dev_) cudaFree(const_cast<void*>(dev_));   // the VRAM fallback below
 }
 
-bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err) {
+bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err,
+                       bool layer_split) {
     try {
         const strata::GgufModel model(shards);
         // --embd-gguf's one-tensor file (tools/embd_bf16_pack.py) says "strata-embd": only its tensor is checked
@@ -162,7 +163,15 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
         // prompt's scattered row reads go: over a PCIe Gen2 x4 link they cost more than the table's size in VRAM
         // is worth. Taken only with the table plus 512 MiB free; otherwise, or when the upload fails, the mapped
         // placement below is used as before (and the fallback is said).
-        if (const char* ev = std::getenv("STRATA_EMBED_VRAM"); ev != nullptr && ev[0] == '1') {
+        // On a layer split the table must be readable from every card: one card's VRAM is not (the draft layer on
+        // the last card gathered card 0's pointer: illegal memory access; edge0 2a84e52b), so the flag is ignored.
+        const char* ev = std::getenv("STRATA_EMBED_VRAM");
+        if (ev != nullptr && ev[0] == '1' && layer_split) {
+            std::fprintf(stderr, "strata: native embedding: STRATA_EMBED_VRAM=1 ignored on a layer split (every "
+                                 "stage's card reads the table): kept in mapped host memory\n");
+            ev = nullptr;
+        }
+        if (ev != nullptr && ev[0] == '1') {
             size_t free_b = 0, total_b = 0;
             const bool have_free = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
             void* d = nullptr;

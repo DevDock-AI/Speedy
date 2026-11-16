@@ -4579,7 +4579,7 @@ int main(int argc, char** argv) {
         }
         const auto embed_t0 = std::chrono::steady_clock::now();
         if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf}, g.n_embd,
-                               g.n_vocab, err)) {
+                               g.n_vocab, err, !o.layer_split.empty())) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -12051,6 +12051,13 @@ int main(int argc, char** argv) {
             }
         };
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
+        // upstream Strata #6052: the periodic checkpoints are due on a grid of --prompt-cache-every from where the read
+        // started (pp_grid), not that many tokens after the chunk end that took the last one: equal prompt chunks are
+        // a little shorter than the spacing, and every other chunk end then fell just short and was skipped
+        int64_t pp_grid = 0;
+        auto pp_next_on_grid = [&](int64_t done) {
+            return pp_grid + ((done - pp_grid) / o.prompt_cache_every + 1) * o.prompt_cache_every;
+        };
         bool pp_tail_saved = false;
         bool pp_periodic_on = false, pp_warned = false;   // this read wants periodic checkpoints / the "none stored" note went out
         int64_t pp_periodic_saved = 0;                     // periodic checkpoints this read stored
@@ -12366,7 +12373,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: checkpoint at %lld skipped: its state could not be copied out (see "
                                          "above); the request goes on without it\n", (long long) done);
                 }
-                if (periodic_checkpoint) pp_next_check = done + o.prompt_cache_every;
+                if (periodic_checkpoint) pp_next_check = pp_next_on_grid(done);
                 if (tail_checkpoint) pp_tail_saved = true;
             }
             // a read longer than the checkpoint interval that stored no periodic checkpoint: a branch before the live
@@ -12388,7 +12395,7 @@ int main(int argc, char** argv) {
                 strata::core::SessionState& stage_ss = i == 0 ? ss : stages[i - 1]->ss;
                 stage_sp.on_stage_chunk = [&, i](int64_t done, std::string& e) -> bool {
                     if (o.prompt_cache <= 0 || o.prompt_cache_every <= 0 || done < part_next[i]) return true;
-                    part_next[i] = done + o.prompt_cache_every;
+                    part_next[i] = pp_next_on_grid(done);
                     ConvCheckpoint part;   // this stage's state at `done` (its stream is synchronized)
                     part.ids.assign(cur.begin(), cur.begin() + done);
                     if (!checkpoint_save(part, stage_ss, g)) {
@@ -16427,6 +16434,7 @@ int main(int argc, char** argv) {
             pp_reached = read_from;
             pp_exact = true;   // a restore, a checkpoint mount or a zeroed session: the state is exactly at read_from
             pp_t0 = r0;
+            pp_grid = resume;
             pp_next_check = reread_to > 0 || !req_ckpt ? INT64_MAX : resume + o.prompt_cache_every;   // ckpt=0: none
             pp_tail_saved = reread_to > 0 || !req_ckpt;   // ckpt=0 (#861): no tail checkpoint either
             pp_periodic_on = pp_next_check != INT64_MAX && o.prompt_cache > 0 && o.prompt_cache_every > 0;

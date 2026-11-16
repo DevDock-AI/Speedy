@@ -1053,6 +1053,8 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
         if (const NativeEmbed* ne = native_embed()) {   // plan v0.3 P6: the GGUF-form table
             ne->gather_dev(tok_, T, emb_, cs);
         } else {
+            // a later stage's weight table may hold no token_embd bytes (edge0 2a84e52b): an error, not a null gather
+            if (we->data == nullptr) { err = "mtp: token_embd.weight has no data on this stage's card"; return false; }
             const auto* codes = (const uint8_t*) we->data;
             const auto* scales = (const float*) (codes + we->codes_bytes);
             const auto* offsets = we->has_offset ? (const float*) (codes + we->codes_bytes + we->scales_bytes) : nullptr;
