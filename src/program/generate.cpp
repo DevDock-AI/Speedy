@@ -4579,7 +4579,7 @@ int main(int argc, char** argv) {
         }
         const auto embed_t0 = std::chrono::steady_clock::now();
         if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf}, g.n_embd,
-                               g.n_vocab, err)) {
+                               g.n_vocab, err, !o.layer_split.empty())) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
