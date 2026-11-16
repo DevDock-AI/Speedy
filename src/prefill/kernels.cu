@@ -101,7 +101,18 @@ __device__ float block_sum(float v, float* sh) {
 }
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "prefill %s: %s\n", what, cudaGetErrorString(e)); std::exit(1); }
+    if (e == cudaSuccess) return;
+    // Upstream Strata #6054: std::exit from a prompt worker ran the static destructors while other threads still held
+    // the GPU, and the process could hang there: the server then waited for its 300 s silence watchdog.  _Exit ends at
+    // once, so the server sees the engine's output close and fails the request now, with this line in the log.
+    if (e == cudaErrorMemoryAllocation)
+        std::fprintf(stderr, "prefill %s: out of memory: the prompt's buffers did not fit; the request fails and the "
+                             "engine restarts (free RAM/VRAM or shorten the conversation)\n", what);
+    else
+        std::fprintf(stderr, "prefill %s: %s\n", what, cudaGetErrorString(e));
+    std::fflush(stderr);
+    std::fflush(stdout);
+    std::_Exit(1);
 }
 unsigned blocks_for(int64_t n, int t = 256) { return (unsigned) ((n + t - 1) / t); }
 
