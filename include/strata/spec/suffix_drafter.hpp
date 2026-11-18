@@ -6,8 +6,11 @@
 //
 // Index: every trigram of the history (prompt + accepted output) maps to its WAYS most recent end positions in a
 // fixed-size open-addressing table, so memory is bounded (~20 bytes per history token) and appends are O(1).
-// A proposal checks those candidates, extends each match backwards up to `max_match`, and takes the longest
-// (most recent on ties). Matches shorter than `min_match` propose nothing.
+// Optional (long_table, STRATA_SUFFIX_NGRAM8): a second table indexes every LONG_ORDER-gram the same way. A common
+// trigram's few ways fill with its newest repeats; the longer key still points at an older source of a quoted stretch
+// (long-context file edits). Costs one more table of the same size (host RAM only).
+// A proposal checks the candidates of both, extends each match backwards up to `max_match`, and takes the longest
+// (most recent on ties, long-table candidates first). Matches shorter than `min_match` propose nothing.
 #pragma once
 
 #include <cstddef>
@@ -19,8 +22,13 @@ namespace strata::spec {
 class SuffixDrafter {
 public:
     static constexpr int WAYS = 4;
+    static constexpr int LONG_ORDER = 8;
 
-    explicit SuffixDrafter(int min_match = 3, int max_match = 32, size_t capacity_tokens = 1u << 19);
+    explicit SuffixDrafter(int min_match = 3, int max_match = 32, size_t capacity_tokens = 1u << 19,
+                           bool long_table = false);
+
+    /// STRATA_SUFFIX_NGRAM8: "1" enables the LONG_ORDER-gram table, "0" disables it, unset = on.
+    static bool long_table_from_env();
 
     void reset();
     /// Add tokens to the history (the prompt, then every accepted token).
@@ -46,12 +54,16 @@ private:
         uint32_t pos[WAYS] = {};      // end positions, most recent first
         uint8_t n = 0;
     };
-    Slot* find_slot(uint64_t key, bool insert);
+    Slot* find_slot(std::vector<Slot>& table, uint64_t key, bool insert);
+    static void push(Slot* s, size_t end);
     uint64_t key_at(size_t end) const;
+    uint64_t long_key_at(size_t end) const;
 
+    static constexpr uint32_t LONG_SLOT_FLAG = 1u << 31;
     int min_match_, max_match_;
     std::vector<int32_t> hist_;
-    std::vector<Slot> table_;
+    std::vector<Slot> table_, long_;    // long_ empty unless long_table
+    std::vector<uint32_t> used_;        // filled slot indices (LONG_SLOT_FLAG = long_), so reset() clears only those
     size_t mask_ = 0;
     int last_match_ = 0;
 };

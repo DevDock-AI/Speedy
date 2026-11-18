@@ -70,6 +70,17 @@ key `"default_reasoning_effort"` (the older `"reasoning_effort"` key still works
 `/health` (`"speedy"."default_reasoning_effort"`: source and value). The Chat settings shared with other apps still
 come before the server default.
 
+## Reasoning effort floor
+
+`"reasoning_effort_floor"` (top level, like `default_reasoning_effort`; env `STRATA_REASONING_EFFORT_FLOOR` wins):
+`low` (default), `medium`, `high` or `off`. A request that offers tools and asks for a lower thinking level (`none`,
+`enable_thinking: false`, Anthropic `thinking: disabled`, or a server default of `none`) gets the floor instead, since
+effort `none` showed a quality drop on agent/tool requests at long context. Requests with no level of their own, with
+their own reasoning budget or without tools are left alone. `"reasoning_effort_floor_ctx_tokens"` (env
+`STRATA_REASONING_EFFORT_FLOOR_CTX_TOKENS`, default `0` = off) also applies the floor to requests without tools whose
+prompt is estimated (about 4 characters per token) above that many tokens. Each raised request logs one
+`[strata] effort floor` line.
+
 ## Context tiers
 - **Native 229K:** `--max-context 229376` (make_configs `--max-context 229376`). Fits every pack on 10 GB at reserve 700.
 - **1M overflow (Q2_0 only on 10 GB):** add `--max-context 1048576 --rope-scaling yarn --rope-scale 4

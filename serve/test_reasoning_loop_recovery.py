@@ -2,7 +2,7 @@
 import threading
 import unittest
 from serve.server import (Service, ByteTokenizer, MockEngine, HIGH_EFFORT,
-                          reasoning_repeat_coverage, focused_recovery_prompt)
+                          reasoning_repeat_coverage, focused_recovery_prompt, LOOP_COVERAGE)
 
 
 class Tokenizer(ByteTokenizer):
@@ -35,6 +35,16 @@ class ReasoningLoopRecovery(unittest.TestCase):
     def test_repetition_and_novel_work(self):
         self.assertEqual(reasoning_repeat_coverage(' '.join(str(i) for i in range(4000))), 0)
         self.assertGreater(reasoning_repeat_coverage(self.loop), .9)
+
+    def test_short_reasoning_window(self):
+        """Reasoning from LOOP_MIN_WORDS to 2,000 words is judged on all of it; shorter is never judged."""
+        short_loop = 'Hmm, wait, let me check the file again before I answer. ' * 30      # ~390 words
+        self.assertGreater(reasoning_repeat_coverage(short_loop), .9)
+        self.assertEqual(reasoning_repeat_coverage('Hmm, wait, let me check the file again. ' * 20), 0)   # < 300 words
+        novel = ' '.join(f'step {i} checks value {i * 7}' for i in range(300))           # ~1,500 words, no repeats
+        self.assertEqual(reasoning_repeat_coverage(novel), 0)
+        once = ' '.join(f'w{i}' for i in range(400))
+        self.assertLess(reasoning_repeat_coverage(once + ' ' + once), LOOP_COVERAGE)      # a passage seen twice is not a loop
 
     def test_a_loop_written_as_one_long_word(self):
         """#1753: a 24k-digit string cycling an 11-digit pattern is one word to the split and never one token twice."""

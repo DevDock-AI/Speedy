@@ -240,6 +240,9 @@ their older presence_penalty 1.5 as a JSON object). Anything the client sends wi
 `"temperature": 0` is still greedy. `STRATA_DEFAULT_SAMPLING=off` turns it off, or give your own JSON; see
 [docs/CONFIGS.md](docs/CONFIGS.md#default-sampling-048). Requests that name no reasoning effort get a server default (`medium` in the card presets;
 `STRATA_DEFAULT_REASONING_EFFORT`, see [docs/CONFIGS.md](docs/CONFIGS.md#default-reasoning-effort-048)).
+Tool requests that ask for effort `none` are raised to a floor of `low` (`"reasoning_effort_floor"` /
+`STRATA_REASONING_EFFORT_FLOOR`, `off` disables it; optional `"reasoning_effort_floor_ctx_tokens"` for long prompts
+without tools), see [docs/CONFIGS.md](docs/CONFIGS.md#reasoning-effort-floor).
 
 At start and then every 3 hours the server checks in the background (never delaying a request) for a newer release:
 one anonymous request to `api.github.com/repos/DevDock-AI/Speedy/releases/latest`, User-Agent `Speedy/<version>`,
