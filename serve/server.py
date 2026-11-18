@@ -299,6 +299,7 @@ HIGH_EFFORT = EFFORT_TEXT["xhigh"]
 LOW_EFFORT = EFFORT_TEXT["low"]
 LOOP_CHECK_EVERY = 512           # output tokens between two looks at the reasoning (at a clean parser boundary)
 LOOP_COVERAGE = 0.25             # the share of the last 2,000 words inside 12-word passages seen three times
+LOOP_MIN_WORDS = 300             # shorter reasoning is not judged; up to 2,000 words the window is all of it
 LOOP_HISTORY_WORDS = 30000       # how far back the passages are counted (bounds the cost of a look)
 LOOP_TAIL_CHARS = 2048           # chars at the end of the reasoning also checked for a short period (#1753)
 LOOP_TAIL_PERIOD = 64            # a period at most this long in that tail reads as a fully repeated window
@@ -319,7 +320,7 @@ def reasoning_repeat_coverage(text):
         return 1.0
     words = re.findall(r"\w+|[^\w\s]", text.lower())[-LOOP_HISTORY_WORDS:]
     width, window = 12, 2000
-    if len(words) < window:
+    if len(words) < LOOP_MIN_WORDS:     # short "Hmm" filler loops repeat well before 2,000 words
         return 0.0
     grams = [tuple(words[i:i + width]) for i in range(len(words) - width + 1)]
     counts = collections.Counter(grams)
@@ -965,6 +966,11 @@ EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default -
 # finished, #267): the process may stay alive and even print DONE, but it must not take another request.
 FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed out at layer ",
                   "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished")
+# #5990: the engine adds this to a fatal verify line when its drain found the card answering errors instead of finishing
+# (src/core/verify.cpp, `Verifier::release_note` - keep the two phrases in step).  It is the same fatal family above, but
+# it is not a verifier bug: the GPU stopped answering, and after an Xid 79 it needs a power cycle, not a retry.  Filing
+# it under "Unrecoverable native verification failure" has already sent two issue threads after a bug that never existed.
+DEVICE_LOST_MARK = "the GPU stopped answering"
 
 
 def parse_engine_stage_line(line: str) -> list[dict] | None:
@@ -1346,7 +1352,12 @@ class StrataEngine:
                 # release_gpu_waits invalidates the verifier, even if the native
                 # process stays alive and prints DONE afterwards.
                 if self.proc is proc:
-                    self.silent_note = "Unrecoverable native verification failure: " + line[4:].strip()
+                    # #5990: name what happened.  A drain that saw the device answering errors is a lost card, not a
+                    # verifier bug (the text is the engine's; the phrase below is DEVICE_LOST_MARK).
+                    note = line[4:].strip()
+                    self.silent_note = ("The GPU stopped answering (device lost): " + note
+                                        if DEVICE_LOST_MARK in line else
+                                        "Unrecoverable native verification failure: " + note)
                     self.ended = True
                 try:
                     proc.terminate()
@@ -4290,6 +4301,7 @@ class Service:
         self.model_arch = None                        # the config's family ("qwen4exp", "qwen35moe"): None = no model-card defaults
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
+        self.effort_floor, self.effort_floor_ctx_tokens = None, 0   # reasoning_effort_floor (set in main)
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
@@ -4964,8 +4976,73 @@ class Service:
         "reasoning_effort" (#1641).  Every API reads it here (the Responses API did not: 0.1.44.1)."""
         return self.shared.get("reasoning_effort") or self.config_effort
 
+    def floor_applies(self, req: dict, tools, *size_parts) -> bool:
+        """The effort floor covers this request: it offers tools, or (with reasoning_effort_floor_ctx_tokens) its prompt
+        is estimated above that many tokens."""
+        if not getattr(self, "effort_floor", None):
+            return False
+        if tools:
+            return True
+        ctx = int(getattr(self, "effort_floor_ctx_tokens", 0) or 0)
+        return ctx > 0 and estimate_prompt_tokens(*size_parts) > ctx
+
+    def note_floor(self, was, api: str, why: str):
+        print(f"[strata] effort floor ({api}): {was} -> {self.effort_floor} ({why})", flush=True)
+
+    def with_effort_floor(self, req: dict, api: str) -> dict:
+        """A request whose thinking level is below the reasoning effort floor gets the floor (tool requests, and long
+        prompts with reasoning_effort_floor_ctx_tokens).  Only an explicit level is raised: none/off, an OpenAI
+        enable_thinking false, an Anthropic thinking disabled; a request's own token budget is left alone."""
+        floor = getattr(self, "effort_floor", None)
+        if not floor or req.get("reasoning_budget_tokens") not in (None, "") or \
+                req.get("thinking_budget_tokens") not in (None, ""):
+            return req
+        if api == "openai":
+            if tool_choice_of(req.get("tool_choice"))[0] == "none":
+                tools = None
+            else:
+                tools = req.get("tools")
+            ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
+            rsn = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
+            was = None
+            for e in (req.get("reasoning_effort"), rsn.get("effort"), ctk.get("reasoning_effort")):
+                if e not in (None, ""):
+                    was = e
+                    break
+            if was is None and ctk.get("enable_thinking") is False:
+                was = "none"
+            if not effort_below_floor(was, floor) or not self.floor_applies(req, tools, req.get("messages")):
+                return req
+            req = dict(req)
+            req["reasoning_effort"] = floor
+            if rsn:
+                req["reasoning"] = {**rsn, "effort": floor}
+            if ctk:
+                ctk = dict(ctk)
+                ctk.pop("enable_thinking", None)
+                if "reasoning_effort" in ctk:
+                    ctk["reasoning_effort"] = floor
+                req["chat_template_kwargs"] = ctk
+        else:
+            tools = None if tool_choice_of(req.get("tool_choice"))[0] == "none" else req.get("tools")
+            th = req.get("thinking") if isinstance(req.get("thinking"), dict) else {}
+            oc = req.get("output_config") if isinstance(req.get("output_config"), dict) else {}
+            was = "none" if th.get("type") == "disabled" else oc.get("effort")
+            if not effort_below_floor(was, floor) or \
+                    not self.floor_applies(req, tools, req.get("system"), req.get("messages")):
+                return req
+            req = dict(req)
+            req.pop("thinking", None)
+            req["output_config"] = {**oc, "effort": floor}
+        self.note_floor(was, api, "tools" if tools else "long prompt")
+        return req
+
     def with_shared(self, req: dict, api: str) -> dict:
-        """The request with the shared thinking level and max tokens filled in where it has none of its own."""
+        """The request with the shared thinking level and max tokens filled in where it has none of its own, then the
+        reasoning effort floor."""
+        return self.with_effort_floor(self._with_shared(req, api), api)
+
+    def _with_shared(self, req: dict, api: str) -> dict:
         s = self.shared
         effort = self.effort_default()
         if not s and not effort:
@@ -7960,6 +8037,7 @@ def make_handler(svc: Service):
                     created = int(getattr(svc, "started_at", 0) or time.time())
                     model = {"id": svc.model, "object": "model", "created": created, "owned_by": "speedy",
                              "status": {"value": "loaded"},
+                             "context_length": svc.reported_ctx(), "max_context_length": svc.reported_ctx(),
                              "meta": {"n_ctx": svc.reported_ctx()},
                              "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
                                               "output_modalities": ["text"]}}
@@ -8639,6 +8717,12 @@ def make_handler(svc: Service):
             responses_api.check_request(req)
             messages = responses_api.input_messages(req)
             tools, names, skipped = responses_api.request_tools(req)
+            effort = (req.get("reasoning") or {}).get("effort") if isinstance(req.get("reasoning"), dict) else None
+            effort = svc.effort_default() if effort is None else effort
+            if effort_below_floor(effort, getattr(svc, "effort_floor", None)) and \
+                    svc.floor_applies(req, tools, req.get("instructions"), messages):
+                svc.note_floor(effort, "responses", "tools" if tools else "long prompt")
+                req = {**req, "reasoning": {**(req.get("reasoning") or {}), "effort": svc.effort_floor}}
             kw = responses_api.template_kwargs(req, {"reasoning_effort": svc.effort_default()})
             try:
                 self._no_local_images(messages)              # as on the chat route: no file read for a foreign page
@@ -9380,6 +9464,56 @@ def resolve_default_effort(cfg: dict, env=None) -> tuple[str | None, str]:
     return level, ("off" if level == "none" else source)
 
 
+EFFORT_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3, "max": 4}
+EFFORT_FLOOR_DEFAULT = "low"          # tool requests: thinking off lost quality on agent work at long context
+
+
+def resolve_effort_floor(cfg: dict, env=None) -> tuple[str | None, int, str]:
+    """The reasoning effort floor, its prompt-size threshold for requests without tools, and the floor's source.
+    Order: env STRATA_REASONING_EFFORT_FLOOR / STRATA_REASONING_EFFORT_FLOOR_CTX_TOKENS (the process environment, then
+    the config's `env`), then the config keys "reasoning_effort_floor" / "reasoning_effort_floor_ctx_tokens".  Floor
+    levels: low, medium, high, or off/none (no floor); default low.  Threshold 0 (default) = tool requests only."""
+    env = os.environ if env is None else env
+    cenv = cfg.get("env") if isinstance(cfg.get("env"), dict) else {}
+
+    def pick(env_name, key):
+        for src, val in (("env", env.get(env_name)), ("env", cenv.get(env_name)), ("config", cfg.get(key))):
+            if val is not None and str(val).strip() != "":
+                return str(val).strip(), src, (env_name if src == "env" else "config " + key)
+        return None, "default", None
+
+    raw, source, name = pick("STRATA_REASONING_EFFORT_FLOOR", "reasoning_effort_floor")
+    if raw is None:
+        floor = EFFORT_FLOOR_DEFAULT
+    else:
+        floor = DEFAULT_EFFORT_LEVELS.get(raw.lower())
+        if floor is None or floor == "max":
+            raise SystemExit(f"[strata] {name}: {raw!r}: expected low, medium, high or off")
+        if floor == "none":
+            floor, source = None, "off"
+    raw_ctx, _, name_ctx = pick("STRATA_REASONING_EFFORT_FLOOR_CTX_TOKENS", "reasoning_effort_floor_ctx_tokens")
+    try:
+        ctx = int(raw_ctx) if raw_ctx is not None else 0
+    except ValueError:
+        raise SystemExit(f"[strata] {name_ctx}: {raw_ctx!r}: expected a number of tokens (0 = off)") from None
+    return floor, max(ctx, 0), source
+
+
+def estimate_prompt_tokens(*parts) -> int:
+    """A cheap prompt size estimate (about 4 characters per token) for the effort floor's threshold."""
+    return len(json.dumps(parts, ensure_ascii=False, default=str)) // 4
+
+
+def effort_below_floor(effort, floor) -> bool:
+    """True when the named level (none/off counts as none) is below the floor; an unknown or absent level is not."""
+    if not floor or effort is None:
+        return False
+    level = DEFAULT_EFFORT_LEVELS.get(str(effort).strip().lower())
+    if level is None and str(effort).strip().lower() in ("minimal", "disabled", "false"):
+        level = "none"
+    return level is not None and EFFORT_ORDER[level] < EFFORT_ORDER[floor]
+
+
 def merge_default_sampling(defaults: dict, sampling) -> dict:
     """Per field: the request's own non-null fields win over `defaults`.  A request that asks for temperature <= 0
     (greedy) gets no defaulted penalty, since a penalty changes even the greedy pick; its own penalties still apply."""
@@ -10103,6 +10237,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     from serve.keepawake import KeepAwake
     svc.keep_awake = KeepAwake.create(cfg.get("prevent_sleep") is True)      # #1727: opt-in, Windows only
     svc.config_effort, svc.default_effort_source = resolve_default_effort(cfg)   # #1641 + 0.4.8 server default
+    svc.effort_floor, svc.effort_floor_ctx_tokens, floor_src = resolve_effort_floor(cfg)
+    print(f"[strata] reasoning effort floor ({floor_src}): {svc.effort_floor or 'off'} for tool requests"
+          + (f" and prompts above ~{svc.effort_floor_ctx_tokens} tokens" if svc.effort_floor and
+             svc.effort_floor_ctx_tokens else ""), flush=True)
     if svc.config_effort:
         print(f"[strata] default reasoning effort ({svc.default_effort_source}): {svc.config_effort} (used only when a "
               "request names no effort or thinking budget; a request, or the Chat settings shared with other apps, "

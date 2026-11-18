@@ -41,7 +41,7 @@ std::vector<int32_t> read_ids(const char* path) {
 struct Sim { long steps = 0, tokens = 0, proposals = 0, accepted = 0; };
 
 Sim simulate(const std::vector<int32_t>& history, const std::vector<int32_t>& target, int K) {
-    SuffixDrafter d(3, 32, history.size() + target.size() + 16);
+    SuffixDrafter d(3, 32, history.size() + target.size() + 16, SuffixDrafter::long_table_from_env());
     d.append(history.data(), history.size());
     Sim s;
     std::vector<int32_t> draft(K);
@@ -102,6 +102,38 @@ void unit_tests() {
         int32_t out[6];
         const int n = d.propose(6, out);
         check(n >= 3 && out[0] == 1 && out[1] == 2 && out[2] == 3, "periodic continuation");
+    }
+    {   // long table: an old source behind a trigram whose ways were filled by later repeats is still found
+        std::vector<int32_t> doc;
+        for (int i = 0; i < 20; ++i) doc.push_back(1000 + i);                   // the source
+        for (int r = 0; r < 8; ++r) {                                           // later repeats of its trigram 1009..1011
+            for (int i = 0; i < 4; ++i) doc.push_back(2000 + r * 10 + i);
+            for (int i = 9; i < 12; ++i) doc.push_back(1000 + i);
+            doc.push_back(3000 + r);
+        }
+        for (int i = 0; i < 12; ++i) doc.push_back(1000 + i);                   // quoting the source again
+        int32_t out[4] = {};
+        SuffixDrafter tri;                                                      // trigram only: ways hold the repeats
+        tri.append(doc.data(), doc.size());
+        const int nt = tri.propose(4, out);
+        check(nt == 0 || out[0] != 1012, "trigram-only table misses the old source (test premise)");
+        SuffixDrafter d(3, 32, 1u << 12, true);
+        d.append(doc.data(), doc.size());
+        const int n = d.propose(4, out);
+        check(n == 4 && out[0] == 1012 && out[3] == 1015, "long table finds the old source");
+        check(d.last_match() >= 12, "long table match covers the quoted stretch");
+    }
+    {   // reset with the long table forgets the whole history (only filled slots are cleared)
+        SuffixDrafter d(3, 32, 1u << 12, true);
+        std::vector<int32_t> doc;
+        for (int i = 0; i < 40; ++i) doc.push_back(500 + i);
+        d.append(doc.data(), doc.size());
+        d.reset();
+        d.append(doc.data(), 12);
+        int32_t out[4];
+        check(d.propose(4, out) == 0 && d.size() == 12, "no proposal from the history before reset");
+        d.append(doc.data(), 3);
+        check(d.propose(4, out) == 4 && out[0] == 503, "proposal from the history since reset");
     }
     {   // bounded memory: appending beyond the nominal capacity does not crash and still works
         SuffixDrafter d(3, 32, 1024);
