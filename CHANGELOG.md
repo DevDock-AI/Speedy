@@ -1,5 +1,11 @@
 # Changelog
 
+## Speedy 0.4.12 (2026-11-19)
+- **Quoted `</think>` stays reasoning**: a typed `\n` right before the tag with a quote or backtick up to four characters back (`` `\n</think>\n\n` ``) is the model writing about its own tag, so the thinking no longer ends there. A real line break after the tag still ends it.
+- **TCP_NODELAY on accepted sockets** (on by default, `STRATA_TCP_NODELAY=0` keeps Nagle on): small SSE chunks go out at once instead of waiting on the client's delayed ACK.
+- **Optional malloc arena limit** (`"malloc_arena_max"` config key, `STRATA_MALLOC_ARENA_MAX` env; default 0 = glibc's own limit): caps glibc malloc arenas on Linux, with mallopt in the server and `MALLOC_ARENA_MAX` for the engine, to keep host RSS down.
+- serve/version.py -> 0.4.12.
+
 ## Speedy 0.4.11 (2026-11-18)
 - **Reasoning effort floor** (`"reasoning_effort_floor"` config key, `STRATA_REASONING_EFFORT_FLOOR` env; `low` / `medium` / `high` / `off`, default `low`): a request that offers tools and asks for a thinking level below the floor (`none` / `off`, `enable_thinking: false`, Anthropic `thinking: disabled`, or a server default of `none`) is raised to the floor, on `/v1/chat/completions`, `/v1/messages` and `/v1/responses`. Reason: a quality drop with effort `none` on agent/tool requests at long context. Requests that name no level, set their own reasoning budget, or have no tools are unchanged. Opt-in `"reasoning_effort_floor_ctx_tokens"` (`STRATA_REASONING_EFFORT_FLOOR_CTX_TOKENS`, default 0 = off) applies the floor to requests without tools too when the prompt is estimated above that many tokens. The env values are read by the server process itself (process environment, then the config's `env`). Logged at start and once per raised request.
 - **Suffix drafter 8-gram table** (`STRATA_SUFFIX_NGRAM8`, on by default, `0` turns it off): a second table indexes every 8-gram next to the trigram table, so a quoted stretch still finds an older source when a common trigram's slots are filled by newer repeats (long-context file edits). Proposals take the longest match of both. Greedy output is bit-identical; host RAM only (one more table of the trigram table's size), no VRAM.
