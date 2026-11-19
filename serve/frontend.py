@@ -1670,9 +1670,12 @@ class OutputParser:
         """#537: the `</think>` at self.buf[i] is the model quoting the tag while it thinks, not the end of the
         thinking: written right after a quote or backtick and followed by anything but a line break, as in `</think>`
         or "</think>...".  The end of the thinking is followed by a line break.  None while the character after the
-        tag has not arrived."""
-        before = self.buf[i - 1] if i else self.line[-1:]
-        if before not in ('"', "'", "`"):
+        tag has not arrived.
+        Also quoted: the escaped form, a typed `\\n` right before the tag with a quote or backtick at most four
+        characters back, as in `\\n</think>\\n\\n`: the model writes about its own tag there."""
+        context = self.buf[:i] if i >= 4 else self.line[-4:] + self.buf[:i]
+        before = context[-1:]
+        if before not in ('"', "'", "`") and not (context[-2:] == "\\n" and any(q in context[-4:] for q in "\"'`")):
             return False
         after = self.buf[i + len(THINK_END):]
         if not after:

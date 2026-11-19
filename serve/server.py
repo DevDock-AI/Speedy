@@ -3877,6 +3877,30 @@ def deepseek_slot_env(env: dict, cfg: dict) -> None:
         env["STRATA_DS4_SLOT_DIR"] = str(Path(log).parent / "ds4-slots")
 
 
+def malloc_arena_max(cfg: dict, env=None) -> int:
+    """glibc malloc arenas for the server and the engine on Linux: STRATA_MALLOC_ARENA_MAX, else the config's
+    "malloc_arena_max"; 0 (the default) leaves glibc's own limit (8 per core)."""
+    env = os.environ if env is None else env
+    v = env.get("STRATA_MALLOC_ARENA_MAX", cfg.get("malloc_arena_max", 0))
+    try:
+        return max(0, int(v or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def limit_malloc_arenas(cfg: dict) -> bool:
+    """Fewer malloc arenas keep the host RSS of threaded staging down.  The server process sets its own limit with
+    mallopt (it already runs); the engine gets MALLOC_ARENA_MAX through child_env.  True when the limit was set."""
+    n = malloc_arena_max(cfg)
+    if not n or not sys.platform.startswith("linux"):
+        return False
+    try:
+        import ctypes
+        return ctypes.CDLL(None).mallopt(-8, n) == 1        # M_ARENA_MAX
+    except (OSError, AttributeError):
+        return False
+
+
 def child_env(cfg: dict, *, offline: bool = False) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -3889,6 +3913,8 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
     elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ordered_gpus(cfg))
+    if malloc_arena_max(cfg, env) and sys.platform.startswith("linux") and "MALLOC_ARENA_MAX" not in env:
+        env["MALLOC_ARENA_MAX"] = str(malloc_arena_max(cfg, env))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
         env[str(k)] = str(v)
     if (cfg.get("arch") or "") == "deepseek41":      # (only this engine reads these; Qwen's environment is untouched)
@@ -7417,6 +7443,8 @@ class BadBody(Exception):
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
+        # small SSE writes go out at once, not after the client's delayed ACK; STRATA_TCP_NODELAY=0 keeps Nagle on
+        disable_nagle_algorithm = os.environ.get("STRATA_TCP_NODELAY", "1") != "0"
 
         record = None                                       # #332: this request's monitor record, if kept
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
@@ -9961,6 +9989,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     split_joined_args(cfg)
     if a.config and a.engine == "strata":
         cfg = apply_saved_tuning(cfg)
+    limit_malloc_arenas(cfg)
     attestation_key = os.environ.pop("STRATA_OWNER_ATTEST_KEY", None)
     launch_attestation = None
     if a.owner_fd is not None:

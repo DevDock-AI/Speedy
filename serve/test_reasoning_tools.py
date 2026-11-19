@@ -127,6 +127,31 @@ class QuotedThinkEnd(unittest.TestCase):
                     self.assertEqual(joined(evs, "reasoning"), "plan\n" + quote + "\ndone\n")
                     self.assertEqual(joined(evs, "content"), "answer")
 
+    def test_an_escaped_tag_in_quotes_stays_reasoning(self):
+        # the model writes its own closing tag escaped, `\n</think>\n\n`, with the quote two characters back
+        for quote in ("the marker `\\n</think>\\n\\n` appears once",
+                      'the marker "\\n</think>\\n\\n" appears once'):
+            text = "plan\n" + quote + "\ndone\n</think>\n\nanswer"
+            for width in (1, 2, 3, 7, 100_000):
+                with self.subTest(quote=quote[:14], width=width):
+                    evs = run(text, width)
+                    self.assertEqual(joined(evs, "reasoning"), "plan\n" + quote + "\ndone\n")
+                    self.assertEqual(joined(evs, "content"), "answer")
+
+    def test_an_escape_then_a_line_break_still_ends(self):
+        for width in (1, 2, 3, 7, 100_000):
+            with self.subTest(width=width):
+                evs = run("the flag `\\n</think>\n\nanswer", width)
+                self.assertEqual(joined(evs, "reasoning"), "the flag `\\n")
+                self.assertEqual(joined(evs, "content"), "answer")
+
+    def test_an_escape_without_a_quote_still_ends(self):
+        for width in (1, 7, 100_000):
+            with self.subTest(width=width):
+                evs = run("the marker \\n</think>answer", width)
+                self.assertEqual(joined(evs, "reasoning"), "the marker \\n")
+                self.assertEqual(joined(evs, "content"), "answer")
+
     def test_a_call_quoted_after_it_is_not_run(self):
         text = ('it returns "</think>\\n\\n2" here.\nThe call looks like this:\n' + CALL + " in the answer.\n"
                 "</think>\n\n" + CALL)
