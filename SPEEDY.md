@@ -32,7 +32,7 @@ Debian 13, CUDA 13.4.
 | #4567 QSA decode 32-cell chunks | Jackwwg83 | `STRATA_QSA_ATTN_VARIANT=2` | A/B pending (near-exact: needs the quality gate) |
 | #3919 KV ring from depth | Zac Chen (xyzzing) | `STRATA_KV_RING_ADAPT=1` | A/B pending |
 | #2968 resident-arena staging ring | sergqwer (sergiywith) | `STRATA_ARENA_PIN_GIB` | A/B pending |
-| #2964 adaptive fetch | sergqwer | `STRATA_ADAPT_FETCH=1` or `=2` | A/B pending |
+| #2964 adaptive fetch | sergqwer | `STRATA_ADAPT_FETCH=1` or `=2` | default =2 on 12.x cards <= 16 GiB (upstream v0.2.17); opt-in elsewhere |
 | #3307 drafter memory lent to long prompts | gopinath87607 | `STRATA_MTP_ROOM_MIN` | A/B pending |
 | #3310 prefill keep | gopinath87607 | `STRATA_PREFILL_KEEP` | A/B pending |
 | #3309 warm-up prompt | gopinath87607 | `STRATA_WARM_PROMPT` | A/B pending |

@@ -1,5 +1,18 @@
 # Changelog
 
+## Speedy 0.5.0 (unreleased)
+- **Smarter agent defaults** (serve; every one can be turned off, see docs/SPEEDY_DEFAULTS.md): thinking level `medium` and a 32768-token thinking budget when the config names none; the reasoning nudge at 60%/80% of the budget; the loop breaker (note naming the next step, repeated tool masked for one reply, no thinking floor); a 6144-token thinking cap on replies that follow a tool result; the answer-room reserve now also for max_tokens 128..1023 on every model family.
+- **Reasoning restore**: a tool-call turn's thinking is restored by call id and spliced back, so the conversation cache continues instead of re-reading (`STRATA_REASONING_RESTORE=0` turns it off).
+- **Tool calls**: argument shape repair (Strata #6315), an indented bare `<function=` held while streaming (Strata #6138), lenient missing `</parameter>`, schema-typed coercion, plural/singular parameter names (#6285), opt-in constrained tool-name decoding in the engine (Strata #5969, #6022 shape).
+- **Robustness**: a stalled request body gets a 408 and frees its slot (Strata #6107, `STRATA_BODY_STALL_S`, 30 s); a client that stops reading is dropped after 120 s without progress (`STRATA_STREAM_WRITE_TIMEOUT_S`, Strata #6153 idea); a GPU that stopped answering ends the engine (#5990); `/v1/messages` timings and decode speed in the monitor.
+- **Low-RAM / small-VRAM (upstream Strata v0.2.17)**: setup's RAM budget is the RAM less 17 GB from 64 GB up (old rule below 64 GB), with the reading rounded to the PC's sold size; cgroup v1 clean-cache credit and hybrid hosts; `STRATA_ADAPT_FETCH=2` default on RTX 50 cards of 16 GB or less (#2964), opt-in elsewhere; the layer-major walk counts the model's experts (#5104, #6018).
+- **Setup**: a 1-GPU tuned profile (`--speedy-profile tuned`, default) writes our presets' route prior, routed prompt stream, two-pass select, GDN tensor cores and tool-call env; the tuned MTP drafter (`--mtp-drafter tuned`, default; Qwen Community License 1.0, licenses/Qwen-Community-License-1.0.txt); ccache/sccache off for vendored ggml builds (#6172); Hyper-V GPU-PV detection (#4718); WDDM shared reserve on 2+ cards; port-busy check before the download; python fallback in setup.sh.
+- **Nudges and caps**: the reasoning nudge is skipped when the reply has no room left for it, and no staged nudges are sent under short max_tokens; a nudge keeps a forced tool call (`tool_choice`); the 6144-token tool-step thinking cap applies only when the request names no thinking budget of its own.
+- **Setup VRAM fit check** (#25): a single-GPU Flash-Next config that cannot fit the card is caught before the download, with a clear error naming the card, the need and the options; an engine that exits at start prints a hint on the likely cause.
+- **Resident quant pick on big cards** (#23): setup picks the best quant a large card holds fully resident; docs/BENCHMARKS.md notes `cache_prompt`.
+- **setup.sh** (#24): python fallback, free-port check, benchmark doc.
+- serve/version.py -> 0.5.0.
+
 ## Speedy 0.4.12 (2026-11-19)
 - **Quoted `</think>` stays reasoning**: a typed `\n` right before the tag with a quote or backtick up to four characters back (`` `\n</think>\n\n` ``) is the model writing about its own tag, so the thinking no longer ends there. A real line break after the tag still ends it.
 - **TCP_NODELAY on accepted sockets** (on by default, `STRATA_TCP_NODELAY=0` keeps Nagle on): small SSE chunks go out at once instead of waiting on the client's delayed ACK.

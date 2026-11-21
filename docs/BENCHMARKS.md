@@ -30,6 +30,10 @@ are kept by the maintainers; every number here is copied from them, and nothing 
   is discarded and re-run.
 - **Noise floor** (repeated controls): prefill +-0.5 %; decode +-4-8 % (the adaptive expert tier changes which experts
   sit in VRAM between runs). A decode difference inside that band is reported as "no change".
+- **`cache_prompt` and resident cards** (#23): Speedy honours `"cache_prompt": false`, so each rep re-reads the whole
+  prompt; upstream Strata may reuse the conversation cache despite it, so compare prefill between the two with care.
+  On a card that holds every expert (e.g. a 96 GB RTX PRO 6000), server state dominates: A/B arms need interleaved
+  fresh-server ABBA (a fresh server per arm, alternating), and decode differences under ~15 % are noise there.
 - **Quality gate** (for anything that changes arithmetic): the short gate = 8 delegation coding tasks (T1-T8) + 4 real
   repository bug fixes, medium reasoning, must match the control; plus a long-context needle test (64K-200K) for
   changes to KV or attention. Bitwise changes need their parity test instead.
