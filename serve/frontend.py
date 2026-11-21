@@ -53,6 +53,9 @@ class ChatTemplate:
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
+        # opt-in (the server sets it from STRATA_SKIP_EMPTY_THINK): a history turn without thinking renders no
+        # thinking block instead of an empty one (a template that does not know the variable ignores it)
+        self.skip_empty_think = False
         self.caps = self._detect_caps()
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
@@ -63,6 +66,8 @@ class ChatTemplate:
                     if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
                                                       and not _text_of(m.get("content")).strip()
                                                       and not _has_image(m.get("content")) and not m.get("tool_calls"))]
+        if self.skip_empty_think:
+            kwargs.setdefault("strata_skip_empty_think", True)
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
 
@@ -541,6 +546,16 @@ def tool_arguments(raw) -> dict:
     return {"arguments": json.dumps(raw, ensure_ascii=False)}
 
 
+class CallList(list):
+    """An assistant turn's tool calls, with the ids the client sent for them (`ids`, one per call).  The ids stay off
+    the message and its calls (the template renders those, and a history with ids converts to the same messages as one
+    without); the reasoning restore reads them (Service._turn_call_ids).  A copy that is a plain list has none."""
+
+    def __init__(self, calls=(), ids=()):
+        super().__init__(calls)
+        self.ids = list(ids)
+
+
 def require_messages(messages: list) -> None:
     """A chat request with no message at all is a 400 (OpenAI: "empty array. Expected an array with minimum length 1"); the
     template would otherwise render just the assistant turn and the model would answer nothing."""
@@ -572,8 +587,9 @@ def _order_chat_tool_results(messages: list[dict]) -> None:
         i = j
     for message in messages:
         message.pop("_call_id", None)
-        for call in message.get("tool_calls") or []:
-            call.pop("_call_id", None)
+        ids = [call.pop("_call_id", None) for call in message.get("tool_calls") or []]
+        if any(isinstance(cid, str) and cid for cid in ids):
+            message["tool_calls"] = CallList(message["tool_calls"], ids)
 
 
 # A tool call id names the response that issued it (OutputParser.new_id): "call_<16 hex>_<n>".
@@ -676,6 +692,10 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
+    # the template's own switch: false leaves out the thinking of the turns before the last user message
+    keep = (req.get("chat_template_kwargs") or {}).get("preserve_thinking")
+    if isinstance(keep, bool):
+        kwargs["preserve_thinking"] = keep
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 
@@ -1309,7 +1329,152 @@ def coerce_value(value: str, declared, notes: list | None = None):
             return json.loads(v)
         except ValueError:
             return coerce_value(v, declared, notes)
+    if isinstance(v, str) and not _declares(declared, "string"):
+        # a number or boolean the model wrote quoted (`"42"`, `"true"`): the declared type decides (ideas from Sneo, MIT)
+        t = v.strip()
+        if _declares(declared, "integer") and re.fullmatch(r"-?\d+", t):
+            return int(t)
+        if _declares(declared, "number") and re.fullmatch(r"-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?", t):
+            return float(t) if any(c in t for c in ".eE") else int(t)
+        if _declares(declared, "boolean") and t.lower() in ("true", "false"):
+            return t.lower() == "true"
     return v
+
+
+def _declared_type(prop):
+    """The `type` a parameter's schema declares (None when it declares none)."""
+    return prop.get("type") if isinstance(prop, dict) else None
+
+
+def _tool_params(schema):
+    """#6285: the (properties, required) a tool's schema declares; ({}, []) when it declares none."""
+    params = schema.get("parameters") if isinstance(schema, dict) else None
+    if not isinstance(params, dict):
+        return {}, []
+    props = params.get("properties")
+    required = params.get("required")
+    return (props if isinstance(props, dict) else {}), (required if isinstance(required, list) else [])
+
+
+def without_plural(name):
+    """#6285: the parameter name a model writes when it drops the plural of a declared one (`commands` -> `command`,
+    `queries` -> `query`); None when `name` carries no plural to drop."""
+    if not isinstance(name, str) or len(name) < 2 or name.endswith("ss"):
+        return None
+    if name.endswith("ies") and len(name) > 3:
+        return name[:-3] + "y"
+    if name.endswith("s"):
+        return name[:-1]
+    return None
+
+
+def is_string_array(prop):
+    """#6285: a parameter declared `array` whose items are strings."""
+    if not isinstance(prop, dict) or _declared_type(prop) != "array":
+        return False
+    items = prop.get("items")
+    return isinstance(items, dict) and _declares(_declared_type(items), "string")
+
+
+def borrowed_parameter(written, props, required):
+    """#6285: the declared parameter a `<parameter=WRITTEN>` opener means when the model wrote its name without the
+    plural `s`: only when the tool declares exactly one required parameter, that parameter is an array of strings, and
+    WRITTEN is its name minus the `s` (`command` for `commands`, `file` for `files`).  Any other write is left alone: a
+    tool that declares `command` itself has no slip to guess, and neither has one with two required parameters."""
+    if not isinstance(written, str) or not written or written in props or len(required) != 1:
+        return None
+    name = required[0]
+    if not isinstance(name, str) or not is_string_array(props.get(name)) or without_plural(name) != written:
+        return None
+    return name
+
+
+def string_items(value, name):
+    """#6285: an array of strings a model wrote as an array of objects: the object's field named the parameter's
+    singular (`{"query": "x", ...}` for `queries`), or the one string field it carries (`{"cmd": "ls",
+    "is_background": false}`); a string member stays itself.  None when a member leaves the reading open (no such field,
+    or more than one string field)."""
+    singular = without_plural(name)
+    out = []
+    for item in value:
+        if isinstance(item, str):
+            out.append(item)
+            continue
+        if not isinstance(item, dict):
+            return None
+        if singular is not None and isinstance(item.get(singular), str):
+            out.append(item[singular])
+            continue
+        strings = [v for v in item.values() if isinstance(v, str)]
+        if len(strings) != 1:
+            return None
+        out.append(strings[0])
+    return out
+
+
+def repair_arguments(args, schema=None, notes=None):
+    """#6285: the arguments a call wrote in a shape the tool's schema does not declare, read as the call it meant.
+    Three slips, each only when the schema settles the reading:
+      * the call's parameters inside one JSON object under an undeclared `arguments` (the OpenAI call shape),
+      * a parameter named without its plural `s` (borrowed_parameter), its text read as the array of one string,
+      * an array of strings written as an array of objects (string_items).
+    Anything the schema does not settle stays as written; each repair is noted in `notes` (the server's repaired-line,
+    #4427)."""
+    props, required = _tool_params(schema)
+    if not props or not isinstance(args, dict) or not args:
+        return args
+    out = dict(args)
+    inner = out.get("arguments")
+    if isinstance(inner, dict) and inner and "arguments" not in props and all(k in props for k in inner):
+        del out["arguments"]
+        for k, v in inner.items():
+            if k in out:               # Speedy: a parameter the call also wrote itself keeps its own write (the stream sent it)
+                continue
+            declared = _declared_type(props.get(k))
+            if isinstance(v, str) and declared is not None and not _declares(declared, "string"):
+                v = coerce_value(v, declared, notes)
+                if v is _SKIP:
+                    continue
+            out[k] = v
+        if notes is not None:
+            notes.append("an `arguments` object was read as the call's own parameters")
+    borrowed = False
+    for k in [k for k in out if k not in props]:
+        name = borrowed_parameter(k, props, required)
+        if name is None:
+            continue
+        v = out.pop(k)
+        if isinstance(v, str):
+            v = [v]                    # the text is the one-string array the parameter was declared to be
+        if name not in out:            # a call that also wrote the declared name keeps its own write
+            out[name] = v
+            borrowed = True
+    if borrowed and notes is not None:
+        notes.append("a parameter named without its plural `s` was read as the declared one")
+    flattened = 0
+    for k, v in out.items():
+        if isinstance(v, list) and v and any(not isinstance(x, str) for x in v) and is_string_array(props.get(k)):
+            flat = string_items(v, k)
+            if flat is not None:
+                out[k] = flat
+                flattened += 1
+    if flattened and notes is not None:
+        notes.append("an array of objects was read as the strings it carries")
+    return out
+
+
+
+def _cut_at_next_param(value: str, pname: str, props: dict, given) -> str:
+    """A value whose `</parameter>` the model left out runs into the next parameter (`...\n<parameter=content>...`).  Cut it
+    there when that is a parameter the tool declares, other than this one and not yet given, the value holds no
+    `</parameter>` or `<function=` of its own (so it is not a file that quotes the format), and the tag starts a line (ideas from Sneo, MIT)."""
+    if not props or PARAM_END in value or FUNC_START in value:      # a value that quotes a call is not cut
+        return value
+    for m in re.finditer(r"(?:^|\n)[ \t]*<parameter=\s*([^<>\s]+)\s*>", value):
+        k = m.group(1)
+        if k != pname and k in props and k not in given:
+            return value[:m.start()]
+    return value
 
 
 def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = None) -> ToolCall:
@@ -1331,6 +1496,12 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
         end = param_end(rest, final=True, name=pname.strip(), allow_reopen=(declared == "string" or declared is None))
         value = rest[:end] if end >= 0 else rest
         rest = rest[end + len(PARAM_END):] if end >= 0 else ""
+        cut = _cut_at_next_param(value, pname.strip(), props, args)
+        if cut != value:                     # the rest of this value is the next parameter(s): read them on
+            rest = value[len(cut):] + (PARAM_END + rest if end >= 0 else "")
+            value = cut
+            if notes is not None:
+                notes.append(f"a missing </parameter> after {pname.strip()} was supplied")
         if value.startswith("\n"):
             value = value[1:]
         if value.endswith("\n"):
@@ -1342,7 +1513,7 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
     # schema's parameters.  When the tool does not declare such a parameter, its members are the call's arguments.
     if len(args) == 1 and "arguments" not in props and isinstance(args.get("arguments"), dict):
         args = args["arguments"]
-    return ToolCall(name=name, arguments=args)
+    return ToolCall(name=name, arguments=repair_arguments(args, schema, notes))
 
 
 RCALL_MAX = 32768        # the most of a `<tool_call>` inside the reasoning that is held while waiting for its end (#804)
@@ -1723,6 +1894,9 @@ class OutputParser:
         self.svstart = 0
         self.sunwrapped = False      # the parameter being read is the whole argument object
         self.sunvalue = None         # ... and its parsed value, held until the call's </function>
+        self.sjson = ""              # #6285: the argument JSON of this call so far (sent, then held)
+        self.shold_at = -1           # where in sjson holding began (a repair may change the rest); -1: not holding
+        self.sprops = {}
 
     def _wrapped_call_end(self) -> int:
         # Without a closing tag the structural walk cannot finish. Search only
@@ -1744,7 +1918,13 @@ class OutputParser:
 
         def args(s):
             if s:
-                out.append(Event("tool_args", s, call=self.scall))
+                self.sjson += s
+                if self.shold_at < 0:
+                    out.append(Event("tool_args", s, call=self.scall))
+
+        def hold():                  # #6285: what follows may be repaired (repair_arguments): sent at the close
+            if self.shold_at < 0 and self.sprops:
+                self.shold_at = len(self.sjson)
         while True:
             rest = self.buf[self.sp:]
             if self.ss == "name":
@@ -1761,6 +1941,7 @@ class OutputParser:
                 self._stamp([Event("tool_start", call=self.scall)])   # its final event copies this id
                 props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
                 self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
+                self.sprops = props
                 out.append(Event("tool_start", call=self.scall))
                 args("{")
                 self.sp += b + 1
@@ -1777,6 +1958,8 @@ class OutputParser:
                     self.sp += b + 1
                     self.sraw_pname = pname
                     self.spname = pname.strip()
+                    if self.spname not in self.sdeclared or self.sunvalue is not None:
+                        hold()                       # an undeclared name (a slip repair_arguments may read)
                     if self.sunvalue is not None:    # a second parameter: the member form after all
                         args('"arguments":' + json.dumps(self.sunvalue, ensure_ascii=False))
                         self.sfirst = False
@@ -1846,6 +2029,9 @@ class OutputParser:
                 if self.sunwrapped and isinstance(v, dict) and not dup_later:
                     self.sunvalue = v            # the whole argument object: sent at the call's </function>
                 elif v is not _SKIP and not dup_later and self.sraw_pname not in self.sseen:
+                    if isinstance(v, list) and any(not isinstance(x, str) for x in v) \
+                            and is_string_array(self.sprops.get(self.sraw_pname)):
+                        hold()                       # objects for a string array: string_items may flatten them
                     args(("" if self.sfirst else ",") + json.dumps(self.sraw_pname) + ":" + json.dumps(v, ensure_ascii=False))
                     self.sfirst = False
                     self.sseen.add(self.sraw_pname)
@@ -1877,9 +2063,34 @@ class OutputParser:
             tail += json.dumps(self.sunvalue, ensure_ascii=False)[1:-1]
             self.sunvalue = None
         tail += "}"
+        if self.shold_at >= 0:      # #6285: the held rest, read as the final call reads it (parse_tool_call)
+            tail = self._repaired_tail(tail)
+            self.shold_at = -1
         out.append(Event("tool_args", tail, call=self.scall))
         self.ss = "done"
         return out
+
+    def _repaired_tail(self, tail: str) -> str:
+        """The held JSON plus `tail`, with the members repair_arguments changes: the keys already sent stay as sent."""
+        sent, rest = self.sjson[:self.shold_at], self.sjson[self.shold_at:] + tail
+        try:
+            whole = json.loads(sent + rest)
+            done = json.loads(sent.rstrip().rstrip(",") + "}")
+        except ValueError:
+            return rest
+        if not isinstance(whole, dict) or not isinstance(done, dict):
+            return rest
+        fixed = repair_arguments(whole, self.schemas.get(self.scall.name))
+        if fixed == whole:
+            return rest
+        first = not done and sent.rstrip().endswith("{")
+        out = ""
+        for k, v in fixed.items():
+            if k in done:
+                continue
+            out += ("" if first else ",") + json.dumps(k) + ":" + json.dumps(v, ensure_ascii=False)
+            first = False
+        return out + "}"
 
     def _hold(self, text: str, tags: tuple[str, ...]) -> int:
         """Length of the longest suffix of `text` that is a proper prefix of one of `tags`."""
@@ -2153,7 +2364,7 @@ class OutputParser:
                     # recover: <function=NAME> alone at the start of a line - the call without its <tool_call>.
                     # Until the name has arrived it is held.
                     j = b
-                    while j > 0 and self.buf[j - 1] == "\n":
+                    while j > 0 and self.buf[j - 1] in "\n \t":     # the line break and an indent before the opener
                         j -= 1
                     if j > 0 and self.buf[:j].strip():
                         out.append(Event("content", self._track(self.buf[:j])))
@@ -2170,7 +2381,8 @@ class OutputParser:
                     if self.recover and self.schemas:            # a line that may be becoming a bare <function=
                         k = self.buf.rfind("\n") + 1
                         tail = self.buf[k:]
-                        if tail and FUNC_START.startswith(tail) and self._ok_at(k):
+                        opener = tail.lstrip(" \t")         # indented like _opener_ok allows: whole parsing takes it
+                        if tail and FUNC_START.startswith(opener) and self._ok_at(k + len(tail) - len(opener)):
                             j = min(j, k)
                     while j > 0 and self.buf[j - 1] == "\n":
                         j -= 1

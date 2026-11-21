@@ -64,6 +64,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve.frontend import (CALL_START, THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages, anthropic_tools,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)
+from serve.frontend import _STEP_ID  # noqa: E402  (the form of the tool call ids this server gives out)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
@@ -82,6 +83,7 @@ from serve import ready as ready_file  # noqa: E402
 from serve import owner_guard  # noqa: E402
 from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
+from serve import tool_name_constraint as tnc_api  # noqa: E402
 from serve import toolguard  # noqa: E402
 from serve import update_check  # noqa: E402
 from serve.version import SPEEDY_VERSION  # noqa: E402
@@ -205,6 +207,8 @@ def write_temporary(path: Path, parts: list) -> None:
 # #458: the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
 # template says nothing for: no xhigh sentence is medium there) says it, since the xhigh one stays at the top
 EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
+REASONING_KEPT_MAX = 4096                        # remembered answers, and tool call ids, kept with their thinking (LRU)
+REASONING_KEPT_MB = 256                          # and their size at most, each of the two (STRATA_REASONING_CACHE_MB)
 EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the "
                       "conclusion without unnecessary elaboration.",
                "medium": "Reasoning effort is set to medium. Think as much as the task needs, without unnecessary "
@@ -222,6 +226,23 @@ ANSWER_ROOM_MIN_CAP = 1024    # 0.1.45: from this max_tokens on, thinking withou
 DS41_DEFAULT_BUDGET = 32768   # DeepSeek-V4.1 only: the thinking budget when neither the request nor the config names one
 DS41_SMALL_CAP_MIN = 48       # DeepSeek-V4.1 only: from this max_tokens up to ANSWER_ROOM_MIN_CAP, thinking is capped at half of it
 ANSWER_RESERVE_MIN = 512     # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
+# Answer-room reserve (llamAmpere v0.7.2 idea, Speedy 0.5.0): from this max_tokens up to ANSWER_ROOM_MIN_CAP the
+# thinking is also closed early (any family), at answer_reserve(max_tokens) before the cap.  max_new is already
+# clipped to the context left (prepare()), so the same reserve also holds before the context end.
+ANSWER_ROOM_SMALL_MIN = 128
+
+
+def answer_reserve(limit: int) -> int:
+    """Tokens kept for the answer under a reply limit (max_tokens, or the context left):
+    max(limit/4, min(512, limit/2))."""
+    limit = max(0, int(limit or 0))
+    return max(limit // 4, min(ANSWER_RESERVE_MIN, limit // 2))
+
+
+def answer_room_env_off(env=None) -> bool:
+    """STRATA_ANSWER_ROOM=0/false/off turns the answer-room reserve off (as "answer_room": false in the config)."""
+    v = (os.environ if env is None else env).get("STRATA_ANSWER_ROOM", "")
+    return str(v).strip().lower() in ("0", "false", "off", "no")
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
@@ -291,6 +312,8 @@ def toolcall_repair_tries(value) -> int:
         return 0
 
 
+NUDGE_TEXT = ["\n\n(Note: about 60% of my thinking budget is used. I should start converging and wrap up soon, then give the answer.)\n\n",
+              "\n\n(Note: my thinking budget is almost used up. I must wrap up now, close the thinking and give the final answer.)\n\n"]
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
@@ -382,8 +405,10 @@ RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean s
 ENGINE_SILENCE_S = 300.0
 # #4271: a streaming client that stops reading (a hung process, a network that dropped) leaves the thread that writes to
 # it blocked once the socket buffers are full - and that thread holds the engine's turn.  A write that makes no progress
-# for this long ends the request as a disconnect (the engine is stopped, the turn given back).  0: no limit, as before.
-STREAM_WRITE_TIMEOUT_S = float(os.environ.get("STRATA_STREAM_WRITE_TIMEOUT_S", "0") or 0)
+# for this long ends the request as a disconnect (the engine is stopped, the turn given back).  0: no limit.
+# Speedy 0.5.0 (Strata #6153 idea): on by default at 120 s (was 0) - the stream is pulled by its writer, so a slow
+# reader never piles up events in memory, but a reader that stops altogether held the engine's turn for good.
+STREAM_WRITE_TIMEOUT_S = float(os.environ.get("STRATA_STREAM_WRITE_TIMEOUT_S", "120") or 0)
 # Disk sessions: the longest allowance an engine may announce (`SWAIT <phase> <s>`) for one step that blocks in a
 # single call (a file flush, the host->device transfer); the engine's own bound is the same (session_phase_limit_s).
 SESSION_WAIT_MAX_S = 3600
@@ -601,10 +626,38 @@ def start_failure_hint(log: str | None, offset: int) -> str:
     except (OSError, ValueError):
         return ""
     if DRAFT_HEAD_FAIL not in text:
-        return ""
+        return expert_cache_fail_hint(text)
     said = [x.strip()[len("strata mtp: "):] for x in text.splitlines()
             if x.strip().startswith("strata mtp: ") and ("draft head over" in x or "hint:" in x)]
     return ". mtp: " + DRAFT_HEAD_FAIL + ". " + (" ".join(said) if said else "Hint: " + DRAFT_HEAD_HINT)
+
+
+EXPERT_CACHE_FAIL = "no VRAM is left for the expert cache"
+EXPERT_CACHE_SHORT = re.compile(r"about (\d+) MiB more than this card has free")
+EXPERT_CACHE_SESSION = re.compile(r"takes (\d+) MiB at (\d+) tokens")
+
+
+def expert_cache_fail_hint(text: str) -> str:
+    """#25: the start stopped because the session (mostly its KV cache) left the expert cache under its minimum:
+    say plainly that the context is too large for this card and which --max-context fits, from the engine's own
+    figures (how much is short, what the session takes at this context).  "" for any other failure."""
+    line = next((x for x in reversed(text.splitlines()) if EXPERT_CACHE_FAIL in x), None)
+    if line is None:
+        return ""
+    short, sess = EXPERT_CACHE_SHORT.search(line), EXPERT_CACHE_SESSION.search(line)
+    setup = "START-HERE.bat --setup" if os.name == "nt" else "./setup.sh"
+    if not (short and sess):
+        return (f". The context is too large for this card: no VRAM is left for the expert cache. Rerun setup with a "
+                f"smaller context ({setup} --context 32768) or --kv q4_0")
+    need, mib, ctx = int(short.group(1)), int(sess.group(1)), int(sess.group(2))
+    fits = next((c for c in (131072, 65536, 32768, 16384, 8192)
+                 if c < ctx and mib * c / ctx <= mib - need - 256), None)   # the session scales with the context
+    if fits is None:
+        return (f". No VRAM is left for the expert cache ({need} MiB short) even with a small context: rerun setup "
+                f"with {setup} --context 8192 --kv q4_0 --draft-vocab en, or close other programs that use the GPU")
+    return (f". The context is too large for this card: {ctx} tokens leave the expert cache {need} MiB short of its "
+            f"minimum. Rerun setup with a context of {fits} ({setup} --context {fits}; the engine's --max-context "
+            f"{fits}), or keep the context with --kv q4_0")
 
 
 def start_log_text(log: str | None, offset: int, limit: int = 1 << 20) -> str:
@@ -1656,6 +1709,9 @@ class StrataEngine:
             if ids:
                 # only these ids are printed; the engine's comma-separated list, renormalised below
                 keys += " allowed=" + ",".join(str(i) for i in ids)
+        tnc = sampling.get("_tool_name_constraint")          # built in Service._run from the declared tools (Strata #5969)
+        if isinstance(tnc, str) and tnc:
+            keys += " tool_name_constraint=" + tnc
         return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias"))
 
     @staticmethod
@@ -4074,9 +4130,10 @@ def vision_env(cfg: dict, env: dict, archs: dict[int, str] | None = None) -> dic
 
 class _Written(str):
     """Remembered thinking (the text the template renders) with the prompt ids and generated ids of its reply."""
-    def __new__(cls, text, prompt_ids=(), gen_ids=None):
+    def __new__(cls, text, prompt_ids=(), gen_ids=None, call_ids=()):
         self = super().__new__(cls, text)
         self.prompt_ids, self.gen_ids = list(prompt_ids[-8:]), gen_ids
+        self.call_ids = tuple(call_ids)              # the ids of the tool calls its reply made
         return self
 
 
@@ -4314,6 +4371,11 @@ class Service:
         # (_restore_reasoning)
         self.recent_reasoning: collections.OrderedDict[str, list[tuple[str, str]]] = collections.OrderedDict()
         self.reasoning_mu = threading.Lock()          # recent_reasoning: written by the generating thread, read by request threads
+        # the thinking of the latest tool-call replies by their emitted tool call ids: id -> (_Written, the reply's
+        # calls, size).  A client that drops reasoning_content still sends the ids back, and an id names its reply
+        # exactly, also when the same call (name and arguments) was made many times with the same result
+        self.reasoning_by_call: collections.OrderedDict[str, tuple[_Written, str, int]] = collections.OrderedDict()
+        self.reasoning_size = [0, 0]                  # about the bytes held by recent_reasoning, by reasoning_by_call
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
@@ -4411,10 +4473,12 @@ class Service:
         self.reasoning_loop_recovery = False
         self.reasoning_budget_configured = False         # the config named reasoning_budget_tokens (0 included): no family default
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
+        self.reasoning_budget_default = 0                # Speedy 0.5.0: main sets DEFAULT_REASONING_BUDGET (no config budget)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.canonical_tools = False                      # config "canonical_tools": true: tools sorted by name, keys sorted, for rendering only
         self.undeclared_tool_calls = "text"               # #4622: config "undeclared_tool_calls": "call" hands a call of an undeclared name to the client
+        self.tool_name_constraint = False                 # Strata #5969: config "tool_name_constraint": true masks tool names to the declared ones (serve/tool_name_constraint.py)
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
@@ -4661,6 +4725,8 @@ class Service:
             value = self.reasoning_budget_tokens
             if not value and self.family == "deepseek41" and not self.reasoning_budget_configured:
                 value = DS41_DEFAULT_BUDGET          # DeepSeek-V4.1 only, as Maya ships it: no budget anywhere = this one
+            elif not value and not self.reasoning_budget_configured:
+                value = self.reasoning_budget_default   # Speedy 0.5.0: 32768 (set in main) when the config names none
         if isinstance(value, float) and value.is_integer():
             value = int(value)
         if isinstance(value, bool) or not isinstance(value, int):
@@ -5351,7 +5417,12 @@ class Service:
         plain = ()
         if changed:
             prompt, plain = unmark_think_literals(prompt, self.literals)
-        spliced = None if plain else self._splice_restored(messages, prompt)
+        if plain:
+            spliced = None
+        elif kwargs.get("preserve_thinking") is False:   # the template left the older turns' thinking out itself
+            spliced = self._splice_restored(messages, prompt, log=False)
+        else:
+            spliced = self._splice_restored(messages, prompt)
         if spliced is not None:                  # text, ids, text, ...: the first text through the kept prompts (#567)
             out = self.prompts.encode(spliced[0], (), store) if self.prompts is not None else \
                 self.tok.encode(spliced[0], parse_special=True)
@@ -5733,11 +5804,52 @@ class Service:
         self.repeat_window = g.int_setting(g.env_value("STRATA_REPEAT_WARN_WINDOW", cfg_env), g.REPEAT_WINDOW,
                                            low=1) or g.REPEAT_WINDOW
         self._tok_per_char = getattr(self, "_tok_per_char", 0.3)   # learned from each prompt (drop_thinking estimate)
+        # loopbreak-1120 (opt-in): STRATA_LOOP_BREAKER=1 -> tier 1 note naming the next action (same call + same result,
+        # no write between), a thinking floor only on the reply after such a turn, tier 2 masks the repeated tool name
+        # for one reply after the 2nd consecutive loop turn (needs an engine with tool_name_constraint v2).
+        lb = g.env_value("STRATA_LOOP_BREAKER", cfg_env)       # Speedy 0.5.0: on unless 0 / false / off
+        self.loop_breaker = True if lb is None or str(lb).strip() == "" else g.flag(lb)
+        self.loop_floor = g.int_setting(g.env_value("STRATA_LOOP_BREAKER_FLOOR", cfg_env), g.LOOP_FLOOR)
+        lm = g.env_value("STRATA_LOOP_BREAKER_MASK", cfg_env)
+        self.loop_mask = True if lm is None or str(lm).strip() == "" else g.flag(lm)
+        # cand-1120 tests (opt-in, default off): another note text; the streak at which the mask starts; a cap on the
+        # thinking of a reply whose </think> was held by a floor (the held tag made degenerate filler run to the
+        # budget in 9zz2 L2/L3); a cap on the thinking of any reply that follows a tool result.
+        self.loop_note = (g.env_value("STRATA_LOOP_BREAKER_NOTE", cfg_env) or "").strip() or g.LOOP_NOTE
+        self.loop_mask_streak = g.int_setting(g.env_value("STRATA_LOOP_BREAKER_MASK_STREAK", cfg_env), 2, low=1) or 2
+        self.think_floor_cap = g.int_setting(g.env_value("STRATA_THINK_FLOOR_CAP", cfg_env), 0)
+        self.tool_step_think_cap = g.int_setting(g.env_value("STRATA_TOOL_STEP_THINK_CAP", cfg_env),
+                                                  g.TOOL_STEP_THINK_CAP)
+        # the reasoning restore (_restore_reasoning) is on unless STRATA_REASONING_RESTORE is 0 / false / off / no
+        self.reasoning_restore = str(g.env_value("STRATA_REASONING_RESTORE", cfg_env) or "1").strip().lower() \
+            not in ("0", "false", "off", "no")
+        self.reasoning_kept_bytes = (g.int_setting(g.env_value("STRATA_REASONING_CACHE_MB", cfg_env), REASONING_KEPT_MB,
+                                                   low=1) or REASONING_KEPT_MB) << 20
+        # opt-in (STRATA_SKIP_EMPTY_THINK=1): a history turn whose thinking is not known (not sent, not restored)
+        # renders without a thinking block instead of an empty one
+        if g.env_value("STRATA_SKIP_EMPTY_THINK", cfg_env) is not None and hasattr(self.template, "skip_empty_think"):
+            self.template.skip_empty_think = g.flag(g.env_value("STRATA_SKIP_EMPTY_THINK", cfg_env))
 
     def _toolguard_prompt(self, messages, cancel=None) -> None:
         """Before the render: the repeat note (STRATA_REPEAT_WARN) and old thinking dropped (STRATA_DROP_THINKING_ABOVE).
         Both are functions of the history alone, so a conversation's prefix renders the same on every request."""
-        if getattr(self, "repeat_warn", False):
+        if getattr(self, "loop_breaker", False):
+            try:
+                loops = toolguard.mark_loops(messages, self.repeat_window, getattr(self, "loop_note", toolguard.LOOP_NOTE))
+            except Exception as e:              # noqa: BLE001 - a guard never fails a request
+                loops = []
+                print(f"[strata] loop breaker skipped: {e}", flush=True)
+            if cancel is not None:
+                try:
+                    setattr(cancel, "_strata_loop", loops)
+                except Exception:               # noqa: BLE001
+                    pass
+            for r in loops:
+                with self.status_lock:
+                    self.totals["tool_call_repeats"] = self.totals.get("tool_call_repeats", 0) + 1
+                print(f"[strata] loop breaker: {r['name']} same call + same result (streak {r['streak']}): note added",
+                      flush=True)
+        elif getattr(self, "repeat_warn", False):
             try:
                 reps = toolguard.mark_repeats(messages, self.repeat_window)
             except Exception as e:              # noqa: BLE001 - a guard never fails a request
@@ -5870,17 +5982,47 @@ class Service:
         if not reasoning:
             return
         end = self.tok.decode(ids[-160:])
+        kept = _Written(reasoning, ids, gen_ids, [c.id for c in calls or () if isinstance(getattr(c, "id", None), str)])
+        size = self._reasoning_size(end, kept)
+        limit = getattr(self, "reasoning_kept_bytes", REASONING_KEPT_MB << 20)
         with self.reasoning_mu:
+            held = self.reasoning_size
             written = self.recent_reasoning.setdefault(key, [])
-            written.append((end, _Written(reasoning, ids, gen_ids)))
+            written.append((end, kept))
+            held[0] += size
+            for old_end, old in written[:-32]:
+                held[0] -= self._reasoning_size(old_end, old)
             del written[:-32]
             self.recent_reasoning.move_to_end(key)
             # every turn of a long agent thread keeps its thinking: a turn whose thinking was forgotten renders without
             # it, and the prompt leaves the conversation cache at that turn (~2 KB each)
-            while len(self.recent_reasoning) > 4096:
-                self.recent_reasoning.popitem(last=False)
+            while len(self.recent_reasoning) > REASONING_KEPT_MAX or held[0] > limit:
+                oldest = next(iter(self.recent_reasoning))
+                if oldest == key:                    # only this reply's answer is left: its older replies go first
+                    if len(written) < 2:
+                        break                        # the newest reply stays, whatever its size
+                    held[0] -= self._reasoning_size(*written.pop(0))
+                else:
+                    held[0] -= sum(self._reasoning_size(e, w) for e, w in self.recent_reasoning.pop(oldest))
+            sig = self._answer_key("", calls)
+            for c in calls or ():
+                cid = getattr(c, "id", None)
+                if isinstance(cid, str) and cid:
+                    was = self.reasoning_by_call.pop(cid, None)       # (an id seen again names the newer reply)
+                    held[1] += size - (was[2] if was else 0)
+                    self.reasoning_by_call[cid] = (kept, sig, size)
+            # the newest reply's own ids stay (its calls are the last entries), whatever its size
+            while len(self.reasoning_by_call) > REASONING_KEPT_MAX or \
+                    (held[1] > limit and len(self.reasoning_by_call) > len(calls or ())):
+                _, gone = self.reasoning_by_call.popitem(last=False)
+                held[1] -= gone[2]
 
-    def _splice_restored(self, messages, prompt):
+    @staticmethod
+    def _reasoning_size(end, kept) -> int:
+        """About the bytes one remembered reply holds: its text and its generated ids (a list of ints)."""
+        return len(end) + len(kept) + 36 * len(kept.gen_ids or ()) + 512
+
+    def _splice_restored(self, messages, prompt, log=True):
         """Restored turns' own token ids.  The template renders a turn as '<think>\\n' + thinking|trim + '\\n</think>\\n\\n'
         + answer, and that text re-tokenized is not what the model wrote when its thinking began with whitespace (it
         often writes '\\n' or ' ' first: trimmed away, or merged with the prompt's '\\n' into one '\\n\\n' token), so
@@ -5895,6 +6037,8 @@ class Service:
             if not isinstance(r, _Written):
                 continue
             why, gen, body = self._restored_ids(r, m, opener)
+            if why is None and m.get("tool_calls"):
+                why, body = Service._tool_turn_body(body, prompt, at, mark)
             if why is None:
                 found = prompt.find(mark + body, at)
                 if found >= 0:
@@ -5903,9 +6047,10 @@ class Service:
                     at = found + len(body)
                     continue
                 why = "its text is not in the rendered prompt"
-            print(f"[strata] restored turn not spliced: {why} (thinking {len(r)} chars, answer "
-                  f"{len(m.get('content') or '') if isinstance(m.get('content'), str) else -1} chars, "
-                  f"{len(r.gen_ids or ())} generated ids)", flush=True)
+            if log:
+                print(f"[strata] restored turn not spliced: {why} (thinking {len(r)} chars, answer "
+                      f"{len(m.get('content') or '') if isinstance(m.get('content'), str) else -1} chars, "
+                      f"{len(r.gen_ids or ())} generated ids)", flush=True)
         return parts + [prompt[at:]] if parts else None
 
     def _restored_ids(self, r, m, opener):
@@ -5914,7 +6059,8 @@ class Service:
         by max_tokens after a space or newline ends past the rendered text); else (reason, None, None)."""
         if not r.gen_ids:
             return "no generated ids", None, None
-        if not isinstance(m.get("content"), str) or m.get("tool_calls"):
+        calls = bool(m.get("tool_calls"))
+        if not calls and not isinstance(m.get("content"), str):
             return "answer is not plain text", None, None
         if list(r.prompt_ids[-len(opener):]) != opener:
             return "its prompt did not end with the thinking opener", None, None
@@ -5928,6 +6074,8 @@ class Service:
         if th.strip() != r:
             return "generated thinking differs from the remembered one", None, None
         answer = text.split("</think>", 1)[1]
+        if calls:   # checked against the rendered turn by _tool_turn_body
+            return None, gen, ("<think>\n" + th.strip() + "\n</think>\n\n", answer)
         if answer.strip().rstrip("\ufffd") != m["content"].strip().rstrip("\ufffd"):   # (a cut inside a character)
             return f"generated answer ({len(answer)} chars) differs from the sent one", None, None
         # all of the generated ids, whitespace the template trims included: the engine reuses a session only when ALL
@@ -5935,50 +6083,121 @@ class Service:
         # at the end of the turn sent the prompt back to the session holding the turn's prompt alone
         return None, gen, "<think>\n" + th.strip() + "\n</think>\n\n" + m["content"].strip()
 
+    @staticmethod
+    def _tool_turn_body(head_answer, prompt, at, mark):
+        """A restored tool-call turn: (None, the text the template rendered for it) when the reply's generated answer
+        (its text and tool calls) is that text up to the whitespace the template trims, else (reason, None).  The
+        template writes the calls in its own layout, so the check is on the rendered prompt itself."""
+        head, answer = head_answer
+        found = prompt.find(mark + head, at)
+        if found < 0:
+            return "its text is not in the rendered prompt", None
+        start = found + len(mark) + len(head)
+        end = prompt.find("<|im_end|>", start)
+        if end < 0:
+            return "its turn has no end in the rendered prompt", None
+        rendered = prompt[start:end]
+        if rendered.strip() != answer.strip():
+            return f"generated tool-call turn ({len(answer)} chars) differs from the rendered one ({len(rendered)})", None
+        return None, head + rendered
+
     def _restore_reasoning(self, messages, log=True):
         """An assistant turn sent back without its thinking (OpenAI chat clients drop reasoning_content) gets the
         thinking this server wrote for that answer.  The template keeps a turn's thinking (preserve_thinking), so
         without it the prompt left the conversation cache at that turn and the whole answer was read again (~800
         tokens, 3-4 s on a streamed arena); with it the prompt is what the model wrote."""
+        if not getattr(self, "reasoning_restore", True):
+            return
         with self.reasoning_mu:
             self._restore_reasoning_locked(messages, log)
 
+    def _reasoning_by_id(self, m):
+        """(the remembered thinking of the reply that emitted this turn's tool calls, None), or (None, why not).  The
+        ids name the reply; the turn must still be that reply's calls, each with its id and in its order (name and
+        arguments as _answer_key reads them): a turn a client rewrote, split or merged is not the reply's any more and
+        gets nothing from here.  Text sent beside the calls is not compared (clients trim it or move it)."""
+        by = getattr(self, "reasoning_by_call", None)
+        calls = m.get("tool_calls")
+        if not by or not calls:
+            return None, None
+        ids = self._turn_call_ids(m)
+        hits = [by.get(cid) if isinstance(cid, str) else None for cid in ids]
+        if all(h is None for h in hits):
+            return None, None
+        if any(h is None for h in hits):
+            return None, "some of its tool call ids are not remembered"
+        if len(set(ids)) != len(ids) or any(h[0] is not hits[0][0] for h in hits):
+            return None, "its tool call ids are of different replies"
+        if hits[0][1] != self._answer_key("", calls):
+            return None, "its tool calls are not the ones the reply with these ids made"
+        for cid in ids:
+            by.move_to_end(cid)                      # a conversation in use keeps its turns' thinking
+        return hits[0][0], None
+
+    @staticmethod
+    def _turn_call_ids(m) -> list:
+        """The ids a client sent with an assistant turn's tool calls (frontend: CallList.ids), one per call."""
+        calls = m.get("tool_calls") or []
+        ids = getattr(calls, "ids", None)
+        if not isinstance(ids, list) or len(ids) != len(calls):
+            ids = [c.get("id") if isinstance(c, dict) else None for c in calls]
+        return ids
+
     def _restore_reasoning_locked(self, messages, log):
-        if not self.recent_reasoning:
+        if not self.recent_reasoning and not getattr(self, "reasoning_by_call", None):
             return
         for i, m in enumerate(messages):
             if m.get("role") != "assistant" or (m.get("reasoning_content") or "").strip():
                 continue
+            r, why = self._reasoning_by_id(m)
+            if r:
+                m["reasoning_content"] = r
+                continue
             key = self._answer_key(m.get("content"), m.get("tool_calls"))
-            r = self._reasoning_for(self.recent_reasoning.get(key), messages[i - 1] if i else None)
+            r = self._reasoning_for(self.recent_reasoning.get(key), messages[i - 1] if i else None,
+                                    self._turn_call_ids(m))
             if r:
                 m["reasoning_content"] = r
                 self.recent_reasoning.move_to_end(key)   # a conversation in use keeps its turns' thinking
             elif log and m is messages[-2 if len(messages) > 1 else -1]:
                 # only the turn before the new message is reported; a request with thinking off is quiet (its replies
                 # have no thinking to restore)
+                if why:
+                    print(f"[strata] reasoning not restored by tool call id: {why}", flush=True)
+                if not self.recent_reasoning:
+                    continue
                 best = max(self.recent_reasoning, key=lambda k: len(os.path.commonprefix([k, key])))
                 n = len(os.path.commonprefix([best, key]))
                 print(f"[strata] reasoning not restored: the previous answer ({len(key)} chars) matches none of the "
                       f"last {len(self.recent_reasoning)}; nearest ({len(best)} chars) differs at char {n}", flush=True)
 
     @staticmethod
-    def _reasoning_for(written, before):
+    def _reasoning_for(written, before, ids=()):
         """The thinking of the reply that wrote this turn: among the replies with this answer, the one whose prompt
         ended with the message this turn follows.  No such reply, none: another turn's thinking would change this
-        turn's text from one request to the next, and every request would leave the conversation cache there."""
+        turn's text from one request to the next, and every request would leave the conversation cache there.
+        `ids`: the turn's tool call ids.  When they are ids this server gave out (new_id's form), a reply that made
+        its calls under other ids is another reply, however alike its answer and the message before it are (the same
+        call with the same result, again and again): it is passed over.  A client's own ids say nothing."""
         if not written or before is None:
             return None
+        ours = tuple(ids) if ids and all(isinstance(c, str) and _STEP_ID.match(c) for c in ids) else None
         text = before.get("content")
         if isinstance(text, list):
             text = "".join(p.get("text", "") for p in text if isinstance(p, dict) and p.get("type") == "text")
         tail = text.strip()[-48:] if isinstance(text, str) else ""
         if not tail:
             return None
+        note = f"\n\n[Note: {toolguard.REPEAT_NOTE}]"
         for ctx, r in reversed(written):   # only the template's turn markers may follow it
-            at = ctx.rfind(tail)
-            if at >= 0 and len(ctx) - at - len(tail) <= 80:
-                return r
+            if ours and getattr(r, "call_ids", ()) and r.call_ids != ours:
+                continue
+            # ... and the repeat note (STRATA_REPEAT_WARN): it is added after the restore, to the server's copy of the
+            # message only, so the prompt that wrote this turn ended with it and the client's message does not
+            for end in (ctx, ctx.replace(note, "")) if note in ctx else (ctx,):
+                at = end.rfind(tail)
+                if at >= 0 and len(end) - at - len(tail) <= 80:
+                    return r
         return None
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
@@ -6020,15 +6239,24 @@ class Service:
                       + " ".join(f"{k}={sampling[k]}" for k in filled), flush=True)
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
+        room_only = False
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
             # 0.1.45: max_tokens counts the thinking too.  A client that caps the reply at 8192 (the desktop agent's
             # harness sends max_completion_tokens: 8192 on every request) and a task the model thinks long about got
             # the cut-off in the middle of the thinking and NO answer.  So thinking is closed early enough to leave
             # the answer its quarter of the cap (the budget's wrap-up: a short closing sentence, </think>, the answer).
             # A request with a budget of its own, or max_tokens below ANSWER_ROOM_MIN_CAP, is left as it was.
-            budget = max_new - min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
+            budget = max_new - answer_reserve(max_new)
             if max_new <= 32768: print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
                   "(\"answer_room\": false in the config turns this off)", flush=True)
+        if (thinking and not budget and self.answer_room and self.family != "deepseek41"
+                and max_new and ANSWER_ROOM_SMALL_MIN <= max_new < ANSWER_ROOM_MIN_CAP):
+            # Answer-room reserve (llamAmpere v0.7.2): a short max_tokens was spent on the thinking and the reply had
+            # no answer.  Close the thinking at answer_reserve(max_tokens) before the cap (half of it here).
+            budget = max(1, max_new - answer_reserve(max_new))
+            room_only = True        # a short cap: no staged nudges (their text would eat the answer's room)
+            print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
+                  "(STRATA_ANSWER_ROOM=0 or \"answer_room\": false turns this off)", flush=True)
         if (thinking and not budget and self.answer_room and self.family == "deepseek41"
                 and max_new and DS41_SMALL_CAP_MIN <= max_new < ANSWER_ROOM_MIN_CAP):
             # DeepSeek-V4.1 only: a short max_tokens (/v1/messages and /v1/chat/completions with 200-600) was spent
@@ -6040,14 +6268,39 @@ class Service:
         if budget and max_new and max_new > 0:
             # #984: a budget at or near max_tokens never fires before the reply is cut off while still thinking, so
             # it has no answer.  Close the thinking early enough to leave room for one.
-            reserve = min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
+            reserve = answer_reserve(max_new)
             if budget > max_new - reserve:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = self.parser_cls(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
+                if max_new < ANSWER_ROOM_MIN_CAP:
+                    room_only = True    # a short cap: no staged nudges, as on the answer-room path above
+        history_tools = with_history_tools(tools, sampling)
+        parser = self.parser_cls(thinking=thinking, tools=history_tools, stream_tools=True,
                                  recover=self.tool_call_recovery, declared_only=declared_only,
                                  deferred=deferred or self.undeclared_tool_calls == "call")   # #4622: opt-in, as for a deferred tool
+        # Strata #5969: engine-side constrained tool-name decoding (config "tool_name_constraint": true): only the names the
+        # request declared (as the parser sees them) may follow <function= or <invoke name=" inside a <tool_call>.
+        # Off when tools are deferred (the declared set is incomplete) or none are declared, and skipped (not
+        # refused: it only narrows names) on an engine that does not report the v2 capability.  Speedy: unlike upstream
+        # it also applies with undeclared_tool_calls "call" (our presets set it): the key is an explicit opt-in, and a
+        # name the request (or its history) declared is all the model can then write.
+        if (self.tool_name_constraint and history_tools and not deferred and tnc_api.engine_supports(self.engine)):
+            tnc = tnc_api.build(self.tok, [t.get("name") for t in history_tools if isinstance(t, dict)], thinking)
+            if tnc:
+                sampling = {**(sampling or {}), "_tool_name_constraint": tnc}
+        loops = getattr(cancel, "_strata_loop", None) if getattr(self, "loop_breaker", False) else None
+        if loops and getattr(self, "loop_mask", False) and history_tools and not deferred:
+            drop = set(toolguard.masked_names(loops, getattr(self, "loop_mask_streak", 2)))
+            keep = [t.get("name") for t in history_tools if isinstance(t, dict) and t.get("name") not in drop]
+            if drop and keep and tnc_api.engine_supports(self.engine):
+                tnc2 = tnc_api.build(self.tok, keep, thinking)
+                if tnc2:
+                    sampling = {**(sampling or {}), "_tool_name_constraint": tnc2}
+                    print(f"[strata] loop breaker: tool name(s) {sorted(drop)} masked for this reply", flush=True)
+            elif drop:
+                print(f"[strata] loop breaker: mask of {sorted(drop)} skipped (engine without tool_name_constraint v2"
+                      f" or no other tool)", flush=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -6094,7 +6347,8 @@ class Service:
         # prompt, and an engine that takes a per-request logit bias (not with --batch)
         cto_ok = bool(getattr(self, "toolcall_constrain", False) and type(parser) is OutputParser and parser.schemas
                       and stops is None and not force and not getattr(self.embeddings, "path", None)
-                      and self._constrain_supported())
+                      and self._constrain_supported()
+                      and "_tool_name_constraint" not in (sampling or {}))   # Strata #5969: the engine masks the name itself
         cto_now, cto_pre = False, []    # a `<tool_call>` just came out; the opening's ids the next pass starts with
         admission_rejected = False                      # #3040: the engine's batch slots refused it before it read anything
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
@@ -6203,6 +6457,38 @@ class Service:
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
+                    nudge_i = 0                         # rb-1118: staged budget nudges given so far
+                    # quality-max-1119 test: thinking floor on tool steps (opt-in "tool_think_floor": N). When the prompt
+                    # ends right after a tool result, </think> gets a -100 logit bias until N thinking tokens are written.
+                    floor_left = 0
+                    tfl = int(getattr(self, "tool_think_floor", 0) or 0)
+                    if getattr(self, "loop_breaker", False) and getattr(cancel, "_strata_loop", None):
+                        tfl = max(tfl, int(getattr(self, "loop_floor", 0) or 0))   # loopbreak-1120: only after a loop turn
+                    tcap = int(getattr(self, "tool_step_think_cap", 0) or 0)     # cand-1120 tests (opt-in)
+                    fcap = int(getattr(self, "think_floor_cap", 0) or 0)
+                    if (tfl > 0 or tcap > 0) and thinking is not False:
+                        try:
+                            tail_txt = self.tok.decode(list(ids[-48:]))
+                        except Exception:       # noqa: BLE001 - a test guard never fails a request
+                            tail_txt = ""
+                        close_ids = [self._think_close_id] if getattr(self, "_think_close_id", None) is not None else list(self.tok.encode("</think>", parse_special=True))
+                        after_tool = "</tool_response>" in tail_txt and tail_txt.rstrip().endswith("<think>")
+                        if after_tool and tfl > 0 and len(close_ids) == 1:
+                            floor_left = tfl
+                            print(f"[strata] tool think floor: </think> held until {tfl} thinking tokens", flush=True)
+                        # cand-1120: this reply's thinking budget, lowered only (never raised, never for other replies)
+                        own = sampling.get("reasoning_budget_tokens") if isinstance(sampling, dict) else None
+                        if own is None and isinstance(sampling, dict):
+                            own = sampling.get("thinking_budget_tokens")
+                        # 0.5.0 (owner): a budget the request named itself is honoured; the cap only fills in for clients
+                        # that name none (OpenCode, T3)
+                        cap = tcap if after_tool and tcap > 0 and own is None else 0
+                        if floor_left > 0 and fcap > 0:
+                            cap = min(cap, max(fcap, tfl + 64)) if cap else max(fcap, tfl + 64)
+                        if cap and (not budget or cap < budget):
+                            print(f"[strata] tool step think cap: {cap} thinking tokens for this reply "
+                                  f"(budget {budget or 'none'}{', floor turn' if floor_left > 0 else ''})", flush=True)
+                            budget = st["thinking_budget"] = cap
                     for ev in opening:
                         yield "event", ev
                     while True:
@@ -6213,10 +6499,17 @@ class Service:
                                                                           sampling, cancel))
                             cto_pre = []
                         else:
-                            gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                                else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                            samp_now = sampling
+                            if floor_left > 0:
+                                fb = dict((sampling or {}).get("logit_bias") or {})
+                                fb[int(close_ids[0])] = -100.0
+                                samp_now = {**(sampling or {}), "logit_bias": fb}
+                            gen = self.engine.generate(prompt, max_new - n, samp_now, cancel, embeddings=emb) if emb \
+                                else self.engine.generate(prompt, max_new - n, samp_now, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
+                        nudge = False
+                        floor_release = False
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
@@ -6314,12 +6607,29 @@ class Service:
                                         if self.reasoning_loop_recovery == "stop":
                                             looped = True        # #728: end the reply here, as for a repeated token
                                             break
+                                        if self.reasoning_loop_recovery == "close":   # rb-1118 test: close the thinking and answer
+                                            print(f"[strata] loop close: repeated reasoning at {n} tokens (coverage={repeat_coverage:.3f}); wrapping up", flush=True)
+                                            wrap = True
+                                            break
                                         if not emb:              # "recover": not for a request with pictures
                                             recover_prompt = focused_recovery_prompt(self.tok, ids, raw_ids)
                                             if recover_prompt is not None:
                                                 break
+                                if floor_left > 0 and parser.state == "reasoning":
+                                    floor_left -= 1
+                                    if floor_left <= 0 and parser.clean and not detok.pending():
+                                        floor_release = True
+                                        break
+                                    floor_left = max(floor_left, 1) if not (parser.clean and not detok.pending()) else floor_left
+                                elif floor_left > 0 and parser.state != "reasoning":
+                                    floor_left = 0          # the thinking ended some other way: drop the bias
                                 if budget and parser.state == "reasoning":
                                     thought += 1
+                                    nf = None if room_only else getattr(self, "reasoning_nudge", None)
+                                    if (nf and nudge_i < len(nf) and thought >= nf[nudge_i] * budget and thought < budget
+                                            and parser.clean and not detok.pending()):
+                                        nudge = wrap = True
+                                        break
                                     # at a clean point: no tag held back, no character split across tokens
                                     if thought >= budget and parser.clean and not detok.pending():
                                         wrap = True
@@ -6508,6 +6818,11 @@ class Service:
                                 prompt = prompt + seg + extra
                                 finish = "length"
                                 continue
+                        if floor_release and not (wrap or opens) and not cancel.is_set():
+                            floor_left = 0
+                            print(f"[strata] tool think floor reached at {n} tokens: </think> allowed again", flush=True)
+                            prompt = prompt + seg
+                            continue
                         if not (wrap or opens) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
@@ -6515,16 +6830,33 @@ class Service:
                         # was generated plus the wrap-up, so the engine continues from the prefix it already holds.
                         # A forced call (tool_choice) is opened the same way: after the wrap-up, or where the
                         # thinking ended, after the blank line the template puts before a call.
-                        if wrap:
+                        if wrap and nudge:
+                            text = NUDGE_TEXT[min(nudge_i, len(NUDGE_TEXT) - 1)]
+                            # a nudge is given only while the reply keeps room for it, the wrap-up and the answer's
+                            # reserve: under a short max_tokens (a budget cut by #984 to ~30 tokens) the nudges would
+                            # eat the whole cap and the reply would end "length" with no answer.  Skipped: no more
+                            # nudges for this reply, the thinking goes on and the budget's wrap-up closes it.
+                            room = max_new - n - len(self.tok.encode(text, parse_special=True)) \
+                                - len(self.tok.encode(REASONING_WRAP_UP, parse_special=True))
+                            if room < answer_reserve(max_new):
+                                print(f"[strata] reasoning nudge {nudge_i + 1} skipped at {thought}/{budget} tokens: "
+                                      f"no room under max_tokens {max_new}", flush=True)
+                                nudge_i = len(NUDGE_TEXT) + len(getattr(self, "reasoning_nudge", None) or ())
+                                prompt = prompt + seg
+                                continue
+                            print(f"[strata] reasoning nudge {nudge_i + 1} at {thought}/{budget} tokens", flush=True)
+                            nudge_i += 1
+                        elif wrap:
                             budget = st["thinking_budget"] = None
                             text = REASONING_WRAP_UP + (force or "")
                         else:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
-                        force = None
+                        if not nudge:
+                            force = None                # a nudge keeps the forced call for the wrap-up / end of thinking
                         extra = self.tok.encode(text, parse_special=True)
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
-                        if wrap:
+                        if wrap and not nudge:
                             print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                                   flush=True)
                         for t in extra:
@@ -7372,6 +7704,8 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
             delta_event = {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": x.get("stop_sequence")},
                            "usage": {"input_tokens": 1, "cache_creation_input_tokens": read_now - 1,
                                      "cache_read_input_tokens": reused, "output_tokens": x["completion_tokens"]}}
+            if x.get("timings"):
+                delta_event["timings"] = x["timings"]             # llama.cpp's field, the top-level one the other two dialects carry
             if x.get("rejected_tool_calls"):
                 delta_event["strata_rejected_tool_calls"] = x["rejected_tool_calls"]     # #3796
             yield "message_delta", delta_event
@@ -7406,6 +7740,8 @@ def anthropic_collect(events) -> dict:
             msg["stop_reason"] = e["delta"]["stop_reason"]
             msg["stop_sequence"] = e["delta"].get("stop_sequence")
             msg["usage"].update(e["usage"])
+            if e.get("timings"):
+                msg["timings"] = e["timings"]                     # the top-level timings a Chat Completions reply has too
             if e.get("strata_rejected_tool_calls"):
                 msg["strata_rejected_tool_calls"] = e["strata_rejected_tool_calls"]
     for i in range(len(blocks) - 1):    # a turn with no </think> (serve/dsml.py): the text is the answer; it is not also a thinking block
@@ -7430,6 +7766,18 @@ def body_limit() -> int:
     except ValueError:
         mib = 0
     return mib << 20 if mib > 0 else CHUNKED_BODY_MAX
+
+
+BODY_STALL_S = 30.0   # Strata #6107: seconds without a byte of the request body before the request is ended (408)
+
+
+def body_stall_s(env=None) -> float:
+    """STRATA_BODY_STALL_S (default BODY_STALL_S; 0 turns the stall guard off)."""
+    v = (os.environ if env is None else env).get("STRATA_BODY_STALL_S", "")
+    try:
+        return max(0.0, float(v)) if str(v).strip() != "" else BODY_STALL_S
+    except ValueError:
+        return BODY_STALL_S
 
 
 class BadBody(Exception):
@@ -7514,6 +7862,26 @@ def make_handler(svc: Service):
                     raise BadBody(400, "malformed chunked request body")
 
         def _body(self) -> bytes:
+            """Strata #6107: a client that stops sending its body (it announced more than it sent, or a chunked body that
+            never ends) ends THIS request with a 408 after body_stall_s() seconds without a byte, instead of tying up
+            the handler thread (and its admission slot) for good.  STRATA_BODY_STALL_S=0 turns it off."""
+            stall = body_stall_s()
+            if not stall:
+                return self._body_read()
+            before = self.connection.gettimeout()
+            try:
+                self.connection.settimeout(stall)
+                return self._body_read()
+            except (socket.timeout, TimeoutError):
+                self.close_connection = True
+                raise BadBody(408, f"the request body stalled: no data for {stall:g} s") from None
+            finally:
+                try:
+                    self.connection.settimeout(before)
+                except OSError:
+                    pass
+
+        def _body_read(self) -> bytes:
             self.body_read = True
             limit = body_limit()
             if self._chunked():
@@ -7528,7 +7896,11 @@ def make_handler(svc: Service):
                 self.close_connection = True               # the body is not read: the connection ends with the answer
                 raise BadBody(413, f"the request body is larger than {limit >> 20} MiB "
                                    "(STRATA_MAX_BODY_MIB raises the limit)")
-            return self.rfile.read(length)
+            data = self.rfile.read(length)
+            if len(data) < length and body_stall_s():
+                # the client closed its side early: the request is incomplete, not a smaller JSON
+                raise BadBody(400, "the request body ended early")
+            return data
 
         def _drain_body(self):
             """An answer sent before the body was read (a 401, a 403, /load, a method with no handler) must not close
@@ -8516,12 +8888,13 @@ def make_handler(svc: Service):
                             kind = item["type"]
                             content = item["delta"] if kind == "response.output_text.delta" else ""
                             reasoning = item["delta"] if kind == "response.reasoning_text.delta" else ""
-                            usage, timings = (item.get("response") or {}).get("usage"), None
+                            # the final event carries its top-level timings beside the response object (#107)
+                            usage, timings = (item.get("response") or {}).get("usage"), item.get("timings")
                         else:
                             _, event = item
                             delta = event.get("delta", {})
                             content, reasoning = delta.get("text", ""), delta.get("thinking", "")
-                            usage, timings = event.get("usage"), None
+                            usage, timings = event.get("usage"), event.get("timings")     # message_delta carries them
                         with svc.status_lock:
                             for name, value in (("output", content), ("reasoning", reasoning)):
                                 if value:
@@ -9295,6 +9668,33 @@ def parse_config_text(text: str, path) -> dict:
                          '"--ple-io", "mmap",) and that no entry is followed by a comma at the end of a list.') from None
 
 
+MTP_TUNED_SUFFIX = "-tuned"   # Speedy 0.5.0: setup puts the tuned MTP drafter in <stock dir>-tuned (setup.py MTP_TUNED)
+
+
+def choose_mtp_drafter(cfg: dict, env=None) -> None:
+    """Speedy 0.5.0: the config's "mtp_drafter" (or STRATA_MTP_DRAFTER, env first, then the config's env block):
+    "stock" runs the stock MTP drafter where the config's --mtp names the tuned one (<dir>-tuned) and the stock
+    directory is there; "tuned" (or nothing) keeps the config as it is.  Said at startup."""
+    env = os.environ if env is None else env
+    want = (env.get("STRATA_MTP_DRAFTER") or (cfg.get("env") or {}).get("STRATA_MTP_DRAFTER")
+            or cfg.get("mtp_drafter") or "").strip().lower()
+    args = cfg.get("args")
+    if want != "stock" or not isinstance(args, list) or "--mtp" not in args:
+        return
+    i = args.index("--mtp") + 1
+    if i >= len(args):
+        return
+    path = str(args[i]).rstrip("/\\")
+    if not path.endswith(MTP_TUNED_SUFFIX):
+        return
+    stock = path[: -len(MTP_TUNED_SUFFIX)]
+    if not Path(stock).is_dir():
+        print(f"[strata] mtp_drafter stock: {stock} not found; the tuned drafter is kept", flush=True)
+        return
+    cfg["args"] = [*args[:i], stock, *args[i + 1:]]
+    print(f"[strata] MTP drafter: stock ({stock})", flush=True)
+
+
 def lift_reasoning_effort_arg(cfg: dict) -> None:
     """#1641: "--reasoning-effort high" in a config's "args" is meant for the thinking level, which is not an engine
     option (the engine stopped at the unknown flag).  It is the config's "reasoning_effort" (none, low, medium or high:
@@ -9468,6 +9868,34 @@ def resolve_default_sampling(cfg: dict, env=None) -> tuple[dict, str]:
     return {**extra, **sampling_defaults_from_config({"sampling": raw})}, source
 
 
+DEFAULT_REASONING_EFFORT = "medium"   # Speedy 0.5.0: the level for requests that name none, when the config names none
+DEFAULT_REASONING_BUDGET = 32768      # Speedy 0.5.0: the thinking budget when the config names none (medium 16K -> 32K:
+                                      # hard replies capped 23% -> 7%, +1 item on the reasoning set)
+DEFAULT_REASONING_NUDGE = [0.6, 0.8]  # Speedy 0.5.0: "converge" notes at 60% and 80% of the thinking budget
+
+
+def resolve_reasoning_nudge(cfg: dict, env=None) -> list[float] | None:
+    """The fractions of the thinking budget at which a short "start converging" note is put into the thinking.
+    Order: the config's "reasoning_nudge", then STRATA_REASONING_NUDGE (env, then the config's env block).  A list or
+    "0.6,0.8"; false / 0 / off / none / [] turns it off.  Default (Speedy 0.5.0): [0.6, 0.8].  It only acts on a
+    request with a thinking budget (low, medium and high all have one by default)."""
+    env = os.environ if env is None else env
+    raw = cfg.get("reasoning_nudge")
+    if raw is None:
+        raw = env.get("STRATA_REASONING_NUDGE") or (cfg.get("env") or {}).get("STRATA_REASONING_NUDGE")
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        return list(DEFAULT_REASONING_NUDGE)
+    if raw is False or raw == 0 or (isinstance(raw, str) and raw.strip().lower() in ("0", "false", "off", "no", "none")):
+        return None
+    try:
+        vals = sorted(float(x) for x in (raw.split(",") if isinstance(raw, str) else raw))
+    except (TypeError, ValueError):
+        raise SystemExit(f"[strata] reasoning_nudge: {raw!r}: expected fractions such as [0.6, 0.8], or false") from None
+    if any(not 0 < v < 1 for v in vals):
+        raise SystemExit(f"[strata] reasoning_nudge: {raw!r}: every fraction must be between 0 and 1")
+    return vals or None
+
+
 DEFAULT_EFFORT_LEVELS = {"none": "none", "off": "none", "low": "low", "medium": "medium", "high": "high",
                          "max": "max"}
 
@@ -9484,7 +9912,7 @@ def resolve_default_effort(cfg: dict, env=None) -> tuple[str | None, str]:
     if raw is None:
         raw, source = cfg.get("reasoning_effort"), "config"
     if raw is None or raw == "":
-        return None, "none"
+        return DEFAULT_REASONING_EFFORT, "default"      # Speedy 0.5.0: medium when nothing names a level
     level = DEFAULT_EFFORT_LEVELS.get(str(raw).strip().lower())
     if level is None:
         name = "STRATA_DEFAULT_REASONING_EFFORT" if source == "env" else "config default_reasoning_effort"
@@ -9828,6 +10256,19 @@ def undeclared_tool_calls_setting(cfg: dict) -> str:
     return mode
 
 
+def tool_name_constraint_setting(cfg: dict) -> bool:
+    """Strata #5969: the config's "tool_name_constraint": true masks the tokens after a tool-name opener inside a <tool_call>
+    (`<function=`, `<invoke name="`) to the declared names, on an engine that reports the capability (serve/tool_name_constraint.py).
+    OFF when the config does not name it (the environment's STRATA_TOOL_NAME_CONSTRAINT=1 turns it on; the config wins).
+    Anything but true or false stops the start."""
+    on = cfg.get("tool_name_constraint")
+    if on is None:
+        on = os.environ.get("STRATA_TOOL_NAME_CONSTRAINT", "") == "1"
+    if not isinstance(on, bool):
+        raise SystemExit(f"[strata] config \"tool_name_constraint\" must be true or false, not {on!r}")
+    return on
+
+
 def tool_call_recovery_setting(cfg: dict) -> bool:
     """The config's "tool_call_recovery" (see OutputParser's recover): ON when the config does not name it (since 0.2.8; 0.2.7 and before: off),
     "tool_call_recovery": false turns it off. Anything but true or false stops the start."""
@@ -10028,6 +10469,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             ap.error("--batch-groups conflicts with the saved engine args")
         cfg["args"] = [*cfg["args"], "--batch-groups", a.batch_groups]
     lift_reasoning_effort_arg(cfg)
+    choose_mtp_drafter(cfg)
     if a.replicas is not None:
         cfg["replicas"] = a.replicas
     if a.split_serve is not None:
@@ -10238,7 +10680,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                         pass
         per_replica = requested if isinstance(requested, int) and not isinstance(requested, bool) and requested > 0 else 1
         svc.requested_slots = per_replica * len(groups) if groups else per_replica
-    svc.answer_room = cfg.get("answer_room") is not False
+    svc.answer_room = cfg.get("answer_room") is not False and not answer_room_env_off()
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     # tool call repair (TOOLCALL_REPAIR_OPEN): the process environment or the config's `env` (the engine ignores it)
     svc.toolcall_repair = toolcall_repair_tries(os.environ.get("STRATA_TOOLCALL_REPAIR")
@@ -10339,6 +10781,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
     svc.tool_call_recovery = tool_call_recovery_setting(cfg)
+    svc.tool_name_constraint = tool_name_constraint_setting(cfg)
     svc.undeclared_tool_calls = undeclared_tool_calls_setting(cfg)
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
@@ -10350,6 +10793,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
+    if cfg.get("reasoning_budget_tokens") is None:
+        svc.reasoning_budget_default = DEFAULT_REASONING_BUDGET
+        print(f"[strata] thinking budget: {DEFAULT_REASONING_BUDGET} tokens (the default; \"reasoning_budget_tokens\": 0 "
+              "turns it off, a request can set its own)", flush=True)
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         svc.reasoning_budget_configured = True
         try:
@@ -10363,10 +10810,18 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     recovery = cfg.get("reasoning_loop_recovery", False)   # #728: false (default) | "stop" | "recover" (true)
     if recovery is True:
         recovery = "recover"
-    if recovery is not False and recovery not in ("stop", "recover"):
+    if recovery is not False and recovery not in ("stop", "recover", "close"):
         raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
                          f"not {recovery!r}")
     svc.reasoning_loop_recovery = recovery
+    nz = resolve_reasoning_nudge(cfg)
+    tf = cfg.get("tool_think_floor") or os.environ.get("STRATA_TOOL_THINK_FLOOR") or (cfg.get("env") or {}).get("STRATA_TOOL_THINK_FLOOR")
+    svc.tool_think_floor = int(tf) if tf else 0   # quality-max-1119 test
+    if svc.tool_think_floor:
+        print(f"[strata] tool think floor: {svc.tool_think_floor} thinking tokens after a tool result", flush=True)
+    svc.reasoning_nudge = nz
+    if svc.reasoning_nudge:
+        print(f"[strata] reasoning nudges at {svc.reasoning_nudge} of the thinking budget", flush=True)
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     if a.engine == "strata" and groups:                 # replicas: every card of every group
