@@ -16,7 +16,7 @@
     "--spec-min-p",
     "0.5",
     "--mtp",
-    "<STRATA_DATA>/mtp/rt-tuned",
+    "<STRATA_DATA>/mtp/rt",
     "dir>",
     "--max-context",
     "262144",

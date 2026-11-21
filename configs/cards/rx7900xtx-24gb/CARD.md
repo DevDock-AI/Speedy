@@ -23,8 +23,8 @@
 
 ## 0.5 defaults
 
-Presets set `reasoning_budget_tokens` 32768 (the server default, written out) and use the tuned MTP drafter
-`<STRATA_DATA>/mtp/rt-tuned` that `setup.py` writes; `"mtp_drafter": "stock"` in a preset runs the stock `mtp/rt`.
+Presets set `reasoning_budget_tokens` 32768 (the server default, written out) and keep the stock MTP drafter
+`<STRATA_DATA>/mtp/rt` (the tuned `mtp/rt-tuned` is not measured on this card yet).
 
 ## Measured upstream of this port (tok/s, one 7900 XTX, fork release rg23)
 
