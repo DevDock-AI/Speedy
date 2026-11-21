@@ -1,6 +1,6 @@
 # Changelog
 
-## Speedy 0.5.1 (unreleased)
+## Speedy 0.5.1 (2026-11-21)
 - **Loop breaker catches repeated failing edits/writes**: a write or edit whose result says it did nothing (not found, error, no match, unchanged) no longer counts as a workspace change, so the same failing call repeated is a loop (note, then the tool masked for one reply). A successful write still resets it, so edit -> test -> edit -> test is not a loop.
 - **Near-identical repeats**: the same tool returning the same result 3 times in a row is a loop even when the arguments differ (a failing result, or arguments that differ only slightly). Results are compared with call ids, hex ids, timestamps and durations normalized; arguments with sorted keys.
 - **Repeat warning backstop**: with the loop breaker on, the plain repeat note (same name and arguments) is still added for a call made 3+ times; a turn never gets two notes.
