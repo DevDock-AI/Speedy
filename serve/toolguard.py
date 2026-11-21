@@ -1,9 +1,9 @@
-"""Speedy tool-call guards (each opt-in by an environment variable or the config's `env`).
+"""Speedy tool-call guards (each set by an environment variable or the config's `env`).
 
-- Constrained tool-call opening (STRATA_TOOLCALL_CONSTRAIN=1): after the model writes `<tool_call>`, the next tokens are
-  "\\n<function=" (forced) and then one of the request's declared tool names and ">\\n", picked token by token by the
-  model under a logit bias that only lets through tokens continuing a declared name.  Seen on UD-Q4_K_XL at 80-620K
-  context: `<4>`, `<=edit>`, `<` and an undeclared name where `<function=NAME>` belongs.
+- Constrained tool-call opening (STRATA_TOOLCALL_CONSTRAIN, on since 0.5.3): what follows `<tool_call>` is
+  "\\n<function=NAME>\\n" with a declared NAME.  The model writes it; the server steps in only when no declared name can
+  follow, and then finishes it under a mask in which the model's own ranking decides (constrain_opening).  Seen on
+  UD-Q4_K_XL at 80-620K context: `<4>`, `<=edit>`, `<` and an undeclared name where `<function=NAME>` belongs.
 - Old thinking dropped at long context (STRATA_DROP_THINKING_ABOVE=N tokens): the thinking of older assistant turns is
   left out of the prompt.  Which turns is fixed in blocks (STRATA_DROP_THINKING_STEP turns), so the prompt prefix only
   changes once per block and the conversation cache is not lost on every request.
@@ -18,9 +18,10 @@ import json
 import os
 import re
 
-CONSTRAIN_OPEN = "\n<function="       # forced right after `<tool_call>`, as the template writes a call
+CONSTRAIN_OPEN = "\n<function="       # what follows `<tool_call>`, as the template writes a call
 CONSTRAIN_CLOSE = ">\n"               # the name's end: part of the targets, so the model's own ">\n" token can be used
-CONSTRAIN_BIAS = 100.0                # the bias of an allowed token (logits are within about +-40: a mask in effect)
+CONSTRAIN_BIAS = 100.0                # the same bias on every allowed token (logits are within about +-40): a mask
+#                                       in effect, and the model's ranking among the allowed tokens is unchanged
 CONSTRAIN_MAX_STEPS = 48
 DROP_THINKING_STEP = 16
 REPEAT_WINDOW = 3
@@ -93,6 +94,31 @@ _BOOK_FILE = re.compile(r"(?:^|[/\\])(?:plan|plan\.session|todo|todos|checklist)
 _MARKS = re.compile(r"\[[ xX~\-/>!]\]")
 _PATCH_FILE = re.compile(r"^\*\*\* (?:Update|Add) File: (.+)$", re.M)
 TODO_TARGET = "the todo list"
+# 0.5.3: junk writes (a dummy file written instead of the step the reply talked about) are not work done
+JUNK_BYTES = 8                 # a whole file of at most this many bytes with a short name and no extension (x, cr8)
+JUNK_NAMED_BYTES = 16          # ... a change this small to a file with a dummy name (placeholder.txt, probe, x, cr8)
+JUNK_SCRATCH_BYTES = 64        # ... or a whole file this small in a scratch directory (/tmp/opencode/...)
+_SCRATCH_DIR = re.compile(r"^(?:/private)?(?:/tmp|/var/tmp|/dev/shm)(?:/|$)|^[A-Za-z]:[\\/]te?mp[\\/]|"
+                          r"[\\/]AppData[\\/]Local[\\/]Temp[\\/]", re.I)
+_DUMMY_NAME = re.compile(r"^(?:placeholder|probe|dummy|scratch|junk|noop|nop|foo|bar|baz|tmp|temp|x+)\d*(?:\.[a-z0-9]{1,4})?$",
+                         re.I)
+_SHORT_NAME = re.compile(r"^[a-z]{1,4}\d{0,3}$", re.I)        # x, v, cr8, ag4: no extension
+CYCLE_NOTE_JUNK = ("The last writes were tiny placeholder files; they do nothing for the task. Stop writing them. Do the "
+                   "step you described: run the command or read the file it needs, with the tool made for that.")
+# 0.5.3: "says X, does Y" (the reply's last sentence names the tool it is about to call; another one is called)
+INTENT_NOTE = ("You wrote that you would call {said}, but the call you made was {made}. If {said} is what you meant, "
+               "call it now.")
+_SHELL_NAME = re.compile(r"(?:bash|shell|sh|terminal|local_shell|exec(?:ute)?(?:_?(?:command|bash|shell))?|"
+                         r"run_?(?:command|shell|bash|terminal_cmd|shell_command))", re.I)
+_SENTENCE = re.compile(r"(?<=[.!?])[\"')\]]?\s+|\n+")
+_INTENT_LEAD = (r"(?:\blet me\b|\blet's\b|\bi(?:'ll| will| need to| should| must| have to|'m going to| am going to| can)\b|"
+                r"\bnow\b|\bnext\b|\btime to\b|\bgoing to\b|\binstead\b|\bneed to\b|\bswitch(?:ing)? to\b|\btry(?:ing)?\b)")
+_INTENT_LATER = re.compile(r"\b(?:then|afterwards?|later|after that|and finally|before)\b[^.;:]{0,40}$", re.I)
+_INTENT_AFTER = re.compile(r"^[^.;:]{0,60}?\b(?:after|once|but first|as soon as)\b", re.I)
+_READ_WORDS = {"read", "glob", "grep", "ls", "list", "view", "search", "find", "cat", "show", "get", "fetch", "open",
+               "todoread", "lsp", "diagnostics"}
+_INTENT_NEG = re.compile(r"(?:\bnot\b|n't\b|\bnever\b|\bwithout\b|\binstead of\b|\brather than\b|\bstop(?:ped)?\b|\bavoid\b|"
+                         r"\bno longer\b|\bcannot\b|\bkeeps?\b|\bkept\b|\bfailed\b|\bunable\b)[^,;:]{0,28}$", re.I)
 
 
 # ------------------------------------------------------------------------------------------------ settings
@@ -139,15 +165,34 @@ def reverse_index(index: dict[str, list[int]]) -> dict[int, str]:
     return {i: s for s, ids in index.items() for i in ids}
 
 
-def name_targets(names) -> list[str]:
-    return sorted({str(n) + CONSTRAIN_CLOSE for n in names if n})
+def opening_targets(names, leads=("\n",)) -> list[str]:
+    """What may follow `<tool_call>`: LEAD + "<function=NAME>\n" for each declared name."""
+    return sorted({lead + CONSTRAIN_OPEN.lstrip("\n") + str(n) + CONSTRAIN_CLOSE for n in names if n for lead in leads})
+
+
+def opening_state(text: str, targets: list[str]) -> str:
+    """Where the text written after `<tool_call>` stands: "done" (LEAD<function=NAME> is complete: what follows is
+    the call's own business), "open" (it can still become one) or "bad" (no declared name can come of it).  Letter
+    case is not judged: the parser reads `Bash` as a declared `bash`."""
+    low = text.lower()
+    if any(low.startswith(tg[:-1].lower()) for tg in targets):
+        return "done"
+    return "open" if any(tg.lower().startswith(low) for tg in targets) else "bad"
+
+
+def opening_name(text: str, targets: list[str]) -> str | None:
+    """The NAME of a "done" opening, as the target spells it (the longest that fits)."""
+    low = text.lower()
+    fit = [tg for tg in targets if low.startswith(tg[:-1].lower())]
+    return max(fit, key=len).strip()[len(CONSTRAIN_OPEN) - 1:-1] if fit else None
 
 
 def allowed_next(index: dict[str, list[int]], text: str, targets: list[str]) -> list[int]:
-    """The ids whose text continues `text` towards one of `targets` (each target is NAME + ">\\n")."""
+    """The ids whose text continues `text` towards one of `targets` (letter case of `text` aside)."""
     want: set[str] = set()
+    low = text.lower()
     for tg in targets:
-        if tg.startswith(text) and len(tg) > len(text):
+        if tg.lower().startswith(low) and len(tg) > len(text):
             rest = tg[len(text):]
             want.update(rest[:k] for k in range(1, len(rest) + 1))
     ids: list[int] = []
@@ -157,39 +202,75 @@ def allowed_next(index: dict[str, list[int]], text: str, targets: list[str]) -> 
 
 
 def remaining(text: str, targets: list[str]) -> list[str]:
-    return [tg for tg in targets if tg.startswith(text)]
+    low = text.lower()
+    return [tg for tg in targets if tg.lower().startswith(low)]
 
 
-def constrain_name(step, encode, index, names, max_steps: int = CONSTRAIN_MAX_STEPS, rev: dict | None = None):
-    """Picks a declared tool name token by token.  `step(allowed_ids) -> id | None` asks the model for one token under
-    the bias; `encode(text) -> ids` spells a forced remainder.  Returns (ids after "<function=", name) or None when
-    the model or the vocabulary cannot finish a name (the caller then lets the model write freely)."""
-    targets = name_targets(names)
-    if not targets:
+def shared_opening(encode, names) -> list[int]:
+    """The ids every declared name's opening starts with, as the tokenizer writes them, and never past "\n<function=".
+    Qwen's vocabulary writes `<function=bash>` as `<function` `=b` `ash` `>`: for such a name the `=` is not a token
+    of its own, so the shared part stops at `<function` (forcing a bare `=` there took the names written with a merged
+    `=x` token out of the model's reach: 0.4.6 .. 0.5.3)."""
+    seqs = [list(encode(tg)) for tg in opening_targets(names)] + [list(encode(CONSTRAIN_OPEN))]
+    if len(seqs) < 2 or not all(seqs):
+        return []
+    n = 0
+    while all(len(s) > n for s in seqs) and len({s[n] for s in seqs}) == 1:
+        n += 1
+    return seqs[0][:n]
+
+
+def constrain_opening(step, encode, index, names, text: str = "", ids=(), rev: dict | None = None,
+                      max_picks: int = CONSTRAIN_MAX_STEPS):
+    """Finishes a tool call's opening after `<tool_call>` as LEAD<function=NAME>\n with a declared NAME.  `text` / `ids`
+    are what the model already wrote of it (a valid start; empty: nothing).  Nothing the model can still choose is
+    decided for it:
+      - while every name that still fits is written with the same next token (the tokenizer's own spelling of the
+        whole opening, which is how the model writes it), that token is written without asking: there is no choice;
+      - otherwise `step(allowed_ids, new_ids) -> id | None` asks the model for one token among those that continue a
+        fitting name in any spelling.  The caller adds the same bias to each allowed id, so the model's own ranking of
+        them decides (a mask, not a preference);
+      - one name left and the model off the tokenizer's spelling: the rest is spelled by `encode`.
+    Returns (new ids, NAME, picks) or None when the model or the vocabulary cannot finish a name (the caller then lets
+    the model write freely)."""
+    names = [str(n) for n in names if n]
+    lead = text[:len(text) - len(text.lstrip())] if text.strip() else (text or "\n")
+    targets = opening_targets(names, (lead,))
+    if not targets or not remaining(text, targets):
         return None
-    text, ids = "", []
-    for _ in range(max_steps):
+    canon = {tg: list(encode(tg)) for tg in targets}
+    if rev is None:
+        rev = reverse_index(index)
+    have, new, picks = list(ids), [], 0
+    for _ in range(max(len(tg) for tg in targets) + 8):
         left = remaining(text, targets)
         if not left:
             return None
-        if text in left:                            # NAME>\n written in full
-            return ids, text[:-len(CONSTRAIN_CLOSE)]
-        if len(left) == 1:                          # one name fits: the rest is forced
-            rest = left[0][len(text):]
-            return ids + list(encode(rest)), left[0][:-len(CONSTRAIN_CLOSE)]
-        allowed = allowed_next(index, text, targets)
-        if not allowed:
-            return None
-        t = step(allowed)
-        if t is None or t not in set(allowed):
-            return None
-        if rev is None:
-            rev = reverse_index(index)
+        whole = [tg for tg in left if len(tg) == len(text)]
+        if whole:
+            return new, whole[0].strip()[len(CONSTRAIN_OPEN) - 1:-1], picks
+        nxt = {canon[tg][len(have)] if canon[tg][:len(have)] == have and len(canon[tg]) > len(have) else None
+               for tg in left}
+        if len(nxt) == 1 and None not in nxt:
+            t = nxt.pop()
+        elif len(left) == 1:
+            return new + list(encode(left[0][len(text):])), left[0].strip()[len(CONSTRAIN_OPEN) - 1:-1], picks
+        else:
+            if picks >= max_picks:
+                return None
+            allowed = allowed_next(index, text, left)
+            if not allowed:
+                return None
+            t = step(allowed, list(new))
+            picks += 1
+            if t is None or t not in set(allowed):
+                return None
         piece = rev.get(t)
         if piece is None:
             return None
         text += piece
-        ids.append(t)
+        have.append(t)
+        new.append(t)
     return None
 
 
@@ -380,12 +461,13 @@ def mark_loops(messages, window: int = REPEAT_WINDOW, note: str = LOOP_NOTE) -> 
                 results[k] if k < len(results) else None)
             raw = _result_text(res_msg) if res_msg is not None else None
             res = norm_result(raw)
-            wrote = is_write(sig) and not failed_result(raw)
+            junk = junk_write(sig)                  # 0.5.3: a dummy file is not a workspace change
+            wrote = is_write(sig) and not failed_result(raw) and not junk
             # near repeat: same tool + same normalized result in a row, args different only slightly (or the result is
             # a failure); a successful write or an empty result ("(no output)" of searches) breaks the run
             key = (sig[0], res)
             same_run = (res is not None and key == run and not wrote and _norm_empty(res) != ""
-                        and (failed_result(raw) or _similar(sig[1], run_args)))
+                        and (failed_result(raw) or junk or _similar(sig[1], run_args)))
             run_n = run_n + 1 if same_run else (0 if wrote or res is None else 1)
             run, run_args = (None, None) if wrote or res is None else (key, sig[1])
             exact = res is not None and any(h[0] == sig and h[1] == res and h[2] == epoch for h in history[-window:])
@@ -467,6 +549,138 @@ def file_op(sig: tuple[str, str]):
     if not path or new is None:
         return None
     return path, old, new, bool(_BOOK_FILE.search(path))
+
+
+def junk_write(sig: tuple[str, str]) -> bool:
+    """A file-editing call that only leaves a dummy behind (seen: hundreds of `write /tmp/opencode/cr8 "cr8"` and
+    `edit /tmp/opencode/placeholder.txt x -> y` where the reply had just said it would run a command): a whole file of
+    at most JUNK_BYTES bytes whose name is a few letters without an extension (or is its own content), a change of
+    at most JUNK_NAMED_BYTES to a file with a dummy name, or a whole file of at most JUNK_SCRATCH_BYTES in a scratch
+    directory.  Not the session plan or the todo list.  Such a call is not "other work" and not a workspace change:
+    it counts like an edit that failed."""
+    op = file_op(sig)
+    if op is None or op[3] or op[0] == TODO_TARGET:
+        return False
+    path, old, new, _ = op
+    size = max(len(new.strip().encode("utf-8", "replace")), len((old or "").strip().encode("utf-8", "replace")))
+    norm = str(path).replace("\\", "/")
+    base = norm.rsplit("/", 1)[-1]
+    if old is None and size <= JUNK_BYTES and (_SHORT_NAME.match(base) or new.strip() == base):
+        return True
+    if size <= JUNK_NAMED_BYTES and _DUMMY_NAME.match(base):
+        return True
+    return old is None and size <= JUNK_SCRATCH_BYTES and bool(_SCRATCH_DIR.search(str(path)))
+
+
+# ------------------------------------------------------------------------------------------------ 6: says X, does Y (0.5.3)
+def _shell_tool(declared) -> str | None:
+    """The declared shell tool, when there is exactly one (bash, shell, run_command, ...)."""
+    hit = [n for n in declared if isinstance(n, str) and _SHELL_NAME.fullmatch(n)]
+    return hit[0] if len(hit) == 1 else None
+
+
+def stated_tool(reasoning: str | None, content: str | None, declared) -> str | None:
+    """The declared tool the reply says it is about to call, or None.  Deliberately narrow: only the LAST sentence
+    before the call is read (the answer's text when there is any, else the thinking's), only when it is a statement of
+    intent (not a question, not a quote), and only these forms:
+      - "invoke / call / use / run / try / switch to  the `NAME` tool", "call NAME instead", "call `NAME`";
+      - for the one declared shell tool: "run ... with bash", "let me run `some command`", "run a ... command".
+    A name after "not", "instead of", "without", "keeps", ... does not count; two different tools named in the
+    sentence mean no answer."""
+    names = sorted({n for n in declared if isinstance(n, str) and n}, key=len, reverse=True)
+    if not names:
+        return None
+    text = content if (content or "").strip() else reasoning
+    parts = [p.strip() for p in _SENTENCE.split((text or "").strip()[-600:]) if p and p.strip()]
+    if not parts:
+        return None
+    sent = parts[-1]
+    if sent.endswith("?") or len(sent) > 300:
+        return None
+    by_low = {n.lower(): n for n in names}
+    alt = "|".join(re.escape(n) for n in names)
+    verb = r"(?:call(?:ing)?|invok(?:e|ing)|us(?:e|ing)|run(?:ning)?|try(?:ing)?|switch(?:ing)? to|with|via)"
+    found: list[tuple[int, str]] = []
+
+    def add(m, name):
+        before = sent[:m.start()]
+        if _INTENT_NEG.search(before) or before.count('"') % 2:
+            return
+        # not the next step: "I'll write the notes, then run `wc -l`", "rewrite it with the write tool after reading it"
+        if _INTENT_LATER.search(before) or _INTENT_AFTER.search(sent[m.end():]):
+            return
+        found.append((m.start(), name))
+
+    for m in re.finditer(rf"\b{verb}\s+(?:the\s+|a\s+)?[`'\"]?(?<![\w.-])({alt})(?![\w-])[`'\"]?\s+tool\b", sent, re.I):
+        add(m, by_low[m.group(1).lower()])
+    for m in re.finditer(rf"\b(?:call(?:ing)?|invok(?:e|ing))\s+(?:the\s+)?[`'\"]?(?<![\w.-])({alt})(?![\w-])[`'\"]?"
+                         rf"(?=\s+(?:instead|now|directly|here|first)\b|\s*[.!,;:]?\s*$)", sent, re.I):
+        add(m, by_low[m.group(1).lower()])
+    for m in re.finditer(rf"\b(?:call(?:ing)?|invok(?:e|ing)|us(?:e|ing))\s+(?:the\s+)?`({alt})`", sent, re.I):
+        add(m, by_low[m.group(1).lower()])
+    shell = _shell_tool(names)
+    if shell and re.search(_INTENT_LEAD, sent, re.I):
+        for pat in (r"\b(?:run|execute)\b[^.;!?\n]{0,60}?\b(?:with|using|via|in|through)\s+(?:the\s+)?`?(?:bash|shell|the terminal|terminal)`?(?![\w-])",
+                    r"\b(?:run|execute)\s+`[^`\n]{2,}`",
+                    r"\b(?:run|execute)\s+(?:a|an|the|this|these|that|those)\s+(?:[\w-]+\s+){0,3}?commands?\b"):
+            for m in re.finditer(pat, sent, re.I):
+                add(m, shell)
+    said = {n for _, n in found}
+    # any other tool named as a tool in the sentence ("the bash tool after the read tool"): no answer
+    named = {by_low[(m.group(1) or m.group(2)).lower()] for m in re.finditer(
+        rf"(?<![\w.-])({alt})(?![\w-])[`'\"]?\s+tool\b|`({alt})`", sent, re.I)}
+    if len(said) != 1 or (named - said and not all(_negated(sent, n) for n in named - said)):
+        return None
+    return said.pop()
+
+
+def _negated(sent: str, name: str) -> bool:
+    """Every mention of `name` in the sentence follows a "not" / "instead of" / "keeps" ..."""
+    hits = list(re.finditer(rf"(?<![\w.-]){re.escape(name)}(?![\w-])", sent, re.I))
+    return bool(hits) and all(_INTENT_NEG.search(sent[:m.start()]) for m in hits)
+
+
+def intent_mismatch(said: str | None, made: str | None) -> bool:
+    """`said` (stated_tool) and the tool called differ in a way worth acting on: not the same tool in another letter
+    case, not two file-editing tools (saying "edit" and calling `write` gets the work done all the same), and the
+    tool called is not one that only looks (read, grep, glob, list: a look before the step) or the shell.  What is
+    left is what the transcripts show: the reply names bash / read / glob and a write, edit, skill or task comes out."""
+    if not said or not made or said.lower() == made.lower():
+        return False
+    # a look first (read / grep / list) or the shell (which can do anything) in place of the named tool is a choice
+    if _SHELL_NAME.fullmatch(made) or any(w.lower() in _READ_WORDS for w in _NAME_WORDS.findall(str(made))):
+        return False
+    return not (is_edit_tool(said) and is_edit_tool(made))
+
+
+def mark_intents(messages, declared, note: str = INTENT_NOTE) -> list[dict]:
+    """The note for a turn whose text said one tool and whose (single) call was another, after its result; a turn that
+    already carries a note gets none (run it after the loop / cycle / repeat notes).  A function of the history alone.
+    Returns the mismatches of the latest assistant turn as {"said", "made"}."""
+    latest: list[dict] = []
+    last_asst = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1)
+    for i, m in enumerate(messages):
+        calls = m.get("tool_calls") if m.get("role") == "assistant" else None
+        if not calls or len(calls) != 1:
+            continue
+        sig = call_signature(calls[0])
+        if sig is None:
+            continue
+        thought = m.get("reasoning_content")
+        if not isinstance(thought, str):
+            thought = m.get("reasoning") if isinstance(m.get("reasoning"), str) else ""
+        said = stated_tool(thought, _raw_text(m), declared)
+        if not intent_mismatch(said, sig[0]):
+            continue
+        j = i + 1
+        while j < len(messages) and messages[j].get("role") == "tool":
+            j += 1
+        if j == i + 1 or _NOTE_TAIL.search(_raw_text(messages[j - 1])):
+            continue
+        _append_note(messages[j - 1], note.replace("{said}", said).replace("{made}", sig[0]))
+        if i == last_asst and j == len(messages):
+            latest = [{"said": said, "made": sig[0]}]
+    return latest
 
 
 def _period(seq: list, wrote: list) -> int:
@@ -563,6 +777,8 @@ def mark_cycles(messages, paused: str = CYCLE_PAUSED) -> dict:
             raw = _result_text(res_msg) if res_msg is not None else None
             op = file_op(sig)
             failed = edit_failed(raw) if op is not None else raw is None    # any answer to another call is work done
+            junk = op is not None and raw is not None and not failed and junk_write(sig)   # 0.5.3: a dummy file is no work either
+            failed = failed or junk
             seq.append((sig, norm_result(raw)))
             wrote.append(is_write(sig))
             edits.append(op is not None)
@@ -579,7 +795,7 @@ def mark_cycles(messages, paused: str = CYCLE_PAUSED) -> dict:
                 target, old, new, book = op
                 if failed:
                     if raw is not None:
-                        failed_ops.append((sig[0], target))
+                        failed_ops.append((sig[0], target, junk))
                 else:
                     good_calls += 1
                     if not book:                        # a real file changed: the other files start over
@@ -628,7 +844,8 @@ def mark_cycles(messages, paused: str = CYCLE_PAUSED) -> dict:
         # the turn as a whole: only failed edits / only the plan or the todo list
         fail_turns = fail_turns + 1 if failed_ops and not good_calls else 0 if good_calls else fail_turns
         if not reps and fail_turns >= CYCLE_FAILS // (2 if ep["held"] else 1):
-            reps = [{"name": n, "target": t, "kind": "failing", "hold": True, "edit": True} for n, t in failed_ops]
+            reps = [{"name": n, "target": t, "kind": "junk" if all(f[2] for f in failed_ops) else "failing",
+                     "hold": True, "edit": True} for n, t, _ in failed_ops]
         touched = {t: n for t, n in touched.items() if t in files}      # not started over later in this turn
         for t in touched:
             files[t]["turns"] += 1
@@ -647,15 +864,17 @@ def mark_cycles(messages, paused: str = CYCLE_PAUSED) -> dict:
                 r["turn"] = ep["turns"]
                 if r["hold"] and r["edit"]:
                     ep["names"].add(r["name"])
-                    if r["kind"] != "failing":
+                    if r["kind"] not in ("failing", "junk"):
                         ep["targets"][r["target"]] = r["target"] == TODO_TARGET or bool(_BOOK_FILE.search(str(r["target"])))
             if results and not _NOTE_TAIL.search(_raw_text(messages[j - 1])):
-                r0 = next((r for r in reps if r["hold"] and r["kind"] not in ("failing", "period")), None)
+                r0 = next((r for r in reps if r["hold"] and r["kind"] not in ("failing", "junk", "period")), None)
                 kinds = {r["kind"] for r in reps}
                 if r0 is not None or kinds == {"churn"}:
                     name = str((r0 or reps[0])["target"]).replace("\\", "/").rsplit("/", 1)[-1]
                     name = re.sub(r"[\[\]\s]+", " ", name).strip()[:80] or "that file"
                     text = (CYCLE_NOTE if r0 is not None else CYCLE_NOTE_CHURN).replace("{file}", name)
+                elif "junk" in kinds:
+                    text = CYCLE_NOTE_JUNK
                 elif "failing" in kinds:
                     text = CYCLE_NOTE_FAIL
                 else:

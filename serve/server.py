@@ -4199,6 +4199,25 @@ def _prefixed(pre, inner):
         inner.close()
 
 
+def _replayed(inner, replay):
+    """`inner`'s ids; whatever the consumer puts into `replay` (a deque) while it reads comes out before `inner`'s next id.
+    Closing it closes `inner`."""
+    try:
+        it = iter(inner)
+        while True:
+            while replay:
+                yield replay.popleft()
+            try:
+                t = next(it)
+            except StopIteration:
+                break
+            yield t
+        while replay:
+            yield replay.popleft()
+    finally:
+        inner.close()
+
+
 def _detok_state(detok) -> tuple:
     """What a Detokenizer has read (tool call repair puts it back)."""
     return (list(detok.ids), detok.sent, detok.inc.getstate() if detok.inc is not None else None)
@@ -5340,7 +5359,7 @@ class Service:
              t.get("tool_calls_unread", 0)),
             ("strata:tool_calls_repaired_total", "counter", "<tool_call> blocks written again and read as a call (STRATA_TOOLCALL_REPAIR)",
              t.get("tool_calls_repaired", 0)),
-            ("strata:tool_calls_constrained_total", "counter", "<tool_call> openings written under the declared-name mask (STRATA_TOOLCALL_CONSTRAIN)",
+            ("strata:tool_calls_constrained_total", "counter", "<tool_call> openings finished under the declared-name mask (STRATA_TOOLCALL_CONSTRAIN)",
              t.get("tool_calls_constrained", 0)),
             ("strata:tool_call_repeats_total", "counter", "Repeated identical tool calls noted (STRATA_REPEAT_WARN)",
              t.get("tool_call_repeats", 0)),
@@ -5526,7 +5545,7 @@ class Service:
                         part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
         self._restore_reasoning(messages, log=kwargs.get("enable_thinking") is not False)
-        self._toolguard_prompt(messages, cancel)        # 0.4.6 (opt-in): after the restore, which adds thinking back
+        self._toolguard_prompt(messages, cancel, tools)  # 0.4.6 (opt-in): after the restore, which adds thinking back
         chars = toolguard.message_chars(messages) if getattr(self, "drop_thinking_above", 0) > 0 else 0
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
         if chars > 1000:
@@ -5750,13 +5769,18 @@ class Service:
             return False
         return (getattr(e, "info", None) or {}).get("logit_bias") == 1
 
-    def _constrained_opening(self, base, schemas, sampling, cancel) -> list[int] | None:
-        """STRATA_TOOLCALL_CONSTRAIN: the ids after `<tool_call>`: "\n<function=" forced, then a declared tool name
-        picked by the model one token at a time under a logit bias that allows only tokens continuing a declared name
-        (and its ">\n"), the rest forced once one name is left.  Each pick is a one-token request on the cached prefix;
-        the bias is applied where the engine samples (the verifier), so a speculative/MTP draft that breaks it is
-        rejected like any draft the verifier does not pick.  None: the model goes on freely (as without the flag)."""
+    def _constrained_opening(self, base, schemas, sampling, cancel, text="", ids=(), only=None) -> list[int] | None:
+        """STRATA_TOOLCALL_CONSTRAIN: the ids that finish a tool call's opening after `<tool_call>` as
+        "\n<function=NAME>\n" with a declared NAME (toolguard.constrain_opening).  `text` / `ids`: what the model already
+        wrote of it (`base` ends with those ids).  Where the names that still fit are written with different tokens, the
+        model picks: a one-token request on the cached prefix with the same bias on every token that continues a
+        fitting name, so its own ranking of them decides and no other token can come out.  The bias is applied where
+        the engine samples (the verifier), so a speculative/MTP draft that breaks it is rejected like any draft the
+        verifier does not pick.  `only`: the one name to write (the reply said it would call it).
+        None: the model goes on freely (as without the flag)."""
         names = [k for k in (schemas or {}) if isinstance(k, str) and k]
+        if only is not None:
+            names = [k for k in names if k == only]
         if not names:
             return None
         if getattr(self, "_cto_index", None) is None:
@@ -5765,14 +5789,16 @@ class Service:
             self._cto_rev = toolguard.reverse_index(self._cto_index)
             print(f"[strata] constrained tool calls: {len(self._cto_rev)} name tokens indexed in "
                   f"{time.perf_counter() - t0:.2f} s", flush=True)
-        opening = list(self.tok.encode(toolguard.CONSTRAIN_OPEN, parse_special=True))
-        picked: list[int] = []
+        own = bias_api.normalize((sampling or {}).get("logit_bias"))    # the request's own bias: its bans stay bans
 
-        def step(allowed):
+        def step(allowed, new):
             if cancel.is_set():
                 return None
-            bias = {int(i): toolguard.CONSTRAIN_BIAS for i in allowed}
-            gen = self.engine.generate(base + opening + picked, 1, {**(sampling or {}), "logit_bias": bias}, cancel)
+            bias = {**own, **{int(i): toolguard.CONSTRAIN_BIAS for i in allowed if own.get(int(i)) != -100}}
+            # no repetition penalty on the pick: the engine applies it after the bias, where it would scale the +100
+            # (and with it take a name the reply just mentioned out of the running)
+            gen = self.engine.generate(base + new, 1, {**(sampling or {}), "logit_bias": bias,
+                                                       "repetition_penalty": 1.0}, cancel)
             got = None
             try:
                 for t in gen:
@@ -5782,14 +5808,12 @@ class Service:
                     break
             finally:
                 gen.close()
-            if got is not None:
-                picked.append(got)
             return got
 
         t0 = time.perf_counter()
         try:
-            out = toolguard.constrain_name(step, lambda text: self.tok.encode(text, parse_special=False),
-                                           self._cto_index, names, rev=self._cto_rev)
+            out = toolguard.constrain_opening(step, lambda piece: self.tok.encode(piece, parse_special=False),
+                                              self._cto_index, names, text=text, ids=ids, rev=self._cto_rev)
         except ValueError as e:                 # the engine refused the bias (an ERR line): write freely
             print(f"[strata] constrained tool call skipped: {e}", flush=True)
             return None
@@ -5797,18 +5821,28 @@ class Service:
             print("[strata] constrained tool call: no declared name could be finished; the model writes freely",
                   flush=True)
             return None
-        ids, name = out
+        new, name, picks = out
         with self.status_lock:
             self.totals["tool_calls_constrained"] = self.totals.get("tool_calls_constrained", 0) + 1
         if os.environ.get("STRATA_TOOLCALL_CONSTRAIN_LOG", "1") != "0":
-            print(f"[strata] constrained tool call: {name} ({len(picked)} picks, "
+            print(f"[strata] constrained tool call: {name} ({picks} picks, "
                   f"{(time.perf_counter() - t0) * 1000:.0f} ms)", flush=True)
-        return opening + list(ids)
+        return list(new)
 
     def configure_toolguard(self, cfg_env) -> None:
         """0.4.6 opt-in guards (serve/toolguard.py), from the process environment or the config's `env` block."""
         g = toolguard
-        self.toolcall_constrain = g.flag(g.env_value("STRATA_TOOLCALL_CONSTRAIN", cfg_env))
+        # 0.5.3: on unless 0 / false / off / no.  "1" (or unset) watches the opening the model writes and steps in only
+        # when no declared name can come of it; "eager" stops at every `<tool_call>` and writes the opening under the
+        # mask (the 0.4.6 flow, without its forced bare `=`).
+        tc = str(g.env_value("STRATA_TOOLCALL_CONSTRAIN", cfg_env) or "").strip().lower()
+        self.toolcall_constrain = tc not in ("0", "false", "off", "no")
+        self.toolcall_constrain_eager = tc in ("eager", "2")
+        # 0.5.3 "says X, does Y": the reply's last sentence names the tool it is about to call and another one is
+        # opened -> the opening is written again with the named tool (once per reply); where that cannot be done,
+        # a note after the call's result.  STRATA_TOOLCALL_INTENT=0 turns both off.
+        self.toolcall_intent = str(g.env_value("STRATA_TOOLCALL_INTENT", cfg_env) or "1").strip().lower() \
+            not in ("0", "false", "off", "no")
         self.drop_thinking_above = g.int_setting(g.env_value("STRATA_DROP_THINKING_ABOVE", cfg_env), 0)
         self.drop_thinking_step = g.int_setting(g.env_value("STRATA_DROP_THINKING_STEP", cfg_env),
                                                 g.DROP_THINKING_STEP, low=1) or g.DROP_THINKING_STEP
@@ -5846,7 +5880,7 @@ class Service:
         if g.env_value("STRATA_SKIP_EMPTY_THINK", cfg_env) is not None and hasattr(self.template, "skip_empty_think"):
             self.template.skip_empty_think = g.flag(g.env_value("STRATA_SKIP_EMPTY_THINK", cfg_env))
 
-    def _toolguard_prompt(self, messages, cancel=None) -> None:
+    def _toolguard_prompt(self, messages, cancel=None, tools=None) -> None:
         """Before the render: the repeat note (STRATA_REPEAT_WARN) and old thinking dropped (STRATA_DROP_THINKING_ABOVE).
         Both are functions of the history alone, so a conversation's prefix renders the same on every request."""
         if getattr(self, "loop_breaker", False):
@@ -5900,6 +5934,20 @@ class Service:
                     "preset": os.path.basename(str(getattr(self, "config_path", "") or "")) or None,
                     "session": getattr(cancel, "_strata_session", None), "outcome": "repeat", "tries": 0,
                     "name": r["name"], "times": r["times"], "snippet": r["arguments"][:300]})
+        if getattr(self, "toolcall_intent", False) and tools:
+            # 0.5.3 "says X, does Y", for a turn the server could not write again itself: a note after the result
+            # (after the loop / cycle / repeat notes: a turn never gets two; before old thinking is dropped)
+            try:
+                declared = [(t.get("function") or t).get("name") for t in tools if isinstance(t, dict)]
+                said = toolguard.mark_intents(messages, declared)
+            except Exception as e:              # noqa: BLE001 - a guard never fails a request
+                said = []
+                print(f"[strata] tool intent note skipped: {e}", flush=True)
+            for r in said:
+                with self.status_lock:
+                    self.totals["tool_call_intent_notes"] = self.totals.get("tool_call_intent_notes", 0) + 1
+                print(f"[strata] tool intent: the reply said {r['said']}, the call was {r['made']}: note added",
+                      flush=True)
         above = getattr(self, "drop_thinking_above", 0)
         if above > 0:
             # decided on the conversation as sent (before anything is dropped): it only grows, so once a conversation
@@ -6387,10 +6435,19 @@ class Service:
         # 0.4.6 constrained tool-call opening (STRATA_TOOLCALL_CONSTRAIN): the same conditions as the repair, a text
         # prompt, and an engine that takes a per-request logit bias (not with --batch)
         cto_ok = bool(getattr(self, "toolcall_constrain", False) and type(parser) is OutputParser and parser.schemas
-                      and stops is None and not force and not getattr(self.embeddings, "path", None)
+                      and stops is None and not force and not deferred and not getattr(self.embeddings, "path", None)
                       and self._constrain_supported()
                       and "_tool_name_constraint" not in (sampling or {}))   # Strata #5969: the engine masks the name itself
         cto_now, cto_pre = False, []    # a `<tool_call>` just came out; the opening's ids the next pass starts with
+        cto_eager = cto_ok and getattr(self, "toolcall_constrain_eager", False)
+        # 0.5.3: the opening is watched while the model writes it (cto_watch: its text and ids since `<tool_call>`,
+        # not yet counted or shown); cto_fix: what to do once the pass has stopped (finish it under the mask / write
+        # it again with the tool the reply named)
+        cto_watch, cto_fix, cto_replay = None, None, collections.deque()
+        cto_names = ([k for k in parser.schemas if isinstance(k, str) and k] + [k for k in parser.aliases if isinstance(k, str)]
+                     + [tnc_api.WRAPPER_NAME]) if cto_ok else []
+        intent_ok = cto_ok and getattr(self, "toolcall_intent", False)
+        said_r, said_c, tool_evs, repicked = "", "", 0, False     # this reply's last thinking / answer text; calls so far
         admission_rejected = False                      # #3040: the engine's batch slots refused it before it read anything
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
@@ -6539,6 +6596,8 @@ class Service:
                             gen = _prefixed(cto_pre, self.engine.generate(prompt + cto_pre, max_new - n - len(cto_pre),
                                                                           sampling, cancel))
                             cto_pre = []
+                            if cto_ok and not cto_eager:
+                                gen = _replayed(gen, cto_replay)
                         else:
                             samp_now = sampling
                             if floor_left > 0:
@@ -6547,6 +6606,8 @@ class Service:
                                 samp_now = {**(sampling or {}), "logit_bias": fb}
                             gen = self.engine.generate(prompt, max_new - n, samp_now, cancel, embeddings=emb) if emb \
                                 else self.engine.generate(prompt, max_new - n, samp_now, cancel)
+                            if cto_ok and not cto_eager:
+                                gen = _replayed(gen, cto_replay)     # a watched opening that was fine comes out again
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nudge = False
@@ -6565,6 +6626,32 @@ class Service:
                                     last_out = time.perf_counter()
                                     yield "ping", None
                                     continue
+                                if cto_watch is not None:
+                                    # 0.5.3: the tokens after `<tool_call>` are held (not counted, not parsed) until
+                                    # "\n<function=NAME>" stands or cannot come of them
+                                    w = cto_watch
+                                    piece = "" if t in self.stop_ids else w["detok"].push(t)
+                                    state = toolguard.opening_state(w["text"] + piece, w["targets"]) if piece else "bad"
+                                    if state != "bad":
+                                        w["text"] += piece
+                                        w["ids"].append(t)
+                                    if state == "open" and len(w["ids"]) < 48:
+                                        continue
+                                    cto_watch = None
+                                    if state == "done":
+                                        name = toolguard.opening_name(w["text"], w["targets"])
+                                        made = name if name in parser.schemas else parser.aliases.get(name, name)
+                                        said = (toolguard.stated_tool(said_r, said_c, list(parser.schemas))
+                                                if intent_ok and not tool_evs and not repicked
+                                                and made in parser.schemas else None)
+                                        if said is None or not toolguard.intent_mismatch(said, made):
+                                            cto_replay.extend(w["ids"])     # as the model wrote it
+                                            continue
+                                        cto_fix = {"said": said, "made": made}
+                                    else:               # the valid part stays; the rest is finished under the mask
+                                        cto_fix = {"text": w["text"], "ids": w["ids"],
+                                                   "bad": None if state == "open" else piece or "(end of turn)"}
+                                    break
                                 n += 1
                                 if first_engine_token_s is None:
                                     first_engine_token_s = round(time.perf_counter() - waiting, 3)
@@ -6601,12 +6688,23 @@ class Service:
                                     repair_held = []
                                 if (cto_ok and parser.state == "content" and piece.endswith(CALL_START)
                                         and max_new - n >= 64):
-                                    cto_now = True      # the name is picked under the bias once this pass stops
+                                    if cto_eager:
+                                        cto_now = True      # the opening is written under the mask once this pass stops
+                                    else:
+                                        cto_watch = {"text": "", "ids": [], "detok": Detokenizer(self.tok),
+                                                     "targets": toolguard.opening_targets(cto_names, ("\n", ""))}
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
+                                    if intent_ok:       # what the reply said last, for the "says X, does Y" check
+                                        if ev.kind == "reasoning":
+                                            said_r = (said_r + (ev.text or ""))[-600:]
+                                        elif ev.kind == "content":
+                                            said_c = (said_c + (ev.text or ""))[-600:]
+                                        elif ev.kind in ("tool_start", "tool_call"):
+                                            tool_evs += 1
                                     if self.reasoning_loop_recovery and ev.kind == "reasoning":
                                         reasoning_text += ev.text or ""
                                     if ev.kind in ("content", "tool_start", "tool_call"):
@@ -6721,12 +6819,47 @@ class Service:
                                   "with an error", flush=True)
                             raise EngineDied("the server is stopping; the request was cut off before it finished - "
                                              "retry against the next instance")
-                        if cto_now:
-                            cto_now = False
+                        if cto_watch is not None and not cto_fix:
+                            # the pass ended inside a watched opening (the engine's own limit): its ids are not lost
+                            cto_fix, cto_watch = {"text": cto_watch["text"], "ids": cto_watch["ids"], "bad": None}, None
+                        if cto_now or cto_fix:
+                            fix, cto_now, cto_fix, cto_watch = cto_fix or {}, False, None, None
                             if not cancel.is_set() and not nonfinite:
-                                # the pass stopped right after `<tool_call>`: "\n<function=" + a declared name + ">\n"
-                                # (constrain_name), then the next pass goes on freely from there
-                                cto_pre = self._constrained_opening(prompt + seg, parser.schemas, sampling, cancel) or []
+                                said = None
+                                if intent_ok and not tool_evs and not repicked and fix.get("bad"):
+                                    said = toolguard.stated_tool(said_r, said_c, list(parser.schemas))
+                                    if said is not None and toolguard.opening_state(
+                                            fix["text"], toolguard.opening_targets([said], ("\n", ""))) != "open":
+                                        said = None             # what is written already cannot become that name
+                                if "said" in fix:
+                                    # "says X, does Y": the opening is written again with the tool the reply named
+                                    repicked = True
+                                    cto_pre = list(self.tok.encode(toolguard.opening_targets([fix["said"]])[0],
+                                                                   parse_special=False))
+                                    with self.status_lock:
+                                        self.totals["tool_calls_repicked"] = self.totals.get("tool_calls_repicked", 0) + 1
+                                    print(f"[strata] tool intent: the reply said {fix['said']}, the call opened as "
+                                          f"{fix['made']}: opening written again as {fix['said']} "
+                                          f"(STRATA_TOOLCALL_INTENT=0 turns this off)", flush=True)
+                                elif "ids" in fix and fix["bad"] is None:
+                                    cto_pre = list(fix["ids"])          # cut off mid-opening: it goes on from there
+                                else:
+                                    # eager: the pass stopped right after `<tool_call>`; watch: at the token no declared
+                                    # name can follow.  The opening is finished under the mask (constrain_opening);
+                                    # the next pass goes on freely from there
+                                    have = list(fix.get("ids") or ())
+                                    if fix.get("bad"):
+                                        print(f"[strata] tool call opening {fix['text']!r} + {fix['bad']!r} names no "
+                                              f"declared tool: finished under the declared-name mask", flush=True)
+                                    done = None
+                                    if said is not None:                # the reply named its tool: that one, if it fits
+                                        done = self._constrained_opening(prompt + seg + have, parser.schemas, sampling,
+                                                                         cancel, fix.get("text", ""), have, only=said)
+                                        repicked = repicked or done is not None
+                                    if done is None:
+                                        done = self._constrained_opening(prompt + seg + have, parser.schemas, sampling,
+                                                                         cancel, fix.get("text", ""), have)
+                                    cto_pre = have + (done or [])
                                 prompt = prompt + seg
                                 continue
                         if repair_held is not None:
@@ -6748,7 +6881,17 @@ class Service:
                                                       parser, ids, n, cancel, fixed)
                                 toolfail_logged = True
                                 repair_orig = None
-                            extra = self.tok.encode(repair_snap["lead"] + TOOLCALL_REPAIR_OPEN, parse_special=True)
+                            # 0.5.3: only what every declared name's opening shares as tokens is forced (a bare `=`
+                            # token after `<function` takes `=b`+`ash` and the like out of the model's reach)
+                            repair_open = TOOLCALL_REPAIR_OPEN
+                            try:
+                                shared = toolguard.shared_opening(lambda x: self.tok.encode(x, parse_special=False),
+                                                                  [k for k in parser.schemas if isinstance(k, str)])
+                                if shared:
+                                    repair_open = CALL_START + self.tok.decode(shared)
+                            except Exception:           # noqa: BLE001 - the plain opening then
+                                pass
+                            extra = self.tok.encode(repair_snap["lead"] + repair_open, parse_special=True)
                             room = max_new - repair_snap["n"] - len(extra) >= 16
                             if unread and repair_left and room:
                                 if repair_orig is None:         # the first reply, kept for the fallback
@@ -6770,7 +6913,7 @@ class Service:
                                 for t in extra:
                                     n += 1
                                     raw_ids.append(t)
-                                repair_held += parser.feed(snap["lead"] + TOOLCALL_REPAIR_OPEN)
+                                repair_held += parser.feed(snap["lead"] + repair_open)
                                 print(f"[strata] the answer's <tool_call> did not read as a call of a declared tool: "
                                       f"writing it again from \"<function=\" (tool call repair, try "
                                       f"{repair_orig['tries']})", flush=True)

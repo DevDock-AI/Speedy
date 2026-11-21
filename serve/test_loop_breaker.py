@@ -365,7 +365,7 @@ class EditCycles(unittest.TestCase):
         st, _ = cyc([e(" ", "~"), e("~", "-"), e("-", "x")])
         self.assertEqual(st["reps"][0]["kind"], "marks")
         # a dummy edit chain x -> y -> z -> ... on one file
-        ch = [("edit", {"filePath": "/tmp/p.txt", "oldString": chr(97 + k), "newString": chr(98 + k)}, OK)
+        ch = [("edit", {"filePath": "/app/notes.txt", "oldString": chr(97 + k), "newString": chr(98 + k)}, OK)
               for k in range(6)]
         self.assertEqual(cyc(ch[:4])[0]["reps"], [])
         self.assertEqual(cyc(ch[:5])[0]["reps"][0]["kind"], "rewrite")
@@ -645,3 +645,190 @@ class EditCycles(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ------------------------------------------------------------------ 0.5.3: junk writes are not work done
+WROTE = "Wrote file successfully."
+
+
+def junk(k):
+    return ("write", {"filePath": f"/tmp/opencode/cr{k}", "content": f"cr{k}"}, WROTE)
+
+
+class JunkWrites(unittest.TestCase):
+    def test_what_counts_as_junk(self):
+        j = lambda name, **a: g.junk_write((name, json.dumps(a)))     # noqa: E731
+        for name, a in (("write", {"filePath": "/tmp/opencode/cr8", "content": "cr8"}),
+                        ("write", {"filePath": "/tmp/opencode/gdb_batch13", "content": "run\nbt\nquit\n"}),
+                        ("edit", {"filePath": "/tmp/opencode/placeholder.txt", "oldString": "x", "newString": "y"}),
+                        ("edit", {"filePath": "/app/placeholder.txt", "oldString": "x", "newString": "y"}),
+                        ("write", {"filePath": "/app/x", "content": "1"}),
+                        ("write", {"filePath": "/app/probe.txt", "content": "probe"}),
+                        ("Write", {"file_path": "C:\\Temp\\k2", "content": "114"})):
+            self.assertTrue(j(name, **a), a)
+        for name, a in (("write", {"filePath": "/app/a.py", "content": "y"}),                  # a real file, however small
+                        ("write", {"filePath": "/app/answer.txt", "content": "42"}),
+                        ("edit", {"filePath": "/app/a.py", "oldString": "f(1)", "newString": "f(2)"}),
+                        ("write", {"filePath": "/tmp/opencode/repro.py", "content": "import sys\n" * 20}),   # real scratch work
+                        ("edit", {"filePath": "/tmp/opencode/repro.py", "oldString": "x" * 80, "newString": "y" * 80}),
+                        ("edit", {"filePath": "/tmp/opencode/check.php", "oldString": "a-b", "newString": "a+b"}),   # a real edit
+                        ("write", {"filePath": "/work/PLAN.md", "content": "- [ ]"}),              # the plan is judged elsewhere
+                        ("todowrite", {"todos": []}),
+                        ("bash", {"command": "echo x > /tmp/x"}),
+                        ("read", {"filePath": "/tmp/opencode/x"})):
+            self.assertFalse(j(name, **a), a)
+
+    def test_junk_writes_become_a_loop_and_then_a_mask(self):
+        # every write "succeeds" and differs from the one before: nothing fired before 0.5.3
+        m = chain_ids([("bash", {"command": "make"}, "error: heap")] + [junk(k) for k in range(3)])
+        reps = g.mark_loops(m)
+        self.assertEqual([(r["name"], r["streak"]) for r in reps], [("write", 1)])
+        self.assertIn(g.LOOP_NOTE, m[-1]["content"])
+        m = chain_ids([("bash", {"command": "make"}, "error: heap")] + [junk(k) for k in range(4)])
+        self.assertEqual(g.masked_names(g.mark_loops(m)), ["write"])
+
+    def test_junk_turns_feed_the_failing_rule(self):
+        for n, kinds, mask in ((g.CYCLE_FAILS - 1, [], []), (g.CYCLE_FAILS, ["junk"], []),
+                               (g.CYCLE_FAILS + 1, ["junk"], ["write"])):
+            st, m = cyc([("bash", {"command": "make"}, "error: heap")] + [junk(k) for k in range(n)])
+            self.assertEqual([r["kind"] for r in st["reps"]], kinds, n)
+            self.assertEqual(st["mask"], mask, n)
+        self.assertIn(g.CYCLE_NOTE_JUNK, m[-1]["content"])
+        self.assertEqual(g.cycle_mask_names(st, ["bash", "edit", "read", "todowrite", "write"]), ["edit", "todowrite", "write"])
+
+    def test_junk_is_not_other_work(self):
+        # a failing edit, a junk write, a failing edit ...: the junk write does not reset the count
+        fail = ("edit", {"filePath": "/app/a.c", "oldString": "foo", "newString": "bar"}, "Error: oldString not found")
+        st, _ = cyc([fail, junk(1), fail, junk(2)])
+        self.assertEqual({r["kind"] for r in st["reps"]}, {"junk"})         # the note speaks of the latest turn
+        st, _ = cyc([junk(1), fail, junk(2), fail])
+        self.assertEqual({r["kind"] for r in st["reps"]}, {"failing"})
+        # ... a real command does
+        st, _ = cyc([junk(1), junk(2), junk(3), ("bash", {"command": "make"}, "ok"), junk(4)])
+        self.assertEqual(st["reps"], [])
+
+    def test_real_work_in_scratch_is_not_junk(self):
+        steps = []
+        for k in range(6):
+            steps += [("write", {"filePath": f"/tmp/opencode/t{k}.py", "content": f"print({k})\n" * 12}, WROTE),
+                      ("bash", {"command": f"python3 /tmp/opencode/t{k}.py"}, f"{k}\n" * 12)]
+        st, m = cyc(steps)
+        self.assertEqual((st["reps"], st["mask"]), ([], []))
+        self.assertEqual(g.mark_loops(chain_ids(steps)), [])
+        # several real files written in a row (no run between) are work too
+        st, _ = cyc([("write", {"filePath": f"/tmp/opencode/part{k}.py", "content": "x = 1\n" * 40}, WROTE) for k in range(6)])
+        self.assertEqual(st["reps"], [])
+
+
+# ------------------------------------------------------------------ 0.5.3: says X, does Y
+DECL = ["bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "write"]
+
+
+class StatedTool(unittest.TestCase):
+    def test_explicit_intents(self):
+        for text, want in (
+                ("The loop is unbreakable. Let me try to invoke the `bash` tool with a command.", "bash"),
+                ("I'll invoke the `glob` tool.", "glob"),
+                ("The loop is unbreakable. Let me try invoking the `glob` tool.", "glob"),
+                ("I'll invoke the `task` tool to explore /build to break the pattern and get useful info.", "task"),
+                ("I need to genuinely stop. Let me switch tools entirely and run a bash gdb command.", "bash"),
+                ("I'm stuck in a loop. I need to call bash instead.", "bash"),
+                ("Let me run `gdb -batch -ex run ./a.out`.", "bash"),
+                ("Let me run the diff commands", "bash"),
+                ("Now I'll run the build with bash.", "bash"),
+                ("Instead of calling the write tool, I will use the read tool.", "read"),
+                ("The write tool keeps being selected. Let me use the Grep tool now.", "grep"),
+                ("Next: call `webfetch`", "webfetch")):
+            self.assertEqual(g.stated_tool(text, "", DECL), want, text)
+
+    def test_not_an_intent(self):
+        for text in ("The write tool keeps being selected.",
+                     "Stop. I mistakenly called skill again. Ignore it. Let me compile and run.",
+                     "Should I use the bash tool?",
+                     "I keep trying to edit a placeholder file that does not exist.",
+                     "Let me run through the logic once more.",
+                     "I'll use the read tool and then the bash tool.",
+                     "I'll use the bash tool after the read tool.",
+                     'The docs say "use the bash tool" for this.',
+                     "Let me write the plan first.",
+                     "I should not call the bash tool here.",
+                     "Let me compile both and run.",
+                     "The Makefile will run the test command.",
+                     "Let me check the task description again.",
+                     "I'll read the file to see what it does.",
+                     "Let me look at the grep output.",
+                     "Now let me edit the file.",
+                     "Let me use `grep` via the bash tool.",
+                     "I already ran the build command.",
+                     "The bash tool returned an error.",
+                     "Let me call the helper function instead.",
+                     "I'll write a concise NOTES.md capturing the learnings, then run `wc -l`.",
+                     "Let me just rewrite the file entirely with the write tool after reading it.",
+                     "First the plan, and later I will call the bash tool.",
+                     "", None):
+            self.assertIsNone(g.stated_tool(text, "", DECL), text)
+
+    def test_only_the_last_sentence_and_the_answer_first(self):
+        self.assertIsNone(g.stated_tool("Let me invoke the `bash` tool. Actually the file needs a fix first.", "", DECL))
+        self.assertEqual(g.stated_tool("I'll write the file.", "Let me invoke the `bash` tool.", DECL), "bash")
+        self.assertIsNone(g.stated_tool("Let me invoke the `bash` tool.", "Writing the plan first.", DECL))
+
+    def test_only_declared_names_and_one_shell(self):
+        self.assertIsNone(g.stated_tool("Let me invoke the `bash` tool.", "", ["shell", "read"]))
+        self.assertEqual(g.stated_tool("Let me run `ls -la`.", "", ["shell", "read"]), "shell")
+        self.assertIsNone(g.stated_tool("Let me run `ls -la`.", "", ["shell", "bash", "read"]))     # which one?
+        self.assertIsNone(g.stated_tool("Let me run `ls -la`.", "", ["read", "write"]))
+        self.assertEqual(g.stated_tool("Let me call the Bash tool.", "", ["Bash", "Read"]), "Bash")
+
+    def test_mismatch(self):
+        self.assertTrue(g.intent_mismatch("bash", "write"))
+        self.assertFalse(g.intent_mismatch("bash", "Bash"))
+        self.assertFalse(g.intent_mismatch("edit", "write"))            # both change a file
+        self.assertFalse(g.intent_mismatch("write", "read"))            # a look before the step
+        self.assertFalse(g.intent_mismatch("edit", "grep"))
+        self.assertFalse(g.intent_mismatch("edit", "bash"))             # the shell can do the edit
+        self.assertTrue(g.intent_mismatch("bash", "skill"))
+        self.assertTrue(g.intent_mismatch("glob", "todowrite"))
+        self.assertTrue(g.intent_mismatch("read", "edit"))
+        self.assertFalse(g.intent_mismatch(None, "write"))
+
+    def turn(self, think, name, i=0, content=""):
+        return [{"role": "assistant", "content": content, "reasoning_content": think,
+                 "tool_calls": [{"id": f"c{i}", "type": "function", "function": {"name": name, "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": f"c{i}", "content": "Wrote file successfully."}]
+
+    def test_note_after_the_result(self):
+        m = [{"role": "user", "content": "go"}] + self.turn("I'll invoke the `glob` tool.", "write", 0) \
+            + self.turn("I'll invoke the `glob` tool.", "glob", 1) + self.turn("Let me write it.", "write", 2)
+        self.assertEqual(g.mark_intents(m, DECL), [])                   # the latest turn is fine
+        self.assertIn("you would call glob, but the call you made was write", m[2]["content"])
+        self.assertNotIn("Note", m[4]["content"] + m[6]["content"])
+        m2 = [{"role": "user", "content": "go"}] + self.turn("Let me invoke the `bash` tool.", "write")
+        self.assertEqual(g.mark_intents(m2, DECL), [{"said": "bash", "made": "write"}])
+        # a turn that already has a note keeps that one; the same history gives the same text (stable prefix)
+        m3 = [{"role": "user", "content": "go"}] + self.turn("Let me invoke the `bash` tool.", "write")
+        m3[-1]["content"] += "\n\n[Note: x]"
+        g.mark_intents(m3, DECL)
+        self.assertEqual(m3[-1]["content"].count("[Note:"), 1)
+        again = [{"role": "user", "content": "go"}] + self.turn("Let me invoke the `bash` tool.", "write")
+        g.mark_intents(again, DECL)
+        self.assertEqual(again, m2)
+
+    def test_server_adds_the_note(self):
+        import io
+        from contextlib import redirect_stdout
+        from serve.server import Service
+        svc = Service.__new__(Service)
+        svc.status_lock, svc.totals, svc.engine = __import__("threading").Lock(), {}, None
+        svc.configure_toolguard({})
+        m = [{"role": "user", "content": "go"}] + self.turn("Let me invoke the `bash` tool.", "write")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            svc._toolguard_prompt(m, None, [{"type": "function", "function": {"name": n}} for n in DECL])
+        self.assertIn("you would call bash", m[-1]["content"])
+        self.assertIn("tool intent: the reply said bash, the call was write", out.getvalue())
+        svc.configure_toolguard({"STRATA_TOOLCALL_INTENT": "0"})
+        m = [{"role": "user", "content": "go"}] + self.turn("Let me invoke the `bash` tool.", "write")
+        with redirect_stdout(io.StringIO()):
+            svc._toolguard_prompt(m, None, [{"type": "function", "function": {"name": n}} for n in DECL])
+        self.assertNotIn("Note", m[-1]["content"])
