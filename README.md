@@ -76,7 +76,7 @@ Decode is with MTP speculative decoding. **short** is a short chat prompt, **cod
 | **UD-IQ4_XS** <sub>quality</sub> | **184** | **211** | **180** | **176** | 1,536 | 1,629 | 3,607 | 3,728 |
 | **UD-Q4_K_XL** <sub>best</sub> | **168** | **170** | **161** | **155** | 1,226 | 1,300 | 2,950 | 3,150 |
 
-<sub>0.4.6 engine, short speed screen. These presets are not in `configs/cards/` yet.</sub>
+<sub>0.4.6 engine, short speed screen. Presets (UD-Q4_K_XL, UD-IQ4_XS, UD-IQ3_XXS; 0.5 settings): [`configs/cards/rtx3080-20gb/2x/`](configs/cards/rtx3080-20gb/2x/).</sub>
 
 Measured on Linux (Threadripper PRO 5975WX, 144 GB RAM), cards capped at 240 W / 280 W and unlocked with the optional
 [gpu-unlock](docs/GPU-UNLOCK.md) module; without it expect lower prefill and the same decode. Plan for about 128 GB of
@@ -130,6 +130,7 @@ numbers). They are our measured configs with paths and GPU UUIDs replaced by pla
 | Folder | Contents |
 |---|---|
 | [`rtx3080-20gb/1x/`](configs/cards/rtx3080-20gb/1x/) | one RTX 3080 20 GB: every quant at 229K and 1M |
+| [`rtx3080-20gb/2x/`](configs/cards/rtx3080-20gb/2x/) | RTX 3080 20 GB + RTX 3080 10 GB (layer split): UD-Q4_K_XL, UD-IQ4_XS, UD-IQ3_XXS with the 0.5 settings, plus `llama-swap.yaml` |
 | [`rtx3080-10gb/1x/`](configs/cards/rtx3080-10gb/1x/), [`2x/`](configs/cards/rtx3080-10gb/2x/) | one and two RTX 3080 10 GB, plus `llama-swap.yaml` |
 
 Got a different card? Copy [`configs/cards/_template/`](configs/cards/_template/) ([how](configs/README.md#add-a-card)),

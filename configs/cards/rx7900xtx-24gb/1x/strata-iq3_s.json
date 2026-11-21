@@ -113,7 +113,7 @@
     "STRATA_TOPK_SPLIT_MIN": "98304",
     "STRATA_QSA_ROWS": "1"
   },
-  "reasoning_budget_tokens": 16384,
+  "reasoning_budget_tokens": 32768,
   "reasoning_close_retry": true,
   "repeat_stop_tokens": 256,
   "host": "127.0.0.1",

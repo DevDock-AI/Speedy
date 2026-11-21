@@ -131,5 +131,154 @@ class LoopFloor(unittest.TestCase):
         self.assertFalse(svc.loop_breaker)
 
 
+# ------------------------------------------------------------------ 0.5.1: failing writes, near repeats, volatile parts
+import os
+import random
+
+FAIL = "File /tmp/opencode/placeholder.txt not found"
+
+
+def edit_args(i):
+    a = {"filePath": "/tmp/opencode/placeholder.txt", "oldString": "x", "newString": "y"}
+    return a if i % 2 else {"filePath": a["filePath"], "newString": "y", "oldString": "x"}   # key order flips
+
+
+def chain_ids(steps):
+    """Like chain(), with fresh OpenCode-style call ids each turn."""
+    rnd = random.Random(7)
+    msgs = [{"role": "user", "content": "fix the repo"}]
+    for name, args, res in steps:
+        cid = "call_%016x_0" % rnd.getrandbits(64)
+        msgs.append({"role": "assistant", "content": "", "tool_calls": [
+            {"id": cid, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]})
+        msgs.append({"role": "tool", "tool_call_id": cid, "content": res})
+    return msgs
+
+
+class FailingWrites(unittest.TestCase):
+    def test_failing_edit_loop_566(self):
+        m = chain_ids([("edit", edit_args(i), FAIL) for i in range(566)])
+        reps = g.mark_loops(m)
+        self.assertEqual([r["name"] for r in reps], ["edit"])
+        self.assertGreaterEqual(reps[0]["streak"], 2)
+        self.assertEqual(g.masked_names(reps), ["edit"])
+        self.assertNotIn("Note", m[2]["content"])          # the first failing edit is not a loop yet
+        self.assertIn(g.LOOP_NOTE, m[4]["content"])        # the second one is
+
+    def test_failing_edit_streak_by_turn(self):
+        self.assertEqual(g.mark_loops(chain_ids([("edit", edit_args(i), FAIL) for i in range(1)])), [])
+        r2 = g.mark_loops(chain_ids([("edit", edit_args(i), FAIL) for i in range(2)]))
+        self.assertEqual([(r["name"], r["streak"]) for r in r2], [("edit", 1)])
+        r3 = g.mark_loops(chain_ids([("edit", edit_args(i), FAIL) for i in range(3)]))
+        self.assertEqual(g.masked_names(r3), ["edit"])
+
+    def test_failure_kinds(self):
+        for res in ("Error: oldString not found in content", "No changes to apply: oldString and newString are identical",
+                    "oldString found multiple matches", "no such file or directory"):
+            self.assertTrue(g.failed_result(res), res)
+        for res in ("Edit applied successfully.", "Wrote file successfully.", ""):
+            self.assertFalse(g.failed_result(res), res)
+
+    def test_successful_write_opens_epoch(self):
+        w = ("write", {"filePath": "a.py", "content": "x"}, "Wrote file successfully.")
+        self.assertEqual(g.mark_loops(chain_ids([w, T, w, T])), [])
+
+    def test_real_edit_test_cycles_not_loop(self):
+        steps = []
+        for k in range(6):
+            steps.append(("edit", {"filePath": "a.py", "oldString": f"v{k}", "newString": f"v{k+1}"}, "Edit applied successfully."))
+            steps.append(("bash", {"command": "pytest -q"}, f"{6 - k} failed in 0.{k}2s"))
+        self.assertEqual(g.mark_loops(chain_ids(steps)), [])
+        # same test failure after each edit (the edit changed the file, the failure stayed): still not a loop
+        steps = []
+        for k in range(6):
+            steps.append(("edit", {"filePath": "a.py", "oldString": f"v{k}", "newString": f"v{k+1}"}, "Edit applied successfully."))
+            steps.append(("bash", {"command": "pytest -q"}, "1 failed in 0.31s"))
+        self.assertEqual(g.mark_loops(chain_ids(steps)), [])
+
+    def test_successful_edits_in_a_row_not_loop(self):
+        steps = [("edit", {"filePath": f"f{k}.py", "oldString": "a", "newString": "b"}, "Edit applied successfully.")
+                 for k in range(5)]
+        self.assertEqual(g.mark_loops(chain_ids(steps)), [])
+
+    def test_near_identical_retries(self):
+        steps = [("edit", {"filePath": "a.py", "oldString": f"def f({k}):", "newString": "def f():"},
+                  "Error: oldString not found in content") for k in range(3)]
+        self.assertEqual(g.mark_loops(chain_ids(steps[:2])), [])          # two differing tries: not yet
+        reps = g.mark_loops(chain_ids(steps))
+        self.assertEqual([r["name"] for r in reps], ["edit"])
+
+    def test_near_streak_broken_by_other_call(self):
+        e = lambda k: ("edit", {"filePath": "a.py", "oldString": f"x{k}", "newString": "y"}, "Error: oldString not found")
+        self.assertEqual(g.mark_loops(chain_ids([e(0), e(1), ("read", {"filePath": "a.py"}, "1: x"), e(2)])), [])
+
+    def test_near_success_results_similar_args(self):
+        steps = [("bash", {"command": f"python3 check.py --seed {k}"}, "OK: 0 mismatches in 0.4s") for k in range(3)]
+        self.assertEqual([r["name"] for r in g.mark_loops(chain_ids(steps))], ["bash"])
+
+    def test_searches_with_no_output_not_loop(self):
+        steps = [("bash", {"command": f"grep -rn {w} src"}, "(no output)") for w in ("alpha", "beta", "gamma", "delta")]
+        self.assertEqual(g.mark_loops(chain_ids(steps)), [])
+        steps = [("read", {"filePath": f"src/{w}.py"}, "1: import os") for w in ("alpha", "server", "util_helpers")]
+        self.assertEqual(g.mark_loops(chain_ids(steps)), [])
+
+    def test_volatile_ids(self):
+        b = {"command": "./run.sh"}
+        steps = [("bash", b, "job 3f9a2c41d7 failed after 12 ms at 2026-11-21T13:04:11Z"),
+                 ("bash", b, "job 88be01aa42 failed after 9 ms at 2026-11-21T13:04:15Z")]
+        self.assertEqual([r["name"] for r in g.mark_loops(chain_ids(steps))], ["bash"])
+        self.assertEqual(g.norm_result("call_abc123_0 took 1.5s"), "# took #")
+
+    def test_key_order(self):
+        self.assertEqual(g.call_signature({"function": {"name": "t", "arguments": '{"a":1,"b":2}'}}),
+                         g.call_signature({"function": {"name": "t", "arguments": '{"b":2,"a":1}'}}))
+
+    def test_replay_fixture(self):
+        """Trimmed synthetic replay shaped like the TB2 fix-git transcript rows (message deltas at msg_offset)."""
+        path = os.path.join(os.path.dirname(__file__), "fixtures", "loop_replay_failing_edit.jsonl")
+        with open(path, encoding="utf-8") as f:
+            rows = [json.loads(line) for line in f]
+        hist, first_note, first_mask = [], None, None
+        for t, row in enumerate(rows, 1):
+            hist = hist[:row["msg_offset"]] + row["messages"]
+            reps = g.mark_loops(copy.deepcopy(hist))
+            if reps and first_note is None:
+                first_note = t
+            if g.masked_names(reps) and first_mask is None:
+                first_mask = t
+        self.assertEqual((first_note, first_mask), (6, 7))    # 2nd failing edit -> note, 3rd -> mask
+
+
+class RepeatBackstop(unittest.TestCase):
+    def test_backstop_needs_three(self):
+        s = ("read", {"filePath": "a"}, "x")
+        m = chain([s, s])
+        self.assertEqual(g.mark_repeats(m, min_times=3, skip_noted=True), [])
+        m = chain([s, s, s])
+        self.assertEqual([r["times"] for r in g.mark_repeats(m, min_times=3, skip_noted=True)], [3])
+
+    def test_no_double_note(self):
+        m = chain_ids([("edit", edit_args(i), FAIL) for i in range(4)])
+        g.mark_loops(m)
+        g.mark_repeats(m, min_times=3, skip_noted=True)
+        for msg in m:
+            if msg["role"] == "tool":
+                self.assertLessEqual(msg["content"].count("[Note:"), 1)
+
+    def test_server_backstop_when_breaker_on(self):
+        svc = Service(RecordingEngine(Tokenizer(), ['x']), Tokenizer(), None)
+        svc.configure_toolguard({})
+        self.assertTrue(svc.loop_breaker)
+        # same call, result changes each time (the breaker sees no loop): the backstop note on the 3rd call only
+        m = chain([("bash", {"command": "date"}, f"t{k}") for k in range(3)])
+        svc._toolguard_prompt(m)
+        self.assertNotIn("Note", m[2]["content"] + m[4]["content"])
+        self.assertIn(g.REPEAT_NOTE, m[6]["content"])
+        m = chain_ids([("edit", edit_args(i), FAIL) for i in range(4)])
+        svc._toolguard_prompt(m)
+        self.assertTrue(all(x["content"].count("[Note:") <= 1 for x in m if x["role"] == "tool"))
+        self.assertIn(g.LOOP_NOTE, m[-1]["content"])
+
+
 if __name__ == "__main__":
     unittest.main()

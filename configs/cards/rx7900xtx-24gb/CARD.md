@@ -21,6 +21,11 @@
 |:---|:---|
 | `1x/` | one card: IQ3_S, UD-IQ4_XS, UD-Q4_K_XL (the fork's "1 GPU" settings, docs/RDNA3_SETTINGS.md there) |
 
+## 0.5 defaults
+
+Presets set `reasoning_budget_tokens` 32768 (the server default, written out) and keep the stock MTP drafter
+`<STRATA_DATA>/mtp/rt` (the tuned `mtp/rt-tuned` is not measured on this card yet).
+
 ## Measured upstream of this port (tok/s, one 7900 XTX, fork release rg23)
 
 | Quant | Prefill 32K | Prefill 128K | Decode prose 32K | Decode code 32K |

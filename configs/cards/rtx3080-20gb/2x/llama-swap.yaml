@@ -1,0 +1,31 @@
+# llama-swap in front of Strata (RTX 3080 20 GB + RTX 3080 10 GB): the request's "model" picks the quant; one loaded at a time.
+healthCheckTimeout: 600
+logLevel: info
+startPort: 18080
+models:
+  ud-q4_k_xl:
+    name: "Qwen3.8 Flash-Next UD-Q4_K_XL"
+    cmd: <LLAMA_SWAP_DIR>/serve.sh <CONFIG_DIR>/strata-ud-q4_k_xl-20g10-pw2.json ${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+    aliases: [qwen3.8-flash-next-ud-q4_k_xl, q4_xl]
+  ud-iq4_xs:
+    name: "Qwen3.8 Flash-Next UD-IQ4_XS"
+    cmd: <LLAMA_SWAP_DIR>/serve.sh <CONFIG_DIR>/strata-ud-iq4_xs-20g10-pw2.json ${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+    aliases: [qwen3.8-flash-next-ud-iq4_xs, q4_xs, ud-iq4_xs-1m]   # one preset from 0 to 1M
+  ud-iq3_xxs:
+    name: "Qwen3.8 Flash-Next UD-IQ3_XXS"
+    cmd: <LLAMA_SWAP_DIR>/serve.sh <CONFIG_DIR>/strata-ud-iq3_xxs-20g10-pw2.json ${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+    aliases: [qwen3.8-flash-next-ud-iq3_xxs, iq3_xxs]
+  ud-q4_k_xl-1m:
+    name: "Qwen3.8 Flash-Next UD-Q4_K_XL 1M (yarn x4)"
+    cmd: <LLAMA_SWAP_DIR>/serve.sh <CONFIG_DIR>/strata-ud-q4_k_xl-1m-20g10.json ${PORT}
+    checkEndpoint: /health
+    ttl: 3600
+hooks:
+  on_startup:
+    preload: [ud-q4_k_xl]

@@ -16,7 +16,7 @@
     "--spec-min-p",
     "0.5",
     "--mtp",
-    "<STRATA_DATA>/mtp/rt",
+    "<STRATA_DATA>/mtp/rt-tuned",
     "--max-context",
     "229376",
     "--kv",
@@ -68,7 +68,7 @@
     "STRATA_SELECT_TWO_PASS": "1",
     "STRATA_GDN_TC": "1"
   },
-  "reasoning_budget_tokens": 16384,
+  "reasoning_budget_tokens": 32768,
   "reasoning_close_retry": true,
   "repeat_stop_tokens": 256,
   "host": "127.0.0.1",

@@ -1,4 +1,4 @@
-"""Speedy 0.4.6 tool-call guards (each opt-in by an environment variable or the config's `env`).
+"""Speedy tool-call guards (each opt-in by an environment variable or the config's `env`).
 
 - Constrained tool-call opening (STRATA_TOOLCALL_CONSTRAIN=1): after the model writes `<tool_call>`, the next tokens are
   "\\n<function=" (forced) and then one of the request's declared tool names and ">\\n", picked token by token by the
@@ -35,6 +35,19 @@ LOOP_FLOOR = 0
 TOOL_STEP_THINK_CAP = 6144     # Speedy 0.5.0: thinking tokens of a reply that follows a tool result (0 = no cap)
 _WRITE_NAME = re.compile(r"write|edit|patch|replace|create|delete|remove|move|rename|insert|apply", re.I)
 _WRITE_CMD = re.compile(r"(^|[^<>&0-9])>{1,2}(?!&)|\bsed\s+-i|\btee\b|\bmv\b|\bcp\b|\brm\b|\bpatch\b|git\s+(apply|checkout|restore|stash)|\btouch\b|\bmkdir\b")
+# 0.5.1: a write whose result says it did nothing (not found / error / no match / unchanged) opens no epoch, so a
+# failing edit repeated verbatim is a loop (TB2 fix-git: 566 identical "File ... not found" edits went unnoticed).
+_FAILED = re.compile(r"^(?:error|failed)\b|\bnot found\b|no such file|does not exist|could not find|cannot find|"
+                     r"\bno match|did not match|not unique|multiple matches|\bunchanged\b|no changes|"
+                     r"must be different|are identical|permission denied", re.I)
+# volatile parts of a result, replaced before results are compared: call ids, uuids, hex ids, timestamps, durations
+_VOLATILE = re.compile(r"\bcall_[0-9A-Za-z_]+|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|"
+                       r"\b(?=[0-9a-f]*\d)[0-9a-f]{7,}\b|\b0x[0-9a-f]+\b|"
+                       r"\d{4}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d)?(?:\.\d+)?(?:Z|[+-]\d\d:?\d\d)?|\b\d\d:\d\d:\d\d(?:\.\d+)?\b|"
+                       r"\b\d+(?:\.\d+)?\s*(?:ns|us|µs|ms|s|sec|secs|seconds|m|min|minutes)\b", re.I)
+NEAR_STREAK = 3                # same tool name + same normalized result this many calls in a row: a loop (args may vary)
+NEAR_ARGS_RATIO = 0.85        # "near-identical" arguments (difflib ratio) for a near repeat whose result is not a failure
+REPEAT_BACKSTOP = 3            # with the loop breaker on, a name+args repeat seen this many times still gets the repeat note
 
 
 # ------------------------------------------------------------------------------------------------ settings
@@ -200,11 +213,14 @@ def _append_note(msg: dict, note: str) -> None:
         msg["content"] = (c if isinstance(c, str) else "" if c is None else str(c)) + text
 
 
-def mark_repeats(messages, window: int = REPEAT_WINDOW, note: str = REPEAT_NOTE) -> list[dict]:
+def mark_repeats(messages, window: int = REPEAT_WINDOW, note: str = REPEAT_NOTE, min_times: int = 2,
+                 skip_noted: bool = False) -> list[dict]:
     """Every assistant tool call identical to one of the `window` calls before it gets `note` after its result (the
     last tool message that follows that turn).  It is a function of the history alone, so the same turns get the same
     note on every request and the prompt prefix stays stable.  Returns the repeats of the latest assistant turn (the
-    ones a caller logs: earlier ones were logged when they were the latest) as {"name", "arguments", "times"}."""
+    ones a caller logs: earlier ones were logged when they were the latest) as {"name", "arguments", "times"}.
+    `min_times`: only a call seen at least this often in the conversation counts.  `skip_noted`: a turn whose last result
+    already ends with a note (the loop breaker's) gets no second one (0.5.1 backstop)."""
     window = max(1, int(window))
     history: list[tuple[str, str]] = []
     latest: list[dict] = []
@@ -217,7 +233,7 @@ def mark_repeats(messages, window: int = REPEAT_WINDOW, note: str = REPEAT_NOTE)
             sig = call_signature(call)
             if sig is None:
                 continue
-            if sig in history[-window:]:
+            if sig in history[-window:] and history.count(sig) + 1 >= min_times:
                 reps.append({"name": sig[0], "arguments": sig[1], "times": history.count(sig) + 1})
             history.append(sig)
         if not reps:
@@ -227,6 +243,8 @@ def mark_repeats(messages, window: int = REPEAT_WINDOW, note: str = REPEAT_NOTE)
             j += 1
         if j == i + 1:
             continue                                # no result yet: nothing to put the note after
+        if skip_noted and _NOTE_TAIL.search(_raw_text(messages[j - 1])):
+            continue
         _append_note(messages[j - 1], note)
         if i == last_asst and all(messages[k].get("role") == "tool" for k in range(i + 1, len(messages))):
             latest = reps
@@ -237,11 +255,34 @@ def mark_repeats(messages, window: int = REPEAT_WINDOW, note: str = REPEAT_NOTE)
 _NOTE_TAIL = re.compile(r"\n\n\[Note: [^\]]*\]\s*$")
 
 
-def _result_text(msg) -> str:
+def _raw_text(msg) -> str:
     c = msg.get("content") if isinstance(msg, dict) else None
     if isinstance(c, list):
         c = "".join(p.get("text", "") for p in c if isinstance(p, dict))
-    return _NOTE_TAIL.sub("", c if isinstance(c, str) else "" if c is None else str(c)).strip()
+    return c if isinstance(c, str) else "" if c is None else str(c)
+
+
+def _result_text(msg) -> str:
+    return _NOTE_TAIL.sub("", _raw_text(msg)).strip()
+
+
+def failed_result(res: str | None) -> bool:
+    """A tool result that says the call did nothing (checked on its first 300 characters)."""
+    return bool(res) and bool(_FAILED.search(res.strip()[:300]))
+
+
+def _norm_empty(res: str) -> str:
+    return re.sub(r"[\s()]|no output", "", res.lower())
+
+
+def _similar(a: str | None, b: str | None, ratio: float = NEAR_ARGS_RATIO) -> bool:
+    import difflib
+    return a is not None and b is not None and (a == b or difflib.SequenceMatcher(None, a, b).ratio() >= ratio)
+
+
+def norm_result(res: str | None) -> str | None:
+    """The result with volatile parts (ids, timestamps, durations) replaced, for comparing results."""
+    return None if res is None else _VOLATILE.sub("#", res)
 
 
 def is_write(sig: tuple[str, str]) -> bool:
@@ -262,13 +303,18 @@ def is_write(sig: tuple[str, str]) -> bool:
 
 def mark_loops(messages, window: int = REPEAT_WINDOW, note: str = LOOP_NOTE) -> list[dict]:
     """Like mark_repeats, stricter: a call is a loop repeat when one of the `window` calls before it has the same name
-    and arguments AND the same result text, with no write (is_write) between the two.  Such a call's turn gets `note`
+    and arguments AND the same result text (volatile ids/timestamps/durations normalized), with no successful write
+    (is_write, result not a failure) between the two; or the same tool name returned the same result NEAR_STREAK calls
+    in a row (arguments may differ).  Such a call's turn gets `note`
     after its last tool result.  A function of the history alone (cache-stable).  Returns the loop repeats of the latest
     assistant turn (when only tool results follow it) as {"name", "arguments", "times", "streak"}; streak = how many
     consecutive assistant turns, up to this one, held a loop repeat of that name."""
     window = max(1, int(window))
     history: list[tuple[tuple[str, str], str, int]] = []
     epoch = 0
+    run: tuple[str, str] | None = None      # (tool name, normalized result) of the previous call
+    run_n = 0
+    run_args: str | None = None
     streak: dict[str, int] = {}
     latest: list[dict] = []
     last_asst = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1)
@@ -287,12 +333,23 @@ def mark_loops(messages, window: int = REPEAT_WINDOW, note: str = LOOP_NOTE) -> 
                 continue
             res_msg = by_id.get(call.get("id")) if isinstance(call, dict) and call.get("id") in by_id else (
                 results[k] if k < len(results) else None)
-            res = _result_text(res_msg) if res_msg is not None else None
-            if res is not None and any(h[0] == sig and h[1] == res and h[2] == epoch for h in history[-window:]):
+            raw = _result_text(res_msg) if res_msg is not None else None
+            res = norm_result(raw)
+            wrote = is_write(sig) and not failed_result(raw)
+            # near repeat: same tool + same normalized result in a row, args different only slightly (or the result is
+            # a failure); a successful write or an empty result ("(no output)" of searches) breaks the run
+            key = (sig[0], res)
+            same_run = (res is not None and key == run and not wrote and _norm_empty(res) != ""
+                        and (failed_result(raw) or _similar(sig[1], run_args)))
+            run_n = run_n + 1 if same_run else (0 if wrote or res is None else 1)
+            run, run_args = (None, None) if wrote or res is None else (key, sig[1])
+            exact = res is not None and any(h[0] == sig and h[1] == res and h[2] == epoch for h in history[-window:])
+            near = run_n >= NEAR_STREAK
+            if exact or near:
                 names_now.add(sig[0])
                 reps.append({"name": sig[0], "arguments": sig[1], "times": sum(1 for h in history if h[0] == sig) + 1})
             history.append((sig, res, epoch))
-            if is_write(sig):
+            if wrote:
                 epoch += 1
         streak = {n: streak.get(n, 0) + 1 for n in names_now}
         for r in reps:

@@ -7,6 +7,7 @@ configs/
 │   │   ├── CARD.md             hardware, build flags, measured numbers, tuning notes
 │   │   ├── 1x/                 presets for one card (+ llama-swap.yaml)
 │   │   └── 2x/                 presets for two cards (layer split)
+│   ├── rtx3080-20gb/           1x/ one 20 GB card; 2x/ 20 GB + 10 GB (layer split)
 │   └── _template/              copy this to add a card
 ├── generic/                    presets with /opt paths, written by make_configs.py
 └── make_configs.py             writes generic presets for your paths
