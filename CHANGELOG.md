@@ -1,5 +1,10 @@
 # Changelog
 
+## Speedy 0.5.2 (unreleased)
+- **Updates bring the 0.5 settings** (UPDATE.bat / `./speedy-update`, `setup.py --update`): each installed Qwen3.8-Flash-Next config gets what a fresh 0.5 install writes. The tuned MTP drafter (downloaded and SHA-checked; offline or a bad file keeps the stock one), the thinking budgets of our old generic presets (16384 / 8192 / 4096) dropped so the server default 32768 applies (the old Q2_0 "low" preset's `reasoning_effort: low` with them), and the Speedy tool-call env everywhere plus the 1-GPU speed profile on one NVIDIA card with a UD-* file. Kept: `"mtp_drafter": "stock"` / `STRATA_MTP_DRAFTER=stock`, any other budget, env entries and engine options already set, configs set up with `--speedy-profile upstream`; Qwen3.6 and DeepSeek configs are not touched. Each changed config is backed up as `strata-*.json.bak-0.5.2` and the update prints what changed and how to revert it. A second update changes nothing.
+- Setup records `"speedy_profile": "upstream"` and `"mtp_drafter": "stock"` in the config when they are chosen, so an update respects them.
+- serve/version.py -> 0.5.2.
+
 ## Speedy 0.5.1 (2026-11-21)
 - **Loop breaker catches repeated failing edits/writes**: a write or edit whose result says it did nothing (not found, error, no match, unchanged) no longer counts as a workspace change, so the same failing call repeated is a loop (note, then the tool masked for one reply). A successful write still resets it, so edit -> test -> edit -> test is not a loop.
 - **Near-identical repeats**: the same tool returning the same result 3 times in a row is a loop even when the arguments differ (a failing result, or arguments that differ only slightly). Results are compared with call ids, hex ids, timestamps and durations normalized; arguments with sorted keys.

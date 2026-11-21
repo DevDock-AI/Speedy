@@ -6512,7 +6512,8 @@ def write_config(path: Path, cfg: dict):
 # "args_written" (strata_control/user_args.py) is setup's own; "user_args" is not in SETUP_KEYS on purpose: carry_over keeps it,
 # then applies the person's options over the generated ones
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "backend", "env",
-                        "gpu", "gpus_asked", "layer_split", "host", "api_key", "draft_vocab", "vision", "args_written"})
+                        "gpu", "gpus_asked", "layer_split", "host", "api_key", "draft_vocab", "vision", "args_written",
+                        "speedy_profile"})
 SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_ROCBLAS_TUNING", "STRATA_RESIDENT_PIN", "STRATA_NO_ARENA_THP", "STRATA_MMQ_KQ", "STRATA_HC_Q8",
                        "STRATA_ROUTE_TAIL_SKIP"}) | frozenset(SPEEDY_TOOL_ENV) | frozenset(SPEEDY_1GPU_ENV) | frozenset(GFX1103_SWITCHES) | frozenset(GFX1150_SWITCHES)   # the "env" entries setup writes (the gfx1103 switches are setup's too: a re-run refreshes them, they do not linger)
 # 0.1.44 added these three, written for Unsloth's files only (unsloth_default_env).  In any other model's config they are the
@@ -7027,6 +7028,114 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     return cfg
 
 
+# Speedy 0.5.2: an update brings an earlier install's configs to what a fresh 0.5 install writes.  The thinking budgets
+# our earlier generic presets wrote (configs/generic, 0.3.0 .. 0.5.1: 16384 for the 4-bit files, 8192 for Q2_0 medium
+# and 1M, 4096 for Q2_0 low) are dropped: the server's default (32768) then applies, as in a fresh config.  Any other
+# value is the user's own and kept.
+OLD_SETUP_BUDGETS = (16384, 8192, 4096)
+UPGRADE_052_BAK = ".bak-0.5.2"
+
+
+def _env_says_stock(cfg: dict) -> bool:
+    env = cfg.get("env") if isinstance(cfg.get("env"), dict) else {}
+    return str(cfg.get("mtp_drafter", "")).lower() == "stock" or str(env.get("STRATA_MTP_DRAFTER", "")).lower() == "stock"
+
+
+def flash_next_config(cfg: dict) -> bool:
+    """A config of a Qwen3.8-Flash-Next family (FAMILIES): the ones fresh setup gives the tuned drafter and profile.
+    Not Qwen3.6 (own path), DeepSeek-V4.1-Flash (its own MTP) or the Mac build."""
+    if own_path_config(cfg) or cfg.get("backend") == "metal":
+        return False
+    name = str(cfg.get("model_name") or "")
+    if any(name.startswith(d["name"]) for d in MULTI_FILE_FAMILIES.values()):
+        return False
+    return any(name.startswith(d["name"]) for d in FAMILIES.values())
+
+
+def upgrade_to_052(cfg_path: Path, cfg: dict, a=None, tuned_cache: dict | None = None, gpu: dict | None = None) -> list:
+    """The 0.5 settings for an updated install's config (update_install).  Returns what changed (a list of lines); the
+    config is backed up as <name>.bak-0.5.2 and rewritten when anything did.  Nothing a person set by hand is changed:
+    the drafter opt-out ("mtp_drafter": "stock", STRATA_MTP_DRAFTER=stock, --mtp-drafter stock), a thinking budget
+    other than our old preset ones, env entries already present, engine options already present, and a config set up
+    with --speedy-profile upstream ("speedy_profile": "upstream") all stay."""
+    if not flash_next_config(cfg):
+        return []
+    changes = []
+    args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
+    # 1. the tuned MTP drafter
+    want_stock = _env_says_stock(cfg) or getattr(a, "mtp_drafter", "tuned") == "stock"
+    if "--mtp" in args[:-1] and not want_stock and cfg.get("mtp") is not False:
+        i = args.index("--mtp") + 1
+        rt = Path(str(args[i]))
+        if rt.name == "rt" and (rt / "experts.bin").exists():
+            cache = tuned_cache if tuned_cache is not None else {}
+            key = os.path.normcase(os.path.abspath(rt))
+            if key not in cache:
+                cache[key] = tuned_mtp_dir(rt)
+            rtt = cache[key]
+            if rtt is not None:
+                if (rt / "draft_vocab.bin").exists():  # the refreshed vocabulary (a copy: never a link to it)
+                    (rtt / "draft_vocab.bin").unlink(missing_ok=True)
+                    shutil.copy2(rt / "draft_vocab.bin", rtt / "draft_vocab.bin")
+                args[i] = str(rtt)
+                changes.append("MTP drafter: the tuned one (revert: \"mtp_drafter\": \"stock\" in the config, "
+                               "or setup --mtp-drafter stock)")
+    # 2. the thinking budget and level our old presets wrote
+    b = cfg.get("reasoning_budget_tokens")
+    if isinstance(b, int) and not isinstance(b, bool) and b in OLD_SETUP_BUDGETS:
+        if b == 4096 and cfg.get("reasoning_effort") == "low":     # the old Q2_0 "low" preset's pair
+            cfg.pop("reasoning_effort")
+            changes.append("thinking level: the server default (medium) instead of the old preset's low "
+                           "(revert: \"reasoning_effort\": \"low\")")
+        cfg.pop("reasoning_budget_tokens")
+        changes.append(f"thinking budget: the server default (32768) instead of the old preset's {b} "
+                       f"(revert: \"reasoning_budget_tokens\": {b})")
+    # 3. the Speedy profile (tool-call env everywhere; the 1-GPU speed profile on one NVIDIA card with a UD-* file)
+    profile = cfg.get("speedy_profile") or ("upstream" if getattr(a, "speedy_profile", "tuned") == "upstream" else None)
+    if profile != "upstream":
+        name = str(cfg.get("model_name") or "")
+        unsloth = FAMILIES["unsloth"]["name"] + "-"
+        model = name[len(unsloth):].upper() if name.startswith(unsloth) else ""
+        multi = isinstance(cfg.get("gpu"), list) or cfg.get("layer_split") is not None
+        g = gpu
+        if g is None and model.startswith("UD-") and not multi and cfg.get("backend") != "hip":
+            try:
+                g = gpu_info(cfg.get("gpu") if isinstance(cfg.get("gpu"), int) else None)
+            except (SystemExit, Exception):        # noqa: BLE001 - no card readable: the plain profile
+                g = None
+        penv, pargs, pprefill = speedy_profile("tuned", "unsloth" if model else "qwen", model or "x",
+                                               cfg.get("backend") == "hip", multi, g)
+        env = cfg.get("env") if isinstance(cfg.get("env"), dict) else {}
+        added = [k for k in penv if k not in env]
+        if added:
+            cfg["env"] = {**env, **{k: penv[k] for k in added}}
+        new_args = []
+        if pprefill and "--prefill" in args[:-1] and args[args.index("--prefill") + 1] == "auto":
+            args[args.index("--prefill") + 1] = pprefill
+            new_args.append(f"--prefill {pprefill}")
+        for flag, value in zip(pargs[::2], pargs[1::2]):
+            if flag not in args:
+                args += [flag, value]
+                new_args.append(f"{flag} {value}")
+        if added or new_args:
+            what = "1-GPU speed profile and tool-call settings" if pargs else "tool-call settings"
+            changes.append(f"Speedy {what}: " + ", ".join(added + new_args) +
+                           " (revert: setup --speedy-profile upstream)")
+            cfg["speedy_profile"] = "tuned"
+    if not changes:
+        return []
+    if user_args.WRITTEN_KEY in cfg:                    # what setup wrote, for the next hand-edit check
+        user_args.stamp(cfg)
+    bak = cfg_path.with_name(cfg_path.name + UPGRADE_052_BAK)
+    try:
+        if not bak.exists():
+            shutil.copyfile(cfg_path, bak)
+    except OSError as e:
+        warn(f"could not keep a copy of {cfg_path.name} ({e.strerror or e})")
+    write_config(cfg_path, cfg)
+    return changes
+
+
 def update_install(have: list, a) -> int:
     """#475: `setup.py --update` (UPDATE.bat / update.sh, after their git pull): what a plain START-HERE.bat does to
     an install before it starts the model, without starting it - the Python packages, the ready-made engine when this
@@ -7043,10 +7152,16 @@ def update_install(have: list, a) -> int:
     if not a.build:
         update_installed_engine(a.prebuilt)
     mtp_done: set = set()
+    tuned_cache: dict = {}
     for cfg_path in have:
         cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
         if not own_path_config(cfg):
             refresh_shared_draft_vocab(cfg, mtp_done)
+        changes = upgrade_to_052(cfg_path, cfg, a, tuned_cache)
+        if changes:
+            ok(f"{cfg_path.name}: Speedy 0.5 settings (the earlier file is kept as {cfg_path.name}{UPGRADE_052_BAK})")
+            for line in changes:
+                say("    - " + line)
         if cfg.get("backend") == "hip" and WIN:
             hip_runtime_beside_exe(Path(cfg["exe"]).parent)   # #468 #461
         ok(f"{cfg.get('model_name', cfg_path.stem)}: up to date")
@@ -10292,6 +10407,10 @@ def main() -> int:
     if (uenv := unsloth_default_env(family, model, hip, in_budget)):
         cfg["env"] = uenv
     penv, pargs, pprefill = speedy_profile(a.speedy_profile, family, model, hip, bool(multi), gpu)
+    if a.speedy_profile == "upstream":
+        cfg["speedy_profile"] = "upstream"             # 0.5.2: an update keeps this choice (upgrade_to_052)
+    if a.mtp_drafter == "stock":
+        cfg["mtp_drafter"] = "stock"                   # 0.5.2: an update does not switch it to the tuned one
     if penv:
         cfg.setdefault("env", {}).update(penv)
     if pargs or pprefill:
