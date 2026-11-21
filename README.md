@@ -19,14 +19,14 @@ Speedy runs large mixture-of-experts models on consumer NVIDIA cards. Its main, 
 **Qwen3.8-Flash-Next** (125B MoE) with a **229K-token native context** and a **1M-token tier**; DeepSeek V4.1-Flash
 and Qwen3.6-35B-A3B run too ([docs/MODELS.md](docs/MODELS.md)). It is a measured, tuned fork of [Strata](https://github.com/Niko1221/Strata).
 Speed is half of it. The other half is what a local model usually gets wrong in real work: agents that loop, tool
-calls that don't parse, thinking that runs out before the answer. Speedy 0.5.0 handles those on the server, so the
+calls that don't parse, thinking that runs out before the answer. Speedy handles those on the server, so the
 client you already use works better.
 
 ## Why Speedy
 
 - 🎯 **Finishes real coding tasks.** 24/24 on our agentic suite (debugging, features, refactors, browser UI checked by screenshots), in 13.3 min instead of about 20.
 - 🧠 **Thinks, then answers.** Medium reasoning with a 32K thinking budget by default, nudges at 60 % and 80 % so it wraps up, and room reserved so a reply is never cut off before the answer.
-- 🔧 **Reliable tool calls.** Malformed calls are repaired, and a loop breaker stops an agent from repeating the same call over and over.
+- 🔧 **Reliable tool calls.** The model always picks a real tool and the one it meant, malformed calls are repaired, and a loop breaker stops an agent from repeating itself or editing in circles.
 - ⚡ **Fast.** 115-168 tok/s decode on one RTX 3080 20 GB, 155-216 tok/s with a second card. A follow-up turn in a long conversation reads from cache.
 - 📚 **Long context that holds.** 229K native, 1M tier. A session grown past 1M tokens still passed 9/9 recall checks.
 - 🔌 **Drop-in API.** OpenAI- and Anthropic-compatible: OpenCode, Claude Code, Codex CLI and anything else that speaks those APIs. Images in chat are supported.
@@ -37,7 +37,7 @@ Every default can be turned off, and a request's own settings always win ([docs/
 
 Qwen3.8-Flash-Next UD-Q4_K_XL, 1M-context preset, RTX 3080 20 GB + 10 GB. Tasks run through OpenCode against the real server.
 
-| Test | Speedy 0.5.0 defaults | Previous defaults |
+| Test | Speedy defaults | Previous defaults |
 |:---|:---|:---|
 | **Agentic coding suite**, 24 real tasks | **24/24** in 13.3 min | 21-24/24 in about 20 min |
 | **Harder multi-file tasks**, 11 tasks / 86 checks | **9/11** (84/86 checks) in 10.7 min | 8/11 (76/86) in 12.2 min |
@@ -76,22 +76,23 @@ Decode is with MTP speculative decoding. **short** is a short chat prompt, **cod
 | **UD-IQ4_XS** <sub>quality</sub> | **184** | **211** | **180** | **176** | 1,536 | 1,629 | 3,607 | 3,728 |
 | **UD-Q4_K_XL** <sub>best</sub> | **168** | **170** | **161** | **155** | 1,226 | 1,300 | 2,950 | 3,150 |
 
-<sub>0.4.6 engine, short speed screen. Presets (UD-Q4_K_XL, UD-IQ4_XS, UD-IQ3_XXS; 0.5 settings): [`configs/cards/rtx3080-20gb/2x/`](configs/cards/rtx3080-20gb/2x/).</sub>
+<sub>0.4.6 engine, short speed screen. Presets (UD-Q4_K_XL, UD-IQ4_XS, UD-IQ3_XXS; current defaults): [`configs/cards/rtx3080-20gb/2x/`](configs/cards/rtx3080-20gb/2x/).</sub>
 
 Measured on Linux (Threadripper PRO 5975WX, 144 GB RAM), cards capped at 240 W / 280 W and unlocked with the optional
 [gpu-unlock](docs/GPU-UNLOCK.md) module; without it expect lower prefill and the same decode. Plan for about 128 GB of
 RAM on the Q4-class quants. Other GPUs, the 1M-token runs and the method: [docs/BENCHMARKS.md](docs/BENCHMARKS.md);
 community results: [docs/COMMUNITY_BENCHMARKS.md](docs/COMMUNITY_BENCHMARKS.md).
 
-## What's new in 0.5.0 ([changelog](CHANGELOG.md))
+## Under the hood ([changelog](CHANGELOG.md))
 
 - **Smart reasoning defaults**: effort `medium`, 32K thinking budget, staged nudges, answer-room reserve.
-- **Loop breaker** for agents: a repeated identical tool call gets a note naming the next step, then the tool is masked for one reply.
+- **Loop breaker** for agents: repeated calls, edits that go back and forth and dummy writes get a note naming the next step; if the agent keeps at it, the editing tools pause until it does real work.
+- **Right tool, every time**: tool names are checked against what the client declared without steering the model's own choice, and a call that contradicts what the model just said it would do is re-picked.
 - **Tool-call repair**: broken calls are regenerated, argument shapes and types are fixed.
 - **Thinking restored across turns**, so a tool-call conversation continues from cache instead of re-reading.
 - **Stall and timeout guards**: a stuck request body or a client that stopped reading frees its slot.
 - **Tuned MTP draft head**: faster decode with identical output.
-- **Setup**: a tuned single-GPU profile by default, and a check that the size you pick fits your VRAM.
+- **Setup**: a tuned single-GPU profile by default, a check that the context you pick fits your VRAM, the best quant that fits fully on big cards, and updates that bring existing installs to the same settings.
 
 ## Quick start: Linux
 
@@ -130,7 +131,7 @@ numbers). They are our measured configs with paths and GPU UUIDs replaced by pla
 | Folder | Contents |
 |---|---|
 | [`rtx3080-20gb/1x/`](configs/cards/rtx3080-20gb/1x/) | one RTX 3080 20 GB: every quant at 229K and 1M |
-| [`rtx3080-20gb/2x/`](configs/cards/rtx3080-20gb/2x/) | RTX 3080 20 GB + RTX 3080 10 GB (layer split): UD-Q4_K_XL, UD-IQ4_XS, UD-IQ3_XXS with the 0.5 settings, plus `llama-swap.yaml` |
+| [`rtx3080-20gb/2x/`](configs/cards/rtx3080-20gb/2x/) | RTX 3080 20 GB + RTX 3080 10 GB (layer split): UD-Q4_K_XL, UD-IQ4_XS, UD-IQ3_XXS with the current defaults, plus `llama-swap.yaml` |
 | [`rtx3080-10gb/1x/`](configs/cards/rtx3080-10gb/1x/), [`2x/`](configs/cards/rtx3080-10gb/2x/) | one and two RTX 3080 10 GB, plus `llama-swap.yaml` |
 
 Got a different card? Copy [`configs/cards/_template/`](configs/cards/_template/) ([how](configs/README.md#add-a-card)),
