@@ -421,5 +421,69 @@ class BatchOwnership(FakeEngines, unittest.TestCase):
         self.finish(bg)
 
 
+    def test_closing_an_admission_mid_prompt_sends_stop(self):
+        """#6471: a consumer leaving a BGEN admission while its prompt is still read (gen.close() on a PP heartbeat,
+        before the cancel is polled) sends STOP, so the engine ends the read instead of reading the whole abandoned
+        prompt while it holds the control lines."""
+        sent = []
+        orig_send = self.engine._send
+
+        def spy_send(text):
+            sent.append(text.split()[0])
+            return orig_send(text)
+
+        bg = self.start_busy(n=2)
+        self.assertTrue(wait_until(lambda: sum(self.engine.slot_busy) >= 2))
+        with mock.patch.object(self.engine, "_send", side_effect=spy_send):
+            gen = self.engine.generate(prompt_ids("KA0001 SLOWPREFILL", 2600), 500, {}, threading.Event())
+            for tok in gen:
+                if tok is None:
+                    gen.close()
+                    break
+        self.assertEqual(sent, ["BGEN", "STOP"], f"closing a BGEN admission did not send STOP: {sent}")
+        self.assertEqual(self.engine.last.get("finish"), "cancel", self.engine.last)
+        self.assertEqual(self.engine.last.get("generated"), 0, self.engine.last)
+        b = Client(self.engine, "LB0002", max_new=60)
+        b.start()
+        self.finish([b], timeout=15)
+        self.assertIsNone(b.error)
+        self.assertEqual(b.foreign(), [])
+        self.assertEqual(b.tokens, expected_reply("LB0002")[:60])
+        for c in bg:
+            c.cancel.set()
+        self.finish(bg)
+
+    def test_a_restart_during_the_cleanup_wait_keeps_the_new_engines_slots(self):
+        """#6474: the engine restarts while a leaving request still waits for its BADM.  Its cleanup after that wait
+        must not clear the new engine's slot tables (they belong to the new engine's requests)."""
+        bg = self.start_busy(n=2)
+        self.assertTrue(wait_until(lambda: sum(self.engine.slot_busy) >= 2))
+        eng, new = self.engine, {}
+        drain = eng._drain_control
+
+        def restart_then_drain(until, timeout=None, born=None, lines_q=None):
+            if until == "BADM" and not new:
+                n = len(eng.slot_busy)          # what restart() leaves: gen first, then the new engine's tables
+                eng.gen += 1
+                new.update(busy=[True] * n, live=[{"new": i} for i in range(n)], held=[[7]] * n, claims=set(range(n)))
+                eng.slot_busy, eng.slot_live, eng.slot_held, eng.slot_claims = (
+                    new["busy"], new["live"], new["held"], new["claims"])
+            return drain(until, timeout=timeout, born=born, lines_q=lines_q)
+
+        eng._drain_control = restart_then_drain
+        gen = eng.generate(prompt_ids("KA0001 SLOWPREFILL", 2600), 500, {}, threading.Event())
+        for tok in gen:
+            if tok is None:
+                gen.close()
+                break
+        self.assertTrue(new, "the cleanup did not wait for the admission's BADM")
+        n = len(new["busy"])
+        self.assertEqual(new["busy"], [True] * n)
+        self.assertEqual(new["live"], [{"new": i} for i in range(n)])
+        self.assertEqual(new["held"], [[7]] * n)
+        self.assertEqual(new["claims"], set(range(n)))
+        for c in bg:
+            c.cancel.set()
+
 if __name__ == "__main__":
     unittest.main()
