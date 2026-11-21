@@ -23,6 +23,11 @@
 | [`2x/`](2x/) | two cards, layer split: every quant at 229K (`-2gpu-pw2`) and 1M (`-1m-2gpu`); UD-IQ4_XS is one preset from 0 to 1M (`-2gpu-pw2`), `llama-swap.yaml` |
 | [`2x/parallel2/`](2x/parallel2/) | `"parallel": 2` variants. Measured slower on 2× 10 GB, kept for reference |
 
+## 0.5 defaults
+
+Presets set `reasoning_budget_tokens` 32768 (the server default, written out) and use the tuned MTP drafter
+`<STRATA_DATA>/mtp/rt-tuned` that `setup.py` writes; `"mtp_drafter": "stock"` in a preset runs the stock `mtp/rt`.
+
 ## Measured (tok/s, average ± half spread)
 
 **1x**

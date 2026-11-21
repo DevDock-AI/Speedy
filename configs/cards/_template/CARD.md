@@ -25,6 +25,11 @@
 |:---|:---|
 | `1x/` | one card: which quants, which context |
 
+## 0.5 defaults
+
+Presets set `reasoning_budget_tokens` 32768 (the server default, written out) and use the tuned MTP drafter
+`<STRATA_DATA>/mtp/rt-tuned` that `setup.py` writes; `"mtp_drafter": "stock"` in a preset runs the stock `mtp/rt`.
+
 ## Measured (tok/s, average ± half spread)
 
 Same method as the reference card (bench/speedbench.py, cold prompts at about 60K / 120K / 200K, see CONTRIBUTING.md).
