@@ -68,26 +68,27 @@ class BiasEngine(MockEngine):
 
 class Pure(unittest.TestCase):
     def test_allowed_next_only_continues_declared_names(self):
-        index = {"r": [1], "re": [2], "read": [3], "x": [4], "4": [5], ">": [6], ">\n": [7], "=": [8], "b": [9]}
-        targets = g.name_targets(["read", "bash"])
-        self.assertEqual(g.allowed_next(index, "", targets), [1, 2, 3, 9])
-        self.assertEqual(g.allowed_next(index, "read", targets), [6, 7])
-        self.assertEqual(g.allowed_next(index, "rx", targets), [])
+        index = {"r": [1], "re": [2], "read": [3], "x": [4], "4": [5], ">": [6], ">\n": [7], "=": [8], "b": [9],
+                 "\n": [10], "\n<": [11], "<": [12]}
+        targets = g.opening_targets(["read", "bash"])
+        self.assertEqual(g.allowed_next(index, "", targets), [10, 11])
+        self.assertEqual(g.allowed_next(index, "\n<function=", targets), [1, 2, 3, 9])
+        self.assertEqual(g.allowed_next(index, "\n<function=read", targets), [6, 7])
+        self.assertEqual(g.allowed_next(index, "\n<function=rx", targets), [])
 
-    def test_constrain_name_picks_and_forces(self):
-        index = {"r": [1], "e": [2], "a": [3], "d": [4], "b": [5], "s": [6], "h": [7], ">": [8], "\n": [9], "_": [10],
-                 "l": [11], "read": [12]}
-        enc = lambda text: [index[c][0] for c in text]  # noqa: E731
-        # one pick ("b") leaves one name: the rest is forced
-        ids, name = g.constrain_name(lambda allowed: 5, enc, index, ["read", "bash"])
-        self.assertEqual((ids, name), ([5] + enc("ash>\n"), "bash"))
-        # read / read_all: "read" then ">" must be picked by the model
-        seq = iter([12, 8])
-        ids, name = g.constrain_name(lambda allowed: next(seq), enc, index, ["read", "read_all"])
-        self.assertEqual(name, "read")
-        self.assertEqual(ids, [12, 8, 9])
+    def test_constrain_opening_picks_and_forces(self):
+        # one id per character (the byte tokenizer): every name's opening shares "\n<function=", nothing is asked there
+        index = {c: [ord(c)] for c in "\n<>=_abcdefhilnorstu"}
+        enc = lambda text: [ord(c) for c in text]   # noqa: E731
+        # one pick ("b") leaves one name: the rest is written without asking
+        ids, name, picks = g.constrain_opening(lambda allowed, new: ord("b"), enc, index, ["read", "bash"])
+        self.assertEqual((ids, name, picks), (enc("\n<function=bash>\n"), "bash", 1))
+        # read / read_all: "r" picked (e, a, d follow for both), then ">" must be picked by the model
+        seq = iter("r>")
+        ids, name, picks = g.constrain_opening(lambda allowed, new: ord(next(seq)), enc, index, ["read", "read_all", "bash"])
+        self.assertEqual((ids, name, picks), (enc("\n<function=read>\n"), "read", 2))
         # a token outside the mask (an engine that ignored the bias): no name
-        self.assertIsNone(g.constrain_name(lambda allowed: 99, enc, index, ["read", "bash"]))
+        self.assertIsNone(g.constrain_opening(lambda allowed, new: 99, enc, index, ["read", "bash"]))
 
     def test_drop_boundary_moves_in_steps(self):
         self.assertEqual([g.drop_boundary(n, 4) for n in range(0, 11)], [0, 0, 0, 0, 0, 4, 4, 4, 4, 8, 8])
@@ -211,8 +212,9 @@ class Served(unittest.TestCase):
         self.assertNotIn("<4>", c["message"].get("content") or "")
         prompts = [self.tok.decode(p) for p, _, _ in self.engine.calls]
         biased = [s for _, _, s in self.engine.calls if s.get("logit_bias")]
-        # "read" vs "read_all": r, e, a, d and then ">" picked by the model; "\n" forced
-        self.assertEqual(len(biased), 5)
+        # the "\n<" the model wrote stays, "function=" is the only way on; "r" picked (list / read / read_all / bash), "ead"
+        # follows for both that are left, then ">" picked ("read" vs "read_all"); "\n" written without asking
+        self.assertEqual(len(biased), 2)
         self.assertTrue(prompts[1].endswith("Let me look.\n\n<tool_call>\n<function="))
         self.assertTrue(prompts[-1].endswith("<tool_call>\n<function=read>\n"))
         # every later prompt continues the first one (the engine's cached prefix)
@@ -227,7 +229,7 @@ class Served(unittest.TestCase):
         self.assertNotIn("<4>", c["content"])
 
     def test_off_and_unsupported_engine_unchanged(self):
-        for env, ok in (({}, True), ({"STRATA_TOOLCALL_CONSTRAIN": "1"}, False)):
+        for env, ok in (({"STRATA_TOOLCALL_CONSTRAIN": "0"}, True), ({"STRATA_TOOLCALL_CONSTRAIN": "1"}, False), ({}, False)):
             with self.subTest(env=env):
                 self.start(BiasEngine(CallTokenizer(), self.BROKEN, bias_ok=ok), **env)
                 c = self.post(self.ASK)

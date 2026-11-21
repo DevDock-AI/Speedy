@@ -62,6 +62,10 @@ See also: [CONFIGS.md](CONFIGS.md) (presets), [ARCHITECTURE.md](ARCHITECTURE.md)
 | Thinking budget | 32768 tokens | `"reasoning_budget_tokens": 0` (no budget) or another number |
 | Reasoning nudge (a short "start converging" note at 60% and 80% of the budget) | `[0.6, 0.8]` | `"reasoning_nudge": false` or `STRATA_REASONING_NUDGE=off` |
 | Loop breaker (same call + same result, no write between: a note naming the next step; the repeated tool masked for one reply after the second such turn) | on, no thinking floor | `STRATA_LOOP_BREAKER=0`; `STRATA_LOOP_BREAKER_FLOOR=N`, `STRATA_LOOP_BREAKER_MASK=0`, `STRATA_LOOP_BREAKER_NOTE=...` |
+| Edit cycles (0.5.3, part of the loop breaker: edits that go back and forth on one file with no other work between; a note, then the file-editing and todo tools masked until two turns of other work followed) | on | `STRATA_LOOP_BREAKER_CYCLE=0` (`STRATA_LOOP_BREAKER_MASK=0` keeps the notes, no mask) |
+| Junk writes (0.5.3, part of the loop breaker: a dummy file written instead of the step the reply described, such as `/tmp/opencode/cr8` holding `cr8` or `placeholder.txt` `x` -> `y`, is not work done: it does not reset the loop / cycle counts, and four such turns in a row get a note, then the editing tools masked) | on | `STRATA_LOOP_BREAKER=0` |
+| Tool call opening always names a declared tool (0.5.3: the model writes it, the server steps in only when no declared name can follow; see `STRATA_TOOLCALL_CONSTRAIN` in [DETAILS.md](DETAILS.md)) | on | `STRATA_TOOLCALL_CONSTRAIN=0`; `eager` = the mask at every call |
+| "Says X, does Y" (0.5.3: the reply's last sentence names the tool it is about to call and another is opened: written again with the named tool, once; else a note after the result) | on | `STRATA_TOOLCALL_INTENT=0` |
 | Thinking cap on a reply that follows a tool result | 6144 tokens | `STRATA_TOOL_STEP_THINK_CAP=0` |
 | Answer-room reserve | on | `STRATA_ANSWER_ROOM=0` / `"answer_room": false` |
 | MTP drafter written by setup | tuned (`<mtp dir>-tuned`) | `setup --mtp-drafter stock`, or `"mtp_drafter": "stock"` / `STRATA_MTP_DRAFTER=stock` |
