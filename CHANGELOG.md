@@ -1,6 +1,6 @@
 # Changelog
 
-## Speedy 0.5.0 (unreleased)
+## Speedy 0.5.0 (2026-11-21)
 - **Smarter agent defaults** (serve; every one can be turned off, see docs/SPEEDY_DEFAULTS.md): thinking level `medium` and a 32768-token thinking budget when the config names none; the reasoning nudge at 60%/80% of the budget; the loop breaker (note naming the next step, repeated tool masked for one reply, no thinking floor); a 6144-token thinking cap on replies that follow a tool result; the answer-room reserve now also for max_tokens 128..1023 on every model family.
 - **Reasoning restore**: a tool-call turn's thinking is restored by call id and spliced back, so the conversation cache continues instead of re-reading (`STRATA_REASONING_RESTORE=0` turns it off).
 - **Tool calls**: argument shape repair (Strata #6315), an indented bare `<function=` held while streaming (Strata #6138), lenient missing `</parameter>`, schema-typed coercion, plural/singular parameter names (#6285), opt-in constrained tool-name decoding in the engine (Strata #5969, #6022 shape).
