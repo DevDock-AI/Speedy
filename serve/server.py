@@ -5861,9 +5861,13 @@ class Service:
                     self.totals["tool_call_repeats"] = self.totals.get("tool_call_repeats", 0) + 1
                 print(f"[strata] loop breaker: {r['name']} same call + same result (streak {r['streak']}): note added",
                       flush=True)
-        elif getattr(self, "repeat_warn", False):
+        if getattr(self, "loop_breaker", False) or getattr(self, "repeat_warn", False):
+            # 0.5.1: with the loop breaker on, the plain repeat note stays as a backstop for a call made 3+ times
+            # (turns the loop breaker already noted get no second note)
+            lb_on = getattr(self, "loop_breaker", False)
             try:
-                reps = toolguard.mark_repeats(messages, self.repeat_window)
+                reps = toolguard.mark_repeats(messages, self.repeat_window,
+                                              min_times=toolguard.REPEAT_BACKSTOP if lb_on else 2, skip_noted=lb_on)
             except Exception as e:              # noqa: BLE001 - a guard never fails a request
                 reps = []
                 print(f"[strata] repeat warning skipped: {e}", flush=True)
