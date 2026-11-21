@@ -5829,6 +5829,10 @@ class Service:
         # budget in 9zz2 L2/L3); a cap on the thinking of any reply that follows a tool result.
         self.loop_note = (g.env_value("STRATA_LOOP_BREAKER_NOTE", cfg_env) or "").strip() or g.LOOP_NOTE
         self.loop_mask_streak = g.int_setting(g.env_value("STRATA_LOOP_BREAKER_MASK_STREAK", cfg_env), 2, low=1) or 2
+        # 0.5.3: edit cycles (back-and-forth edits of one file with no other work between; toolguard.mark_cycles), on
+        # with the loop breaker unless STRATA_LOOP_BREAKER_CYCLE is 0 / false / off
+        lc = g.env_value("STRATA_LOOP_BREAKER_CYCLE", cfg_env)
+        self.loop_cycle = True if lc is None or str(lc).strip() == "" else g.flag(lc)
         self.think_floor_cap = g.int_setting(g.env_value("STRATA_THINK_FLOOR_CAP", cfg_env), 0)
         self.tool_step_think_cap = g.int_setting(g.env_value("STRATA_TOOL_STEP_THINK_CAP", cfg_env),
                                                   g.TOOL_STEP_THINK_CAP)
@@ -5851,9 +5855,24 @@ class Service:
             except Exception as e:              # noqa: BLE001 - a guard never fails a request
                 loops = []
                 print(f"[strata] loop breaker skipped: {e}", flush=True)
+            cycle = None
+            if getattr(self, "loop_cycle", False):
+                # 0.5.3: edit cycles, after the loop notes (a turn that is both keeps the loop's note, never two)
+                try:
+                    can_mask = getattr(self, "loop_mask", False) and tnc_api.engine_supports(self.engine)
+                    cycle = toolguard.mark_cycles(messages) if can_mask else toolguard.mark_cycles(messages, paused="")
+                except Exception as e:          # noqa: BLE001 - a guard never fails a request
+                    cycle = None
+                    print(f"[strata] loop breaker (edit cycle) skipped: {e}", flush=True)
+                for r in (cycle or {}).get("reps") or ():
+                    with self.status_lock:
+                        self.totals["tool_call_repeats"] = self.totals.get("tool_call_repeats", 0) + 1
+                    print(f"[strata] loop breaker: {r['name']} edit cycle on {str(r['target'])[:120]!r} ({r['kind']}, "
+                          f"cycle turn {r['turn']}): note added", flush=True)
             if cancel is not None:
                 try:
                     setattr(cancel, "_strata_loop", loops)
+                    setattr(cancel, "_strata_cycle", cycle)
                 except Exception:               # noqa: BLE001
                     pass
             for r in loops:
@@ -6306,14 +6325,20 @@ class Service:
             if tnc:
                 sampling = {**(sampling or {}), "_tool_name_constraint": tnc}
         loops = getattr(cancel, "_strata_loop", None) if getattr(self, "loop_breaker", False) else None
-        if loops and getattr(self, "loop_mask", False) and history_tools and not deferred:
-            drop = set(toolguard.masked_names(loops, getattr(self, "loop_mask_streak", 2)))
-            keep = [t.get("name") for t in history_tools if isinstance(t, dict) and t.get("name") not in drop]
+        # 0.5.3: an edit cycle keeps the file-editing tools out for several replies (until other work was done)
+        cycle = getattr(cancel, "_strata_cycle", None) if getattr(self, "loop_breaker", False) and not force else None
+        if (loops or (cycle or {}).get("mask")) and getattr(self, "loop_mask", False) and history_tools and not deferred:
+            declared = [t.get("name") for t in history_tools if isinstance(t, dict)]
+            held = set(toolguard.cycle_mask_names(cycle, declared))
+            drop = set(toolguard.masked_names(loops, getattr(self, "loop_mask_streak", 2))) | held
+            keep = [n for n in declared if n not in drop]
             if drop and keep and tnc_api.engine_supports(self.engine):
                 tnc2 = tnc_api.build(self.tok, keep, thinking)
                 if tnc2:
                     sampling = {**(sampling or {}), "_tool_name_constraint": tnc2}
-                    print(f"[strata] loop breaker: tool name(s) {sorted(drop)} masked for this reply", flush=True)
+                    print(f"[strata] loop breaker: tool name(s) {sorted(drop)} masked for this reply"
+                          + (f" (edit cycle: until {cycle.get('hold')} more turn(s) of other work)" if held else ""),
+                          flush=True)
             elif drop:
                 print(f"[strata] loop breaker: mask of {sorted(drop)} skipped (engine without tool_name_constraint v2"
                       f" or no other tool)", flush=True)
