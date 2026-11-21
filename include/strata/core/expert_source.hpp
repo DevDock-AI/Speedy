@@ -88,6 +88,12 @@ struct HostMemory {
     uint64_t commit = ~uint64_t{0};   ///< available Windows commit capacity; ~0 when not reported
 };
 
+/// Strata v0.2.17: the room under a cgroup v1 limit.  usage_in_bytes charges the whole page cache, so the group's clean
+/// file pages (memory.stat total_inactive_file + total_active_file - total_dirty - total_writeback, never more than the
+/// usage) are credited, less min(credit / 2, limit / 64).  No total_inactive_file: no credit (limit - usage).
+/// `inactive_only` (STRATA_MEM_CREDIT_INACTIVE=1) credits total_inactive_file alone.
+uint64_t cgroup_v1_room(uint64_t limit, uint64_t usage, const std::string& stat_text, bool inactive_only = false);
+
 /// Linux reads `meminfo`, `self_cgroup` and the cgroup tree under `cgroup_root` (the parameters are for tests; the
 /// defaults are the real files).  cgroup v2 as before (an unreadable limit of a group that has one fails); cgroup v1's
 /// memory controller (`<root>/memory/<path>`: memory.limit_in_bytes - memory.usage_in_bytes); no cgroup line at all is
@@ -109,6 +115,12 @@ bool wait_for_ram(uint64_t need, double max_wait_s, double step_s, double note_s
 /// Bound a resident budget by RAM and commit capacity after headroom; leave 256 MiB more when clamping.
 /// Pass UINT64_MAX for commit when the platform does not report it.
 uint64_t clamp_resident_budget(uint64_t requested, uint64_t physical, uint64_t commit, uint64_t headroom);
+
+/// #3725: under WDDM every page-locked, mapped host buffer counts against the GPU's shared (non-local) segment, on each
+/// CUDA device it is mapped into, and the segment is about half the RAM; the commit capacity does not show that limit.
+/// `segment_left` is the room the tightest GPU has left (budget - usage), `reserve` what the engine maps after the
+/// complement (the lend ring, the hand-off and staging buffers).  The budget, cut to what is left of the segment.
+uint64_t clamp_budget_to_shared_segment(uint64_t budget, uint64_t segment_left, uint64_t reserve);
 
 /// #1250: one cudaHostAlloc of the whole page-locked complement has no way back when the kernel does not give the
 /// pages as fast as the driver takes them (the process is OOM-killed, even with MemAvailable high: clean file cache
@@ -353,7 +365,8 @@ private:
     std::condition_variable cv_;
     bool quit_ = false, pending_ = false, busy_ = false;
     int64_t layer_ = -1, n_tok_ = 0;
-    const int32_t* host_res_ = nullptr;
+    std::vector<int32_t> res_;   ///< the residency rows of the layers predicted, copied at submit (admissions write the table)
+    bool has_res_ = false;
     uint64_t sub_gen_ = 0;
     ForesightSwap* fs_ = nullptr;                   ///< (under mu_)
     std::vector<float> x_;
@@ -391,6 +404,9 @@ struct GpuPlanSink {
     /// copy engine.  counts[0] = VRAM groups, counts[1] = all entries, counts[2] = PCIe groups.
     unsigned long long* ptr2 = nullptr;
     int32_t* start2 = nullptr;
+    /// STRATA_ADAPT_FETCH (pcie_mode 2): per PCIe group, the VRAM cache slot its blob is copied into instead of
+    /// staging (0: staging).  staging_cap entries.
+    unsigned long long* dst2 = nullptr;
     unsigned long long staging = 0;
     int64_t staging_cap = 0;
     int64_t cap = 0;
@@ -672,6 +688,24 @@ struct ExpertDispatch {
     /// whose routed ids all look resident there publishes no activation (doorbell_publish_res) - counted
     const int32_t* dres_check = nullptr;
     int64_t stale_x = 0;
+    /// Opt-in (STRATA_ADAPT_FETCH): the PCIe share admits into the VRAM tier.  Its blobs cross into VRAM anyway, so the
+    /// layer's most-routed misses (`usage`) take the share, and one routed at least `fetch_min` and `fetch_margin` more
+    /// than its layer's least-routed resident expert not routed in the window is copied into that one's slot instead
+    /// of staging - a swap with no RAM read of its own.  `res_mut` is `host_res`, written here (and listed in
+    /// `res_dirty_idx`); `in_flight`: experts the adaptive tier is copying in.
+    int fetch_admit = 0;
+    float fetch_min = 1.0f, fetch_margin = 0.5f;
+    int32_t* res_mut = nullptr;
+    std::vector<uint8_t> in_flight;
+    std::vector<uint8_t> fetch_mark;   ///< per expert of the layer: routed in the window
+    /// STRATA_ADAPT_FETCH: whether the pool can admit into `layer` now (a window still needs a PCIe share there)
+    bool fetch_can(int64_t layer) const;
+    /// per layer: the PCIe share fetched there since the tier's last round (the tier leaves those layers' fetchable
+    /// candidates to the admission under STRATA_ADAPT_FETCH=2, and swaps the rest itself)
+    std::vector<uint8_t> fetch_avail;
+    int64_t fetch_admitted = 0;
+    bool fetch_log_on = false;          ///< STRATA_ADAPT_FETCH_VERIFY: keep the admissions for a read-back
+    std::vector<std::pair<int64_t, int32_t>> fetch_log;   ///< (layer * n_expert + expert, slot)
     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
     /// Multi-GPU: the second GPU's tier.  Its experts are computed there instead of on the CPU (kind 2).

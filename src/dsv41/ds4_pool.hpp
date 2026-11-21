@@ -36,7 +36,7 @@ class Pool {
 public:
     explicit Pool(int n, const std::vector<int>& cpus = {}, int spin_us = 200) : spin_us_(spin_us) {
         for (int i = 0; i < n; ++i) {
-            th_.emplace_back([this] { loop(); });
+            th_.emplace_back([this] { os::no_power_throttling(); loop(); });
             if (!cpus.empty()) os::pin_thread(th_.back(), cpus[(size_t) i % cpus.size()]);
         }
     }
@@ -149,7 +149,7 @@ public:
         std::atomic<bool>* cancel = nullptr;   // set before the job starts: it is dropped unread (bad is set, left counted down)
     };
     explicit IoQueue(int n) {
-        for (int i = 0; i < n; ++i) th_.emplace_back([this] { loop(); });
+        for (int i = 0; i < n; ++i) th_.emplace_back([this] { os::no_power_throttling(); loop(); });
     }
     ~IoQueue() {
         {

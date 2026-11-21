@@ -138,11 +138,16 @@ public:
     /// parameters would otherwise be baked forever - so this can change between requests freely.
     void set_sampling(const strata::kernels::SamplerParams& sp) {
         sampling_ = sp;   // row t of a window at pos0 draws Philox(seed, pos0 + t): see run()
-        sampling_.logit_bias = logit_bias_host_.empty() ? nullptr : logit_bias_device_;
+        sampling_.logit_bias = logit_bias_host_.empty() && !bias_rows_ ? nullptr : logit_bias_device_;
+        sampling_.logit_bias_stride = bias_rows_ ? (int) n_vocab_ : 0;   // Strata #5969: a per-row bias stays per-row
         if (next_) next_->set_sampling(sp);
     }
     // One request's fixed vocabulary bias. Empty clears it; copied only when changed, on the final stage's device.
     bool set_logit_bias(const std::vector<float>& bias, std::string& err);
+    /// Strata #5969 (tool-name constraint): a PER-ROW bias for the next window: `host` holds `rows` x n_vocab floats, row t
+    /// the bias of token row t (sets `sampling_.logit_bias_stride = n_vocab`).  `rows == 0` or a null `host` clears it.  The
+    /// upload is unconditional (the per-row mask changes with the drafts); the next set_logit_bias re-uploads its broadcast row.
+    bool set_logit_bias_rows(const float* host, int rows, std::string& err);
 
     /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len`
     /// int32 slots at that stride (`strata::kernels::penalty_rows` builds them), most recent token LAST, unused
@@ -424,7 +429,8 @@ public:
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
     /// Called before every window this verifier launches (run, the batch and pipelined launches): the device's
-    /// residency table catches up with the host's (the adaptive tier's evictions while its copies are in flight).
+    /// residency table catches up with the host's (the adaptive tier's evictions while its copies are in flight,
+    /// STRATA_ADAPT_FETCH's admissions).
     /// It gets this verifier's stream; false (with the message in `err`) fails the launch.
     void set_pre_launch(std::function<bool(cudaStream_t cs, std::string& err)> f) { pre_launch_ = std::move(f); }
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
@@ -594,6 +600,8 @@ private:
 #endif
     std::vector<float> logit_bias_host_;
     float* logit_bias_device_ = nullptr;
+    size_t logit_bias_cap_ = 0;          ///< Strata #5969: bytes the device buffer holds (set_logit_bias_rows may grow it)
+    bool bias_rows_ = false;             ///< Strata #5969: the device buffer holds per-row data (set_logit_bias_rows)
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     unsigned long long* rr_stats_ = nullptr;   ///< STRATA_ROUTE_RESIDENT's counters on device_ (#1578); null: none
     std::atomic<bool> released_{false};  ///< #267: release_gpu_waits ran (maybe on the watchdog thread): no more windows
@@ -760,6 +768,7 @@ private:
     static void raise_flag(uint32_t* flag, uint32_t value);
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block
+    int64_t dst2_off_ = 0;                                        // its PCIe groups' slot targets (GpuPlanSink::dst2)
     GpuPlanSink sink_;
     uint32_t cur_layer_ = 0;
     static void publish_plan(void* ctx);

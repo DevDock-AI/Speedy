@@ -635,6 +635,24 @@ void test_unbuffered_reads() {
 
 // #633: the host RAM probe with fake /proc and cgroup trees: v2 (a limit, "max", a missing or malformed limit), v1
 // (a limit, unlimited), and no cgroup line at all.  Elsewhere than Linux it reads the machine's RAM.
+void test_wddm_shared_segment() {
+    constexpr uint64_t GiB = 1ull << 30;
+    // #3725: a 31 GB PC with two cards (WDDM shared segment ~15.5 GiB, ~12 GiB of it left for this process): the
+    // auto complement of 14.81 GiB was pinned whole and the next 26 KB cudaMalloc failed.  With 2 GiB kept for the
+    // buffers mapped later the reporter's own patch gave 12.90 -> 10.97 GiB at 12.97 GiB left.
+    using strata::core::detail::clamp_budget_to_shared_segment;
+    const uint64_t seg = 12970ull * GiB / 1000, keep = 2 * GiB;
+    require(clamp_budget_to_shared_segment(14810ull * GiB / 1000, seg, keep) == seg - keep,
+            "a complement larger than the shared segment's room was not cut");
+    require(clamp_budget_to_shared_segment(8 * GiB, seg, keep) == 8 * GiB,
+            "a complement that fits the shared segment was changed");
+    require(clamp_budget_to_shared_segment(seg - keep, seg, keep) == seg - keep,
+            "a complement that exactly fits the shared segment was changed");
+    require(clamp_budget_to_shared_segment(8 * GiB, keep, keep) == 0 && clamp_budget_to_shared_segment(8 * GiB, 0, keep) == 0,
+            "a shared segment with no room beyond the reserve produced a positive complement");
+    require(clamp_budget_to_shared_segment(8 * GiB, seg, 0) == 8 * GiB, "a zero reserve changed a fitting complement");
+}
+
 void test_host_memory() {
     using namespace strata::core::detail;
     constexpr uint64_t GiB = 1ull << 30;
@@ -686,6 +704,26 @@ void test_host_memory() {
     require(probe("4:memory:/docker/abc\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "v1 unlimited");
     // a v1 group not visible here (another namespace): MemAvailable alone
     require(probe("4:memory:/elsewhere\n") && m.available == 100 * GiB, "v1 group not mounted");
+    // Strata v0.2.17: v1 clean file cache credited (32 GiB limit, 30 GiB used, 20 GiB clean file pages, 1 GiB dirty)
+    put("fs/memory/docker/abc/memory.limit_in_bytes", std::to_string(32 * GiB) + "\n");
+    put("fs/memory/docker/abc/memory.usage_in_bytes", std::to_string(30 * GiB) + "\n");
+    put("fs/memory/docker/abc/memory.stat", "cache 1\ntotal_inactive_file " + std::to_string(15 * GiB) +
+        "\ntotal_active_file " + std::to_string(6 * GiB) + "\ntotal_dirty " + std::to_string(GiB) + "\ntotal_writeback 0\n");
+    require(probe("4:memory:/docker/abc\n") && m.available == 2 * GiB + 20 * GiB - 32 * GiB / 64 && m.cgroup_limit == 32 * GiB,
+            "v1 clean page cache credited");
+    // hybrid host: a "0::" line, the root is the v1 tree (no cgroup.controllers): the v1 group is read, not a failure
+    fs::remove(t.path / "fs/cgroup.controllers");
+    require(probe("4:memory:/docker/abc\n0::/docker/abc\n") && m.cgroup_limit == 32 * GiB &&
+            m.available == 2 * GiB + 20 * GiB - 32 * GiB / 64, "hybrid cgroup host");
+    require(probe("0::/system.slice/x\n4:memory:/docker/abc\n") && m.cgroup_limit == 32 * GiB, "hybrid, 0:: line first");
+    fs::remove(t.path / "fs/memory/docker/abc/memory.stat");
+    require(probe("4:memory:/docker/abc\n") && m.available == 2 * GiB, "v1 without memory.stat: no credit");
+    // the pure rule
+    require(cgroup_v1_room(32 * GiB, 30 * GiB, "") == 2 * GiB, "v1 room, no stat");
+    require(cgroup_v1_room(32 * GiB, 30 * GiB, "total_inactive_file " + std::to_string(40 * GiB) + "\n") ==
+            32 * GiB - (30 * GiB - (30 * GiB - GiB / 2)), "v1 credit bounded by the usage");
+    require(cgroup_v1_room(32 * GiB, 30 * GiB, "total_inactive_file " + std::to_string(4 * GiB) + "\ntotal_active_file " +
+            std::to_string(10 * GiB) + "\n", true) == 2 * GiB + 4 * GiB - 32 * GiB / 64, "v1 inactive only");
 #else
     require(host_available_memory(m) && m.available > 0 && m.cgroup_limit == ~0ull, "this PC's RAM");
 #if defined(_WIN32)
@@ -1050,6 +1088,7 @@ int main(int argc, char** argv) {
         test_numa_slice_ranges();
         test_cgroup_memory_budget();
         test_host_memory();
+        test_wddm_shared_segment();
         test_canonical_layout();
         test_unbuffered_reads();
         test_io_prefetch();

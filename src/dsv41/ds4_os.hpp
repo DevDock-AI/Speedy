@@ -512,9 +512,24 @@ inline void anon_free(void* p, size_t bytes) {
 #endif
 }
 
+/// Windows 10/11: opt the calling thread out of EcoQoS (power throttling), which parks a backgrounded console's
+/// threads on efficiency cores at low clocks - the CPU pool's workers then hold every token back.  Resolved at run time
+/// (no newer SDK needed, a no-op on Windows before 10 1709); elsewhere nothing.  (Idea from llamAmpere v0.7.1, MIT.)
+inline void no_power_throttling() {
+#if defined(_WIN32)
+    struct Tps { ULONG Version, ControlMask, StateMask; };   // THREAD_POWER_THROTTLING_STATE
+    using Fn = BOOL(WINAPI*)(HANDLE, int, LPVOID, DWORD);
+    static const Fn set = (Fn) (void*) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation");
+    if (set == nullptr) return;
+    Tps st{1u /* THREAD_POWER_THROTTLING_CURRENT_VERSION */, 0x1u /* ..._EXECUTION_SPEED */, 0u /* off */};
+    set(GetCurrentThread(), 3 /* ThreadPowerThrottling */, &st, (DWORD) sizeof st);
+#endif
+}
+
 /// The calling thread, or `t`, on logical CPU `cpu` (Windows: the first 64 CPUs, processor group 0).
 inline void pin_self(int cpu) {
 #if defined(_WIN32)
+    no_power_throttling();
     if (cpu >= 0 && cpu < 64) SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << cpu);
 #else
     cpu_set_t set;
