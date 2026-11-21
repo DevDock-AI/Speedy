@@ -14,6 +14,20 @@ fi
 # Python 3.10+ that can make a venv WITH pip: Debian/Ubuntu ship `venv` without `ensurepip` (that is the separate
 # python3-venv package), and a venv made without it has no pip
 ok_py() { "$1" -c 'import sys, venv, ensurepip; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; }
+# Speedy #24: the interpreters tried, in order. A `python3` without ensurepip (an image whose python3 is newer than the
+# one apt's python3-venv belongs to) falls back to python3.12 / python3.11; TRIED names each one for the message.
+PY_CANDIDATES="python3 python3.12 python3.11 python"
+TRIED=""
+find_py() {
+  PY=""
+  for c in $PY_CANDIDATES; do
+    if command -v $c >/dev/null 2>&1; then
+      if ok_py $c; then PY=$c; return 0; fi
+      TRIED="$TRIED $c=$(command -v $c)($($c -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo '?'))"
+    fi
+  done
+  return 1
+}
 # a .venv from an earlier run that failed half-way has a python but no pip: start it again
 if [ -x .venv/bin/python ] && ! .venv/bin/python -m pip --version >/dev/null 2>&1; then
   rm -rf .venv
@@ -30,11 +44,7 @@ if [ ! -x .venv/bin/python ]; then
     # Prefer uv's own interpreter: unlike Nix's Python, it works naturally with pip wheels using dlopen.
     PY=3.12
   else
-    for c in python3 python; do
-      if command -v $c >/dev/null 2>&1 && ok_py $c; then
-        PY=$c; break
-      fi
-    done
+    find_py
   fi
   # macOS: the system Python is 3.9; a standalone Python 3.12 goes into .python (no sudo, no Homebrew; pinned)
   if [ -z "$PY" ] && [ "$(uname -s)" = Darwin ]; then
@@ -58,8 +68,9 @@ if [ ! -x .venv/bin/python ]; then
     elif command -v pacman >/dev/null 2>&1; then
       sudo pacman -S --noconfirm python python-pip
     fi
-    PY=python3
-    if ! ok_py $PY; then
+    TRIED=""
+    if ! find_py; then
+      echo "No Python 3.10+ with venv and ensurepip found. Tested:${TRIED:- none}"
       echo "Please install Python 3.10 or newer with venv (Ubuntu/Debian: sudo apt install python3-venv), then run"
       echo "./setup.sh again. On NixOS, add uv to environment.systemPackages."
       exit 1
@@ -70,7 +81,8 @@ if [ ! -x .venv/bin/python ]; then
     "$UV" venv --managed-python --seed --python "$PY" .venv || { echo "Could not create the uv environment in .venv."; exit 1; }
   else
     # a private environment inside this folder (system Python stays untouched; newer distros refuse global pip)
-    $PY -m venv .venv || { rm -rf .venv; echo "could not create .venv: sudo apt install python3-venv"; exit 1; }
+    echo "Making .venv with $PY ($(command -v $PY 2>/dev/null || echo $PY))"
+    $PY -m venv .venv || { rm -rf .venv; echo "could not create .venv with $PY: sudo apt install python3-venv"; exit 1; }
   fi
 fi
 exec .venv/bin/python setup.py "$@"

@@ -570,7 +570,12 @@ UNSLOTH_BIG_SHARDS = {
         (34015618784, "538a93bca918064983409a41187ad4c68640f9aced6f29564da8f551bf86d7a5"),
 }
 UNSLOTH_ENGINE = (0, 1, 32)     # the first engine setup configures for UD-Q4_K_XL (0.1.31 ran it by hand)
-UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and the file cache the rest is read through
+UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget where the 17 below was not measured: a layer split's need (unsloth_split_need_gb), a unified-memory GPU, the APU cache room
+UNSLOTH_BUDGET_LEFT_GB = 17     # RAM beside the RAM budget (resident_budget_gib) on a discrete card.  Upstream Strata v0.2.17 (8780e9fdc): 24 -> 17, a 64 GB PC 40 -> 47 GiB;
+                                # under a real 64 GiB limit (UD-Q4_K_XL, RTX PRO 4500): decode 57.7 -> 84.2 tok/s, a 65K prompt reads 97.7 -> 37.0 GB from the SSD,
+                                # and it survived an 8 GiB program started after the load (52 did not).  The engine still clamps N to free RAM less 4 GiB at start.
+UNSLOTH_BUDGET_MIN_RAM_GB = 64  # Speedy 0.5.0: the 17 applies from 64 GB (nominal) up. At 32 GB it cut UD-Q4_K_XL prefill by ~3/4 in our
+                                # test (n1), so below 64 GB the budget stays RAM - 24 (UNSLOTH_RAM_LEFT_GB), as in 0.4.12
 UNSLOTH_MIN_RAM_GB = 48         # the RAM-budget mode below which setup says an Unsloth file does not fit (UD-Q4_K_XL's floor)
 # Contexts past 262144 (the model's trained length) extend it by rope scaling: for the context it will
 # serve the setup resolves the method (yarn, or one question when interactive) and derives the factor
@@ -847,6 +852,24 @@ def ok(msg):
 
 def warn(msg):
     say(f"  [!]  {msg}")
+
+
+def port_busy(host: str, port: int) -> bool:
+    """Speedy #24: whether something already listens on host:port (checked before the download, not after it)."""
+    import socket
+    try:
+        with socket.create_connection((host if host not in ("0.0.0.0", "::", "") else "127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def free_port(host: str, port: int, tries: int = 20):
+    """The first port after `port` nothing listens on; None when the next `tries` are all taken."""
+    for p in range(port + 1, port + 1 + tries):
+        if not port_busy(host, p):
+            return p
+    return None
 
 
 def fail(msg, hint=None):
@@ -3243,12 +3266,33 @@ def ready_fetch(model: str, models_dir: Path) -> None:
         verify_sha256(dst, size, sha)
 
 
-def resident_budget_gib(model, ram, kv_ram_gb=0.0) -> int:
-    """UD-Q4_K_XL: the GiB of experts the engine keeps in RAM (--resident-budget-gib): the RAM (GiB, ram_gb()) less
-    24 for the OS, the engine and the file cache the other experts are read through, less a KV cache streamed to
-    RAM; at most all of them, at least 8.  64 GB: 40, the measured setting (docs/UNSLOTH_Q4.md)."""
-    gib = round(ram) - UNSLOTH_RAM_LEFT_GB - math.ceil(kv_ram_gb)
+def resident_budget_gib(model, ram, kv_ram_gb=0.0, uma=False) -> int:
+    """UD-Q4_K_XL: the GiB of experts the engine keeps in RAM (--resident-budget-gib): the RAM (GiB, ram_gb(), rounded up to
+    the size the PC is sold with: nominal_ram_gb) less 17 (UNSLOTH_BUDGET_LEFT_GB) for the OS, the engine and the file cache
+    the other experts are read through, less a KV cache streamed to RAM; at most all of them, at least 8.  64 GB: 47
+    (Speedy 0.4.12 and earlier: less 24, 40).  Below 64 GB (nominal) the old rule stays: the reading less 24.  A unified-memory GPU (`uma`) keeps 24: its expert cache is RAM too, and 17
+    was measured on discrete cards only (upstream Strata v0.2.17)."""
+    nominal = nominal_ram_gb(ram)
+    if uma or nominal < UNSLOTH_BUDGET_MIN_RAM_GB:     # Speedy 0.5.0: the 17 only from 64 GB up; the old rule below
+        gib = round(ram) - UNSLOTH_RAM_LEFT_GB - math.ceil(kv_ram_gb)
+    else:
+        gib = round(nominal) - UNSLOTH_BUDGET_LEFT_GB - math.ceil(kv_ram_gb)
     return max(8, min(gib, int(MODELS[model]["arena_gb"] / 1.073741824)))
+
+
+NOMINAL_RAM_GB = (16, 24, 32, 48, 64, 96, 128, 192, 256)     # the sizes a PC is sold with (above 256: a multiple of 8)
+NOMINAL_RAM_MARGIN = 0.03                                    # a reading this close under one of them is that size
+
+
+def nominal_ram_gb(ram) -> float:
+    """Upstream Strata v0.2.17 (c8d70bbcd): the RAM reading rounded UP to the size the PC is sold with, where it reads within 3% under it.
+    A "64 GB" Windows PC reads 63.1 GiB (Linux 62.5 to 63.7), which gave one GiB less than the same PC on Linux.  A PC that really has
+    less (60 GB) is not counted as 64.  Only the RAM budget rule uses it; every other test keeps the reading."""
+    ram = float(ram)
+    size = next((s for s in NOMINAL_RAM_GB if ram <= s), None)
+    if size is None:
+        size = math.ceil(ram / 8) * 8
+    return float(size) if size * (1 - NOMINAL_RAM_MARGIN) <= ram <= size else ram
 
 
 # MODEL-UPDATE Phase 2: Unsloth's files keep every expert in RAM (a pinned arena, as ISTA's files do) where the experts
@@ -3315,15 +3359,15 @@ def uma_expert_cache(model, ram, budget_gib, kv_ram_gb=0.0):
     return slots if slots >= 256 else None
 
 
-def budget_choice(model, ram, asked) -> float:
+def budget_choice(model, ram, asked, uma=False) -> float:
     """S4: UD-Q4_K_XL's RAM budget: --resident-budget-gib N as given, else the recommendation (resident_budget_gib).
     More than the recommendation is kept, with what it risks (the owner's rule: setup recommends, it never forces)."""
-    rec = resident_budget_gib(model, ram)
+    rec = resident_budget_gib(model, ram, uma=uma)
     if asked is None:
         return rec
     if asked > rec:
         warn(f"a {asked:g} GiB RAM budget is more than setup recommends for this PC ({rec} GiB: the RAM less "
-             f"{UNSLOTH_RAM_LEFT_GB} GB for the OS, the engine and the file cache that reads the other experts). Kept "
+             f"{UNSLOTH_RAM_LEFT_GB if uma or nominal_ram_gb(ram) < UNSLOTH_BUDGET_MIN_RAM_GB else UNSLOTH_BUDGET_LEFT_GB} GB for the OS, the engine and the file cache that reads the other experts). Kept "
              "as you chose: the engine clamps it to the RAM it finds free at start (less 4 GB), and the file cache "
              "gets less room - it may be slower, or run the PC out of RAM under load")
     return int(asked) if asked == int(asked) else asked
@@ -3854,6 +3898,89 @@ def unsloth_default_env(family: str, model: str, hip: bool, in_budget: bool) -> 
     if not in_budget:
         env["STRATA_ROUTE_TAIL_SKIP"] = "0"
     return env
+
+
+# Speedy 0.5.0: the env our own tuned presets run, written by setup too.  Before, a setup.sh config on one card decoded
+# 33-35% slower than our tuned 1-card preset on the same card (UD-IQ4_XS 92 vs 138 tok/s, UD-Q4_K_XL 77 vs 118).
+# Tool-call quality (serve side, every model and card count): constrained call opening, call repair, the repeat
+# warning, undeclared tool names kept as calls.
+SPEEDY_TOOL_ENV = {"STRATA_TOOLCALL_CONSTRAIN": "1", "STRATA_TOOLCALL_REPAIR": "1", "STRATA_REPEAT_WARN": "1",
+                   "STRATA_UNDECLARED_TOOL_CALLS": "call"}
+# The 1-GPU speed profile (NVIDIA, Unsloth UD-* files): residency-biased routing (route prior 1.5; it can end a reply
+# early now and then, accepted for the speed), the routed prompt stream, two-pass expert select, the GDN tensor-core
+# path.  The tail skip stays off (+3-5% decode measured, under our 8% gate for a lossy switch).
+SPEEDY_1GPU_ENV = {"STRATA_ROUTE_PRIOR": "1.5", "STRATA_PREFILL_ROUTED_STREAM": "1", "STRATA_PREFILL_ROUTED_STREAM_PP": "1",
+                   "STRATA_PREFILL_STREAM_MIN": "512", "STRATA_SELECT_TWO_PASS": "1", "STRATA_GDN_TC": "1"}
+SPEEDY_1GPU_ARGS = ["--adapt-async", "1", "--adapt-swaps", "80", "--pool-affinity", "measure"]
+SPEEDY_1GPU_PREFILL = "auto:16384"
+SPEEDY_PROFILES = ("tuned", "upstream")
+
+
+def speedy_profile(profile: str, family: str, model: str, hip: bool, multi: bool,
+                   gpu: dict | None = None) -> tuple[dict, list, str | None]:
+    """Speedy 0.5.0: (env, extra engine args, --prefill value or None) for the config setup writes.  "tuned" (default):
+    the tool-call env everywhere, plus on one NVIDIA card with an Unsloth UD-* file the 1-GPU speed profile of our own
+    presets.  "upstream": nothing (upstream Strata's setup output).  Several cards keep setup's split settings (our
+    multi-card tuning lives in the card presets: configs/cards)."""
+    if profile == "upstream":
+        return {}, [], None
+    env = dict(SPEEDY_TOOL_ENV)
+    if hip or multi or family != "unsloth" or not model.startswith("UD-"):
+        return env, [], None
+    env.update(SPEEDY_1GPU_ENV)
+    args = list(SPEEDY_1GPU_ARGS)
+    try:
+        arch, vram = int((gpu or {}).get("arch") or 0), float((gpu or {}).get("vram_gb") or 0.0)
+    except (TypeError, ValueError):
+        arch, vram = 0, 0.0
+    if arch >= 120 and 0 < vram <= 16.5:     # RTX 50 <= 16 GB: the adaptive fetch default (STRATA_ADAPT_FETCH=2) needs
+        i = args.index("--adapt-async")      # synchronous adapt swaps, and it is the bigger gain there
+        del args[i:i + 2]
+    return env, args, SPEEDY_1GPU_PREFILL
+
+
+# Speedy 0.5.0: the tuned MTP drafter ("mtp-tuned"): the draft layer's dense weights re-tuned on the model's own
+# outputs (self-distilled); experts, index and draft vocabulary stay the stock ones.  Decode +2.5% on UD-Q4_K_XL
+# (accepted drafts 66.5% -> 69.6%), even on UD-IQ4_XS.  The weights derive from Qwen3.8-Flash-Next and are under the
+# Qwen Community License 1.0 (licenses/Qwen-Community-License-1.0.txt; the notice is copied next to the file).
+# The stock drafter: setup --mtp-drafter stock, or "mtp_drafter": "stock" (STRATA_MTP_DRAFTER=stock) in the config.
+MTP_TUNED = {"url": "https://github.com/DevDock-AI/Speedy/releases/download/v0.5.0/mtp-tuned-dense.bin",
+             "size": 116099072, "sha256": "dfe18647e0c95d05302907be88f021590119645a1567fcd770c8d309df852d75"}
+MTP_TUNED_SUFFIX = "-tuned"
+MTP_DRAFTERS = ("tuned", "stock")
+
+
+def tuned_mtp_dir(rt: Path, url: str | None = None) -> Path | None:
+    """The tuned drafter's directory next to the stock one (<rt>-tuned): its dense.bin downloaded and checked, the stock
+    dense.txt / experts.bin / draft_vocab.bin linked (copied where links are refused), the license notice beside them.
+    None when it cannot be had (offline, a wrong file): the caller keeps the stock drafter."""
+    out = rt.parent / (rt.name + MTP_TUNED_SUFFIX)
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        dense = out / "dense.bin"
+        if not (dense.exists() and dense.stat().st_size == MTP_TUNED["size"]):
+            download(url or MTP_TUNED["url"], dense, "the tuned MTP drafter (116 MB)")
+        h = hashlib.sha256()
+        with open(dense, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 22), b""):
+                h.update(chunk)
+        if h.hexdigest() != MTP_TUNED["sha256"]:
+            dense.unlink(missing_ok=True)
+            raise ValueError("the tuned MTP drafter's SHA-256 does not match")
+        for name in ("dense.txt", "experts.bin"):     # draft_vocab.bin: copied by the caller (it is refreshed)
+            src, dst = rt / name, out / name
+            if src.exists() and not dst.exists():
+                try:
+                    os.link(src, dst)
+                except OSError:
+                    shutil.copy2(src, dst)
+        lic = ROOT / "licenses" / "Qwen-Community-License-1.0.txt"
+        if lic.exists():
+            shutil.copy2(lic, out / "LICENSE-Qwen-Community-License-1.0.txt")
+        return out if all((out / n).exists() for n in ("dense.bin", "dense.txt", "experts.bin")) else None
+    except (SystemExit, Exception) as e:          # noqa: BLE001 - the stock drafter always works
+        warn(f"the tuned MTP drafter could not be set up ({e}); the stock drafter is used")
+        return None
 
 
 def menu_families(hip: bool) -> list:
@@ -5697,7 +5824,10 @@ def cmake_build(src, bdir, target, defs, vcvars, bat_name):
     cmake, ninja = ensure_build_tools()
     fresh_if_other_generator(bdir)
     conf = [cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(src), "-B", str(bdir),
-            "-DCMAKE_BUILD_TYPE=Release", *defs]
+            "-DCMAKE_BUILD_TYPE=Release", "-DGGML_CCACHE=OFF", *defs]
+    # Strata v0.2.17 (#6172): a vendored ggml (the vision and image builds) wraps EVERY compile in ccache / sccache when
+    # one is on PATH (a global RULE_LAUNCH_COMPILE), nvcc's too, and sccache stops them at the fatbinary step.  Off here;
+    # a -DGGML_CCACHE in defs still wins.
     build = [cmake, "--build", str(bdir), "--target", target, "-j", str(max(2, (os.cpu_count() or 4) // 2))]
     # A failed build is tried once more: CUDA 13.0's ptxas now and then fails to parse a PTX file it just wrote, and
     # the same command then gets past it (issue #45); a second attempt only compiles what is still missing.
@@ -6384,7 +6514,7 @@ def write_config(path: Path, cfg: dict):
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "backend", "env",
                         "gpu", "gpus_asked", "layer_split", "host", "api_key", "draft_vocab", "vision", "args_written"})
 SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_ROCBLAS_TUNING", "STRATA_RESIDENT_PIN", "STRATA_NO_ARENA_THP", "STRATA_MMQ_KQ", "STRATA_HC_Q8",
-                       "STRATA_ROUTE_TAIL_SKIP"}) | frozenset(GFX1103_SWITCHES) | frozenset(GFX1150_SWITCHES)   # the "env" entries setup writes (the gfx1103 switches are setup's too: a re-run refreshes them, they do not linger)
+                       "STRATA_ROUTE_TAIL_SKIP"}) | frozenset(SPEEDY_TOOL_ENV) | frozenset(SPEEDY_1GPU_ENV) | frozenset(GFX1103_SWITCHES) | frozenset(GFX1150_SWITCHES)   # the "env" entries setup writes (the gfx1103 switches are setup's too: a re-run refreshes them, they do not linger)
 # 0.1.44 added these three, written for Unsloth's files only (unsloth_default_env).  In any other model's config they are the
 # user's own (STRATA_ROUTE_TAIL_SKIP=0 to turn the tail skip off, STRATA_MMQ_KQ=1 ...): a setup run again keeps them there
 # (0.1.44 dropped them with the rest of SETUP_ENV).
@@ -7247,6 +7377,89 @@ def unsloth_small_card_lines(model: str, vram_gb: float, plan, start_ok: bool) -
         lines.append("By setup's estimate even a 4608 context with a 4-bit KV cache and no draft layer leaves no room "
                      "for the expert cache on this card: the start will probably stop with \"no VRAM is left for the "
                      "expert cache\".")
+    return lines
+
+
+# #25: the GSQ packs (IQ3_XXS and the other Qwen3.8-Flash-Next sizes) on a card of 10-12 GB.  A 262144 context with
+# an 8-bit KV cache and the draft layer left the expert cache no room on a 10 GB RTX 3080: the engine said "no VRAM is
+# left for the expert cache: it needs at least 296 slots (657 MiB), about 951 MiB more than this card has free" (the
+# session 3741 MiB at 262144 tokens, the draft layer 1098 MiB) and exited before it was ready.  FIT_FIXED_MIB is that
+# measurement turned into a constant: everything but the session's KV and the draft layer, the expert cache's minimum
+# and the engine's own 700 MiB reserve included.  An ESTIMATE (the dense side differs a little between the sizes):
+# FIT_MARGIN_MIB stands beside its error, and the engine still says what is short if it is off.
+FIT_FIXED_MIB = 6352
+FIT_MTP_MIB = 1098
+FIT_SESSION_MIB_262K_INT8 = 3741  # the session at 262144 tokens, 8-bit KV (the engine's own figure, #25)
+FIT_ENGINE_RESERVE_MIB = 700      # the reserve the engine keeps when none is given (in FIT_FIXED_MIB)
+FIT_MARGIN_MIB = 256
+FIT_CARD_GB = 12.5                # the check is for cards up to here (a 16 GB card has room to spare)
+FIT_HINT_MIN_GB = 9.5             # the hint: 10-12 GB cards (the #496 one covers those under 8 GB)
+FIT_CTX_STEPS = (131072, 65536, 32768)
+
+
+def fit_session_mib(ctx: int, kv: str, resident: int | None = None) -> float:
+    """The VRAM the session takes, mostly its KV cache: the #25 figure scaled by context and KV width.  With KV
+    streaming (--kv-resident N) only N positions stay in VRAM."""
+    toks = min(ctx, resident) if resident else ctx
+    return FIT_SESSION_MIB_262K_INT8 * toks / 262144 * UD_FIT_KV_BYTES.get(kv, 1056) / UD_FIT_KV_BYTES["int8"]
+
+
+def fit_slack_mib(vram_gb: float, ctx: int, kv: str, mtp: bool = True, reserve_mib: int | None = None,
+                  resident: int | None = None) -> float:
+    """MiB to spare beside the expert cache's minimum by setup's estimate (negative: the engine would exit with "no
+    VRAM is left for the expert cache")."""
+    extra = 0 if reserve_mib is None else reserve_mib - FIT_ENGINE_RESERVE_MIB
+    return (vram_gb * 1024 - FIT_FIXED_MIB - (FIT_MTP_MIB if mtp else 0) - fit_session_mib(ctx, kv, resident)
+            - extra)
+
+
+def fit_plan(vram_gb: float, ctx: int, kv: str, mtp: bool = True, reserve_mib: int | None = None,
+             resident: int | None = None):
+    """(ctx, kv, slack_mib) of the start that fits with the least change: the context first (262144 -> 131072 ->
+    65536 -> 32768), then the KV cache in 4 bits at 32768; None when not even that fits.  The first entry is the
+    config as asked when it already fits."""
+    ctxs = [ctx] + [c for c in FIT_CTX_STEPS if c < ctx]
+    tries = [(c, kv) for c in ctxs] + ([(ctxs[-1], "q4_0")] if kv not in ("q4_0",) else [])
+    for c, k in tries:
+        slack = fit_slack_mib(vram_gb, c, k, mtp, reserve_mib, resident)
+        if slack >= FIT_MARGIN_MIB:
+            return c, k, slack
+    return None
+
+
+RESIDENT_PICK_CTX, RESIDENT_PICK_KV = 131072, "int8"   # the context setup's preset asks for on a large card
+
+
+def resident_pick(vram_gb: float, ram: float, fams, multi=(), ctx: int = RESIDENT_PICK_CTX, kv: str = RESIDENT_PICK_KV):
+    """#23: (family, model, why) when one card's VRAM holds a better quant than the memory tier's (IQ3_S) fully
+    resident - all of its experts, the dense weights and buffers, the KV cache at ctx, the draft layer and the reserve
+    (fit_slack_mib) - else None.  The order is setup's quality order (RECOMMENDED_SIZES["unsloth"]: UD-Q4_K_XL, then
+    UD-IQ4_XS).  A 96 GB RTX PRO 6000 used to get IQ3_S with 40 GiB idle.  Never for a split or a card it does not fit."""
+    if multi or "unsloth" not in fams:
+        return None
+    for m in RECOMMENDED_SIZES["unsloth"]:
+        d = MODELS[m]
+        slack = fit_slack_mib(vram_gb, ctx, kv) - d["arena_gb"] * 1e9 / 2**20
+        if slack >= FIT_MARGIN_MIB and ram >= d["ram_gb"]:
+            why = (f"this card's {vram_gb:.0f} GB of VRAM holds all {d['arena_gb']:.0f} GB of {m}'s experts with the "
+                   f"KV cache ({ctx // 1024}K, {kv}), the draft layer and the reserve (~{slack / 1024:.0f} GiB to spare), "
+                   f"so the better-quality {m} is the pick over IQ3_S; --family/--model choose another")
+            return "unsloth", m, why
+    return None
+
+
+def fit_card_note(vram_gb: float, ctx: int, kv: str) -> list[str]:
+    """#25: the hint for a 10-12 GB card (the #496 one is for cards under 8 GB): what to run when the start stops
+    with "no VRAM is left for the expert cache".  A recommendation; setup already chose a start that fits."""
+    if not FIT_HINT_MIN_GB <= vram_gb <= FIT_CARD_GB:
+        return []
+    start = "START-HERE.bat --setup" if WIN else "./setup.sh"
+    smaller = next((c for c in FIT_CTX_STEPS if c < ctx), None)
+    tips = ([f"--context {smaller}"] if smaller else []) + (["--kv q4_0"] if kv != "q4_0" else [])
+    lines = [f"On a {vram_gb:.0f} GB card the context's KV cache and the draft layer share the VRAM with the expert "
+             "cache. If the start stops with \"no VRAM is left for the expert cache\":"]
+    lines.append(f"  run {start} again with " + (" or ".join(tips) if tips else "--draft-vocab en")
+                 + ", or close other programs that use the GPU.")
     return lines
 
 
@@ -8891,6 +9104,13 @@ def main() -> int:
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's settings for this PC (about 15-30 minutes, longer on a slow card), then start the model")
+    ap.add_argument("--mtp-drafter", choices=MTP_DRAFTERS, default="tuned",
+                    help="tuned (default) = Speedy's re-tuned MTP draft layer (more accepted drafts; Qwen Community "
+                         "License 1.0), stock = the draft layer of the model's pack")
+    ap.add_argument("--speedy-profile", choices=SPEEDY_PROFILES, default="tuned",
+                    help="tuned (default) = the settings of Speedy's own tuned presets (one NVIDIA card with an Unsloth "
+                         "UD-* file: route prior, routed prompt stream, two-pass select, GDN tensor cores; every config: "
+                         "tool-call repair and constrained calls); upstream = upstream Strata's setup output")
     ap.add_argument("--draft-vocab", choices=list(DRAFT_VOCABS),
                     help="the draft layer's tokens: cjk = with Chinese, Japanese and Korean (default), en = English "
                          "and code only (~110 MiB less VRAM, English answers 1-2%% faster), cyrillic = English, code "
@@ -9072,6 +9292,18 @@ def main() -> int:
         if not models_dir_given:
             a.models_dir = str(data / "models")
 
+    # Speedy #24: a busy port is found before the download (it used to fail the first start after 84 GB, like a broken install)
+    if not a.check and not a.no_start and port_busy(a.host or "127.0.0.1", port):
+        if a.port:
+            fail(f"port {port} is already in use (another server, or Strata already running)",
+                 f"stop that server, or pick another port: {'START-HERE.bat' if WIN else './setup.sh'} --port {port + 11}")
+        alt = free_port(a.host or "127.0.0.1", port)
+        if alt is None:
+            fail(f"port {port} and the next ones are already in use",
+                 f"pick a free port: {'START-HERE.bat' if WIN else './setup.sh'} --port N")
+        warn(f"port {port} is already in use (another server?): this install uses port {alt} instead "
+             f"(choose one yourself with --port N)")
+        port = a.port = alt
     # ---- 1. the PC
     step(1, "checking your PC")
     found = gpus()
@@ -9306,7 +9538,8 @@ def main() -> int:
         family = a.family
     else:
         tier = tier_pick(ram, low_ram_vram(gpu))
-        rec_fam = STRIX_HALO_FAMILY if strix_halo_recommends(gpu, ram) and STRIX_HALO_FAMILY in fams else             tier[0] if tier and tier[0] in fams else fams[0]
+        upgrade = None if a.model or gpu.get("uma") else resident_pick(gpu["vram_gb"], ram, fams, multi)
+        rec_fam = upgrade[0] if upgrade else STRIX_HALO_FAMILY if strix_halo_recommends(gpu, ram) and STRIX_HALO_FAMILY in fams else             tier[0] if tier and tier[0] in fams else fams[0]
         for i, f in enumerate(fams, 1):
             d = FAMILIES[f]
             say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else "")
@@ -9316,6 +9549,8 @@ def main() -> int:
             d = {**OWN_PATH_FAMILIES, **MULTI_FILE_FAMILIES}[f]
             say(f"  {j}) {d['title']:20s} {d['by']} - {d['about']}   [new]")
         allf = fams + list(OWN_PATH_FAMILIES) + list(MULTI_FILE_FAMILIES)
+        if upgrade:
+            say("  " + upgrade[2])
         if tier_note(ram, low_ram_vram(gpu)) and rec_fam == "swift":
             say("  " + tier_note(ram, low_ram_vram(gpu)))
         family = allf[int(ask("Which model?", [str(i) for i in range(1, len(allf) + 1)],
@@ -9370,7 +9605,9 @@ def main() -> int:
             fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, low_ram_vram(gpu)):.0f}%, "
                    + ("the rest in RAM)" if low_ram_resident(m, ram, low_ram_vram(gpu)) else "the rest from the SSD)"))
         say(f"  {i}) {m:8s}{size_tag(family, m, installed)} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
-    rec = str(names.index(installed or recommended_size(family, names, ram, low_ram_vram(gpu))) + 1)
+    pick = None if a.model or installed or gpu.get("uma") else resident_pick(gpu["vram_gb"], ram, fams, multi)
+    pick = pick[1] if pick and pick[0] == family and pick[1] in names else None
+    rec = str(names.index(installed or pick or recommended_size(family, names, ram, low_ram_vram(gpu))) + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     budget, q4_split = None, False
     in_budget = bool(MODELS[model].get("budget")) and unsloth_budget(model, ram, gpu, a.resident_budget_gib)
@@ -9403,7 +9640,7 @@ def main() -> int:
                          f"choose a smaller size, or --model {model} --yes to install it anyway", "  Install it anyway?")
             warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
         if in_budget:
-            budget = budget_choice(model, ram, a.resident_budget_gib)
+            budget = budget_choice(model, ram, a.resident_budget_gib, uma=bool((gpu or {}).get("uma")))
             if multi and not unsloth_together(a, model, ram, fallback_card(a, gpu, chosen), chosen):
                 gpu = fallback_card(a, gpu, chosen)
                 multi, sel, chosen = [], [gpu["index"]], [gpu]
@@ -9786,7 +10023,14 @@ def main() -> int:
     draft_vocab = a.draft_vocab or saved_draft_vocab(home() / f"strata-{tag.lower()}.json")
     if (rt / "experts.bin").exists():
         refresh_draft_vocab(rt, draft_vocab or "cjk")
-        ok(f"MTP draft layer: {rt}")
+        if a.mtp_drafter == "tuned" and (rtt := tuned_mtp_dir(rt)) is not None:
+            if (rt / "draft_vocab.bin").exists():      # the vocabulary just refreshed (a copy: never a link to it)
+                (rtt / "draft_vocab.bin").unlink(missing_ok=True)
+                shutil.copy2(rt / "draft_vocab.bin", rtt / "draft_vocab.bin")
+            rt = rtt
+            ok(f"MTP draft layer: {rt} (tuned drafter, Qwen Community License 1.0; --mtp-drafter stock for the stock one)")
+        else:
+            ok(f"MTP draft layer: {rt}")
     for line in draft_vocab_note(gpu.get("vram_gb", 0.0), draft_vocab):   # #474: a recommendation, nothing changes
         say("  " + line)
 
@@ -9823,7 +10067,7 @@ def main() -> int:
         # most-used experts outside VRAM pinned within RAM less 24 GB, the rest read from experts.bin.  Mapped
         # (--mmap-experts) on a 64 GB Windows PC, the experts it read stayed in the engine's working set: free RAM
         # fell to 0.6 GB on the RTX 5070 PC (2026-10-13), where the budget mode kept 22 GB free
-        rb = resident_budget_gib(model, ram)
+        rb = resident_budget_gib(model, ram, uma=bool((gpu or {}).get("uma")))
         args += ["--resident-budget-gib", str(rb)]
         ok(f"low-RAM mode: {rb} GiB of {model}'s experts kept in RAM (the most used), the rest read from the pack's "
            "experts.bin on the SSD as needed")
@@ -9904,11 +10148,11 @@ def main() -> int:
         if q4_split:                                   # #498: no budget to take it out of
             pass
         elif budget is not None and a.resident_budget_gib is None:   # its RAM comes out of the experts' budget
-            budget = resident_budget_gib(model, ram, kv_ram_gb)
+            budget = resident_budget_gib(model, ram, kv_ram_gb, uma=bool((gpu or {}).get("uma")))
             ok(f"RAM budget: {budget} GiB (less the KV cache's RAM)")
-        elif budget is not None and budget > resident_budget_gib(model, ram, kv_ram_gb):
+        elif budget is not None and budget > resident_budget_gib(model, ram, kv_ram_gb, uma=bool((gpu or {}).get("uma"))):
             warn(f"the KV cache's {kv_ram_gb:.1f} GB of RAM come on top of your {budget:g} GiB RAM budget (setup "
-                 f"would take them out of it: {resident_budget_gib(model, ram, kv_ram_gb)} GiB); kept as you chose")
+                 f"would take them out of it: {resident_budget_gib(model, ram, kv_ram_gb, uma=bool((gpu or {}).get('uma')))} GiB); kept as you chose")
     elif ctx >= 65536:   # #620: say why, so a regenerated config that lost --kv-resident is not a surprise
         ok(f"KV streaming off: it needs ~{kv_ram_gb:.1f} GB of RAM beside the ~{MODELS[model]['ram_gb']} GB {model} "
            f"uses, and this PC has {ram:.0f}; the KV cache stays in VRAM (fewer cached experts). --kv-streaming on "
@@ -9984,6 +10228,41 @@ def main() -> int:
                      "--vram-reserve-mib 0, which leaves nothing for other programs).")
         for line in unsloth_small_card_lines(model, vg, plan, fits):
             warn(line)
+    if not multi and family != "unsloth" and not gpu.get("uma") and 0 < gpu.get("vram_gb", 0.0) <= FIT_CARD_GB:
+        # #25: never write a config whose start leaves the expert cache under its minimum.  Context first, then KV
+        vg = gpu["vram_gb"]
+        res_arg = int(args[args.index("--vram-reserve-mib") + 1]) if "--vram-reserve-mib" in args[:-1] else None
+        resident = int(args[args.index("--kv-resident") + 1]) if "--kv-resident" in args[:-1] else None
+        has_mtp = "--mtp" in args[:-1]
+        plan = fit_plan(vg, ctx, kv, has_mtp, res_arg, resident)
+        if plan is None:
+            warn(f"by setup's estimate even a {FIT_CTX_STEPS[-1]} context with a 4-bit KV cache leaves the expert cache "
+                 f"no room on this {vg:.0f} GB card: the start may stop with \"no VRAM is left for the expert cache\". "
+                 "Close other programs that use the GPU, or try --draft-vocab en / a smaller --vram-reserve-mib")
+        elif plan[:2] != (ctx, kv):
+            nctx, nkv, slack = plan
+            changes = []
+            if nctx != ctx:
+                args[args.index("--max-context") + 1] = str(nctx)
+                changes.append(f"context {ctx} -> {nctx}")
+                if nctx <= 262144 and "--rope-scaling" in args[:-1]:   # inside the trained length: no scaling
+                    i = args.index("--rope-scaling")
+                    del args[i:i + 4]
+            if nkv != kv:
+                if "--kv" in args[:-1]:
+                    args[args.index("--kv") + 1] = nkv
+                else:
+                    args += ["--kv", nkv]
+                changes.append(f"KV cache {kv} -> {nkv}")
+            need = -fit_slack_mib(vg, ctx, kv, has_mtp, res_arg, resident) + FIT_MARGIN_MIB
+            warn(f"{ctx} tokens with the {KV_WORDS.get(kv, kv)} KV cache" + (" and the draft layer" if has_mtp else "")
+                 + f" would not start on this {vg:.0f} GB card: setup's estimate leaves the expert cache ~{need:.0f} "
+                 f"MiB short of its minimum plus a {FIT_MARGIN_MIB} MiB margin (the engine would exit before it was ready, "
+                 "#25). Changed: "
+                 + ", ".join(changes) + f" (~{slack:.0f} MiB to spare). A bigger context needs a card with more VRAM.")
+            ctx, kv = nctx, nkv
+        for line in fit_card_note(vg, ctx, kv):   # a recommendation: nothing changes
+            say("  " + line)
     if not multi and 0 < gpu.get("vram_gb", 0.0) < SMALL_CARD_GB:
         # #496: on a 6 GB card the expert cache can get no room at all; the engine lowers its own reserve when that
         # is what it takes, and says what is short when even that is not enough.  Setup only says what helps.
@@ -10012,6 +10291,17 @@ def main() -> int:
         cfg["cuda"] = 12
     if (uenv := unsloth_default_env(family, model, hip, in_budget)):
         cfg["env"] = uenv
+    penv, pargs, pprefill = speedy_profile(a.speedy_profile, family, model, hip, bool(multi), gpu)
+    if penv:
+        cfg.setdefault("env", {}).update(penv)
+    if pargs or pprefill:
+        if pprefill and "--prefill" in args and args[args.index("--prefill") + 1] == "auto":
+            args[args.index("--prefill") + 1] = pprefill
+        for flag, value in zip(pargs[::2], pargs[1::2]):
+            if flag not in args:                       # an option setup already wrote is kept as it is
+                args += [flag, value]
+        ok("Speedy 1-GPU profile (tuned): route prior 1.5, routed prompt stream, two-pass select, GDN tensor cores, "
+           "tool-call repair (--speedy-profile upstream writes upstream Strata's settings instead)")
     if hip:
         cfg["backend"] = "hip"
         # the dense prompt GEMMs through hipBLASLt with kernels measured on this GPU generation (tools/hip; +40-60%
