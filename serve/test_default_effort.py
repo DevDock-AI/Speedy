@@ -16,7 +16,7 @@ from serve.server import Service, resolve_default_effort, speedy_version_info  #
 
 class Resolve(unittest.TestCase):
     def test_order_and_levels(self):
-        self.assertEqual(resolve_default_effort({}, {}), (None, "none"))
+        self.assertEqual(resolve_default_effort({}, {}), ("medium", "default"))   # Speedy 0.5.0
         self.assertEqual(resolve_default_effort({"default_reasoning_effort": "medium"}, {}), ("medium", "config"))
         self.assertEqual(resolve_default_effort({"reasoning_effort": "low"}, {}), ("low", "config"))
         self.assertEqual(resolve_default_effort({"default_reasoning_effort": "high", "reasoning_effort": "low"}, {}),
@@ -25,7 +25,7 @@ class Resolve(unittest.TestCase):
                                                 {"STRATA_DEFAULT_REASONING_EFFORT": "max"}), ("max", "env"))
         self.assertEqual(resolve_default_effort({"default_reasoning_effort": "medium"},
                                                 {"STRATA_DEFAULT_REASONING_EFFORT": "off"}), ("none", "off"))
-        self.assertEqual(resolve_default_effort({}, {"STRATA_DEFAULT_REASONING_EFFORT": " "}), (None, "none"))
+        self.assertEqual(resolve_default_effort({}, {"STRATA_DEFAULT_REASONING_EFFORT": " "}), ("medium", "default"))
         with self.assertRaises(SystemExit):
             resolve_default_effort({}, {"STRATA_DEFAULT_REASONING_EFFORT": "huge"})
         with self.assertRaises(SystemExit):

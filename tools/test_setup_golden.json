@@ -32,6 +32,12 @@
     "700"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": 0,
    "gpus_asked": true,
@@ -84,6 +90,12 @@
     "700"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": 0,
    "gpus_asked": true,
@@ -136,6 +148,12 @@
     "700"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": 0,
    "gpus_asked": true,
@@ -188,6 +206,12 @@
     "700"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": 0,
    "gpus_asked": true,
@@ -220,7 +244,7 @@
     "--expert-cache",
     "auto",
     "--prefill",
-    "auto",
+    "auto:16384",
     "--spec",
     "4",
     "--spec-min-p",
@@ -235,12 +259,28 @@
     "32768",
     "--vision",
     "--vram-reserve-mib",
-    "700"
+    "700",
+    "--adapt-async",
+    "1",
+    "--adapt-swaps",
+    "80",
+    "--pool-affinity",
+    "measure"
    ],
    "cwd": "<T>",
    "env": {
+    "STRATA_GDN_TC": "1",
     "STRATA_HC_Q8": "1",
-    "STRATA_ROUTE_TAIL_SKIP": "0"
+    "STRATA_PREFILL_ROUTED_STREAM": "1",
+    "STRATA_PREFILL_ROUTED_STREAM_PP": "1",
+    "STRATA_PREFILL_STREAM_MIN": "512",
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_ROUTE_PRIOR": "1.5",
+    "STRATA_ROUTE_TAIL_SKIP": "0",
+    "STRATA_SELECT_TWO_PASS": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
    },
    "exe": "<T>/engine/<EXE>",
    "gpu": 0,
@@ -293,6 +333,12 @@
     "700"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": [
     0,
@@ -353,6 +399,12 @@
     "700"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": [
     0,
@@ -413,6 +465,12 @@
     "700"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": [
     0,
@@ -473,6 +531,12 @@
     "700"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": [
     0,
@@ -514,7 +578,7 @@
     "--expert-cache",
     "auto",
     "--prefill",
-    "auto",
+    "auto:16384",
     "--spec",
     "4",
     "--spec-min-p",
@@ -529,11 +593,27 @@
     "8",
     "--vision",
     "--vram-reserve-mib",
-    "700"
+    "700",
+    "--adapt-async",
+    "1",
+    "--adapt-swaps",
+    "80",
+    "--pool-affinity",
+    "measure"
    ],
    "cwd": "<T>",
    "env": {
-    "STRATA_HC_Q8": "1"
+    "STRATA_GDN_TC": "1",
+    "STRATA_HC_Q8": "1",
+    "STRATA_PREFILL_ROUTED_STREAM": "1",
+    "STRATA_PREFILL_ROUTED_STREAM_PP": "1",
+    "STRATA_PREFILL_STREAM_MIN": "512",
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_ROUTE_PRIOR": "1.5",
+    "STRATA_SELECT_TWO_PASS": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
    },
    "exe": "<T>/engine/<EXE>",
    "gpu": 0,
@@ -588,6 +668,12 @@
     "--vision"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": [
     0,
@@ -647,6 +733,12 @@
     "--vision"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": [
     0,
@@ -705,6 +797,12 @@
     "--vision"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": [
     0,
@@ -764,6 +862,12 @@
     "--vision"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": [
     0,
@@ -806,7 +910,7 @@
     "--expert-cache",
     "auto",
     "--prefill",
-    "auto",
+    "auto:16384",
     "--spec",
     "4",
     "--spec-min-p",
@@ -819,11 +923,25 @@
     "int8",
     "--resident-budget-gib",
     "23",
-    "--vision"
+    "--vision",
+    "--adapt-swaps",
+    "80",
+    "--pool-affinity",
+    "measure"
    ],
    "cwd": "<T>",
    "env": {
-    "STRATA_HC_Q8": "1"
+    "STRATA_GDN_TC": "1",
+    "STRATA_HC_Q8": "1",
+    "STRATA_PREFILL_ROUTED_STREAM": "1",
+    "STRATA_PREFILL_ROUTED_STREAM_PP": "1",
+    "STRATA_PREFILL_STREAM_MIN": "512",
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_ROUTE_PRIOR": "1.5",
+    "STRATA_SELECT_TWO_PASS": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
    },
    "exe": "<T>/engine/<EXE>",
    "gpu": 0,
@@ -880,6 +998,12 @@
     "700"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": 0,
    "gpus_asked": true,
@@ -932,6 +1056,12 @@
     "700"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": 0,
    "gpus_asked": true,
@@ -984,6 +1114,12 @@
     "700"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": 0,
    "gpus_asked": true,
@@ -1034,6 +1170,12 @@
     "700"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": 0,
    "gpus_asked": true,
@@ -1066,7 +1208,7 @@
     "--expert-cache",
     "auto",
     "--prefill",
-    "auto",
+    "auto:16384",
     "--spec",
     "4",
     "--spec-min-p",
@@ -1078,14 +1220,30 @@
     "--kv",
     "int8",
     "--resident-budget-gib",
-    "40",
+    "47",
     "--vision",
     "--vram-reserve-mib",
-    "700"
+    "700",
+    "--adapt-async",
+    "1",
+    "--adapt-swaps",
+    "80",
+    "--pool-affinity",
+    "measure"
    ],
    "cwd": "<T>",
    "env": {
-    "STRATA_HC_Q8": "1"
+    "STRATA_GDN_TC": "1",
+    "STRATA_HC_Q8": "1",
+    "STRATA_PREFILL_ROUTED_STREAM": "1",
+    "STRATA_PREFILL_ROUTED_STREAM_PP": "1",
+    "STRATA_PREFILL_STREAM_MIN": "512",
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_ROUTE_PRIOR": "1.5",
+    "STRATA_SELECT_TWO_PASS": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
    },
    "exe": "<T>/engine/<EXE>",
    "gpu": 0,
@@ -1137,6 +1295,12 @@
     "--vision"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": 0,
    "gpus_asked": true,
@@ -1188,6 +1352,12 @@
     "--vision"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": 0,
    "gpus_asked": true,
@@ -1239,6 +1409,12 @@
     "--vision"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": 0,
    "gpus_asked": true,
@@ -1290,6 +1466,12 @@
     "--vision"
    ],
    "cwd": "<T>",
+   "env": {
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
+   },
    "exe": "<T>/engine/<EXE>",
    "gpu": 0,
    "gpus_asked": true,
@@ -1323,7 +1505,7 @@
     "--expert-cache",
     "auto",
     "--prefill",
-    "auto",
+    "auto:16384",
     "--spec",
     "4",
     "--spec-min-p",
@@ -1336,12 +1518,26 @@
     "int8",
     "--kv-resident",
     "32768",
-    "--vision"
+    "--vision",
+    "--adapt-swaps",
+    "80",
+    "--pool-affinity",
+    "measure"
    ],
    "cwd": "<T>",
    "env": {
+    "STRATA_GDN_TC": "1",
     "STRATA_HC_Q8": "1",
-    "STRATA_ROUTE_TAIL_SKIP": "0"
+    "STRATA_PREFILL_ROUTED_STREAM": "1",
+    "STRATA_PREFILL_ROUTED_STREAM_PP": "1",
+    "STRATA_PREFILL_STREAM_MIN": "512",
+    "STRATA_REPEAT_WARN": "1",
+    "STRATA_ROUTE_PRIOR": "1.5",
+    "STRATA_ROUTE_TAIL_SKIP": "0",
+    "STRATA_SELECT_TWO_PASS": "1",
+    "STRATA_TOOLCALL_CONSTRAIN": "1",
+    "STRATA_TOOLCALL_REPAIR": "1",
+    "STRATA_UNDECLARED_TOOL_CALLS": "call"
    },
    "exe": "<T>/engine/<EXE>",
    "gpu": 0,

@@ -277,7 +277,7 @@ class MockedInstall(unittest.TestCase):
         self.assertEqual(code, 0, out[-2000:])
         a = cfg["args"]
         self.assertFalse({"--mmap-experts", "--resident-experts"} & set(a))
-        self.assertEqual(a[a.index("--resident-budget-gib") + 1], "40")
+        self.assertEqual(a[a.index("--resident-budget-gib") + 1], "47")   # RAM less 17 (upstream v0.2.17; was 40)
 
     def test_amd_is_refused_with_a_recommendation(self):
         import test_setup_golden as G

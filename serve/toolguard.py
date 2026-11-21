@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 CONSTRAIN_OPEN = "\n<function="       # forced right after `<tool_call>`, as the template writes a call
 CONSTRAIN_CLOSE = ">\n"               # the name's end: part of the targets, so the model's own ">\n" token can be used
@@ -24,6 +25,16 @@ CONSTRAIN_MAX_STEPS = 48
 DROP_THINKING_STEP = 16
 REPEAT_WINDOW = 3
 REPEAT_NOTE = "You already made this exact call; its result is above. Do something different."
+# Loop breaker (Speedy 0.5.0: on by default, STRATA_LOOP_BREAKER=0 turns it off): the note names the next action, and
+# only a call that is the same call with the same result and no write in between counts (re-running tests after an edit
+# is not a loop).  "Light": no thinking floor by default (STRATA_LOOP_BREAKER_FLOOR=N adds one); the repeated tool name
+# is masked for one reply after the second loop turn in a row (STRATA_LOOP_BREAKER_MASK=0 turns that off).
+LOOP_NOTE = ("This call returned the same result as before; calling it again will not change it. If the task is done, "
+             "write the final answer now. Otherwise take a different step.")
+LOOP_FLOOR = 0
+TOOL_STEP_THINK_CAP = 6144     # Speedy 0.5.0: thinking tokens of a reply that follows a tool result (0 = no cap)
+_WRITE_NAME = re.compile(r"write|edit|patch|replace|create|delete|remove|move|rename|insert|apply", re.I)
+_WRITE_CMD = re.compile(r"(^|[^<>&0-9])>{1,2}(?!&)|\bsed\s+-i|\btee\b|\bmv\b|\bcp\b|\brm\b|\bpatch\b|git\s+(apply|checkout|restore|stash)|\btouch\b|\bmkdir\b")
 
 
 # ------------------------------------------------------------------------------------------------ settings
@@ -220,3 +231,80 @@ def mark_repeats(messages, window: int = REPEAT_WINDOW, note: str = REPEAT_NOTE)
         if i == last_asst and all(messages[k].get("role") == "tool" for k in range(i + 1, len(messages))):
             latest = reps
     return latest
+
+
+# ------------------------------------------------------------------------------------------------ 4: loop breaker (1120)
+_NOTE_TAIL = re.compile(r"\n\n\[Note: [^\]]*\]\s*$")
+
+
+def _result_text(msg) -> str:
+    c = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(c, list):
+        c = "".join(p.get("text", "") for p in c if isinstance(p, dict))
+    return _NOTE_TAIL.sub("", c if isinstance(c, str) else "" if c is None else str(c)).strip()
+
+
+def is_write(sig: tuple[str, str]) -> bool:
+    """A call that may change the workspace: a write/edit-like tool name, or a shell command with a redirect or a
+    file-changing command in its arguments."""
+    name, args = sig
+    if _WRITE_NAME.search(name):
+        return True
+    if re.search(r"shell|bash|exec|run|terminal|command", name, re.I):
+        try:
+            a = json.loads(args)
+        except ValueError:
+            a = args
+        cmd = " ".join(str(v) for v in a.values()) if isinstance(a, dict) else str(a)
+        return bool(_WRITE_CMD.search(cmd))
+    return False
+
+
+def mark_loops(messages, window: int = REPEAT_WINDOW, note: str = LOOP_NOTE) -> list[dict]:
+    """Like mark_repeats, stricter: a call is a loop repeat when one of the `window` calls before it has the same name
+    and arguments AND the same result text, with no write (is_write) between the two.  Such a call's turn gets `note`
+    after its last tool result.  A function of the history alone (cache-stable).  Returns the loop repeats of the latest
+    assistant turn (when only tool results follow it) as {"name", "arguments", "times", "streak"}; streak = how many
+    consecutive assistant turns, up to this one, held a loop repeat of that name."""
+    window = max(1, int(window))
+    history: list[tuple[tuple[str, str], str, int]] = []
+    epoch = 0
+    streak: dict[str, int] = {}
+    latest: list[dict] = []
+    last_asst = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1)
+    for i, m in enumerate(messages):
+        if m.get("role") != "assistant" or not m.get("tool_calls"):
+            continue
+        j = i + 1
+        while j < len(messages) and messages[j].get("role") == "tool":
+            j += 1
+        results = messages[i + 1:j]
+        by_id = {r.get("tool_call_id"): r for r in results if r.get("tool_call_id")}
+        reps, names_now = [], set()
+        for k, call in enumerate(m["tool_calls"]):
+            sig = call_signature(call)
+            if sig is None:
+                continue
+            res_msg = by_id.get(call.get("id")) if isinstance(call, dict) and call.get("id") in by_id else (
+                results[k] if k < len(results) else None)
+            res = _result_text(res_msg) if res_msg is not None else None
+            if res is not None and any(h[0] == sig and h[1] == res and h[2] == epoch for h in history[-window:]):
+                names_now.add(sig[0])
+                reps.append({"name": sig[0], "arguments": sig[1], "times": sum(1 for h in history if h[0] == sig) + 1})
+            history.append((sig, res, epoch))
+            if is_write(sig):
+                epoch += 1
+        streak = {n: streak.get(n, 0) + 1 for n in names_now}
+        for r in reps:
+            r["streak"] = streak[r["name"]]
+        if not reps or not results:
+            continue
+        _append_note(messages[j - 1], note)
+        if i == last_asst and j == len(messages):
+            latest = reps
+    return latest
+
+
+def masked_names(reps, min_streak: int = 2) -> list[str]:
+    """Tier 2: the tool names to keep out of the next reply (a loop repeat seen on `min_streak` consecutive turns)."""
+    return sorted({r["name"] for r in reps or () if r.get("streak", 0) >= min_streak})

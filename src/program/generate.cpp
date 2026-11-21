@@ -2,6 +2,7 @@
 #include "strata/core/memory_pressure.hpp"
 #include "ggml.h"
 #include "strata/core/logit_bias.hpp"
+#include "strata/core/tool_name_constraint.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
 // THE DRIVER, and the first program in this project that answers a question.  Everything below it is a
@@ -38,6 +39,7 @@
 #include "strata/core/ple_residency.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/coupled_draft.hpp"
+#include "strata/core/device_lost_exit.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/sdma_copy.hpp"
 #include "strata/core/foresight_swap.hpp"
@@ -1786,6 +1788,14 @@ bool adapt_overlap() {
     return v;
 }
 
+/// STRATA_ADAPT_FETCH (opt-in; 2 is the default of a compute capability 12.x card with 16 GiB or less, see nv_defaults.hpp): 1 = the PCIe share also admits into the VRAM tier (ExpertDispatch::fetch_admit), beside
+/// the tier's own copies from RAM; 2 = instead of them (the tier's counts still decay).  STRATA_ADAPT_FETCH_MIN and
+/// STRATA_ADAPT_FETCH_MARGIN: the admission's thresholds (default 1 and 0.5).
+int adapt_fetch() {
+    static const int v = [] { const char* e = std::getenv("STRATA_ADAPT_FETCH"); return e ? std::max(0, std::min(2, std::atoi(e))) : 0; }();
+    return v;
+}
+
 /// ExpertDispatch::evict_sync where the tier does not wait for its copies; STRATA_ADAPT_EVICT_SYNC=0 turns it off.
 bool adapt_evict_sync() {
     static const bool v = [] { const char* e = std::getenv("STRATA_ADAPT_EVICT_SYNC"); return e == nullptr || std::atoi(e) != 0; }();
@@ -3019,6 +3029,10 @@ int main(int argc, char** argv) {
 #endif
     // Speedy: the production environment defaults, before anything reads them (STRATA_UPSTREAM_DEFAULTS=1: none)
     speedy::apply_env_defaults(stderr);
+    // #5990 test hook: arm the CUDA-free device-lost exit as if the runtime had answered an error, so the path can be
+    // exercised without a card falling off the bus (STRATA_LOST_EXIT_S sets the grace, default 10 s).  Unset: nothing.
+    if (const char* hook = std::getenv("STRATA_TEST_LOST_GPU"); hook != nullptr && *hook != '0')
+        strata::core::arm_device_lost_exit("test hook (STRATA_TEST_LOST_GPU): an injected device loss");
     // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is touched
     for (int i = 1; i < argc && i < 3; ++i) {
         if (std::strcmp(argv[i], "--version") == 0 || std::strcmp(argv[i], "-V") == 0) {
@@ -3549,7 +3563,20 @@ int main(int argc, char** argv) {
                 same = cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d) == cudaSuccess &&
                        cudaDeviceGetAttribute(&n, cudaDevAttrComputeCapabilityMinor, d) == cudaSuccess && m == m0 && n == n0;
             }
-            if (same) { strata::core::apply_nv_defaults(m0, n0); strata::core::apply_spec_adapt_default(m0, n0); }
+            if (same) {
+                // upstream v0.2.17: STRATA_ADAPT_FETCH=2 for a 12.x card of 16 GiB or less; only a one-card run uses the switch, so the
+                // engine's main card (STRATA_PRIMARY_DEVICE) decides; its memory is read without making a context on it
+                uint64_t main_vram = 0;
+                {
+                    const char* pv = std::getenv("STRATA_PRIMARY_DEVICE");
+                    const int pd = pv != nullptr ? std::atoi(pv) : 0;
+                    cudaDeviceProp mp{};
+                    if (cudaGetDeviceProperties(&mp, pd > 0 && pd < nd ? pd : 0) == cudaSuccess) main_vram = (uint64_t) mp.totalGlobalMem;
+                    else (void) cudaGetLastError();
+                }
+                strata::core::apply_nv_defaults(m0, n0, main_vram);
+                strata::core::apply_spec_adapt_default(m0, n0);
+            }
         }
         (void) cudaGetLastError();
     }
@@ -12531,6 +12558,36 @@ int main(int argc, char** argv) {
                              gs.link_gbps, gs.pcie_frac);
             }
         };
+        // the serial windows of one GPU, where the pool can admit (expert_pool_dispatch_multi's fetch_on)
+        const char* fetch_off = d_res == nullptr ? "no residency table" : o.spec_split ? "--spec-split"
+                              : multi_gpu || !stages.empty() ? "a layer split" : peer.valid() ? "--peer-device"
+                              : remote_opt || drive.d.remote_count > 0 ? "helper GPUs" : o.adapt_async ? "--adapt-async"
+                              : o.pipeline_windows > 0 ? "--pipeline-windows" : o.batch > 0 ? "--batch"
+                              : adapt_overlap() ? "STRATA_ADAPT_OVERLAP=1" : nullptr;
+        if (adapt_fetch() > 0) {   // STRATA_ADAPT_FETCH (opt-in)
+            const char* off = drive.d.usage.empty() ? "the adaptive tier is off" : fetch_off != nullptr ? fetch_off
+                            : o.pcie_mode == "dma" || o.pcie_mode == "direct" ? "--pcie-mode dma / direct"
+                            : drive.d.plan == nullptr ? "no GPU plan"
+                            : drive.d.pcie_num <= 0 ? "no PCIe share"
+                            : src.complement_ready() ? "the resident RAM mode" : nullptr;
+            if (off != nullptr) {
+                if (strata::core::adapt_fetch_is_default())   // the card's default, not the user's setting
+                    std::fprintf(stderr, "strata serve: STRATA_ADAPT_FETCH=2 (the default for this card) is not used in this run (%s)\n", off);
+                else std::fprintf(stderr, "strata serve: STRATA_ADAPT_FETCH is off (%s)\n", off);
+            }
+            else {
+                drive.d.fetch_admit = adapt_fetch();
+                drive.d.res_mut = host_res.data();
+                drive.d.in_flight.assign(host_res.size(), 0);
+                drive.d.fetch_avail.assign((size_t) g.n_layers, 0);
+                if (const char* v = std::getenv("STRATA_ADAPT_FETCH_MIN")) drive.d.fetch_min = (float) std::atof(v);
+                if (const char* v = std::getenv("STRATA_ADAPT_FETCH_MARGIN")) drive.d.fetch_margin = (float) std::atof(v);
+                std::fprintf(stderr, "strata serve: STRATA_ADAPT_FETCH=%d: the PCIe share takes each layer's most-routed "
+                                     "misses and admits those routed >= %.2f and %.2f more than a resident one%s\n",
+                             drive.d.fetch_admit, drive.d.fetch_min, drive.d.fetch_margin,
+                             drive.d.fetch_admit == 2 ? "; the tier's own copies are off" : "");
+            }
+        }
         // #477 --expert-profile-save: what the adaptive tier learned, kept across restarts (opt-in; off: `heat` stays
         // empty and nothing below runs).  It needs the adaptive tier's counts and the residency table.
         std::vector<double> heat;
@@ -12696,8 +12753,9 @@ int main(int argc, char** argv) {
                 const auto& [i, slot] = pending[q];
                 (tp2 && q < pending_card.size() && pending_card[q] == 1 ? host_res1 : host_res)[(size_t) i] = slot;
                 srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);   // in VRAM now: RAM not needed
+                if (!drive.d.in_flight.empty()) drive.d.in_flight[(size_t) i] = 0;
             }
-            if (drive.d.evict_sync) {   // a failed upload leaves them to the pre-launch hook
+            if (drive.d.evict_sync || drive.d.fetch_admit > 0) {   // a failed upload leaves them to the pre-launch hook
                 for (const auto& pr : pending) drive.d.res_dirty_idx.push_back(pr.first);
                 drive.d.res_dirty = true;
             }
@@ -12879,7 +12937,8 @@ int main(int argc, char** argv) {
         // only when the round's copies land - a window or more later, and until then doorbell_publish_res skips the
         // activation of a layer whose routed experts all look resident, while the pool computes an evicted one from the
         // activation published before.  The hook runs at each verifier's launch; the serial windows (one at a time,
-        // the batch windows included, a layer split's stages one after another) take it.
+        // the batch windows included, a layer split's stages one after another) take it.  STRATA_ADAPT_FETCH's
+        // admissions (the pool writes host_res during a window) go up the same way, whether the tier waits or not.
         //   --batch-groups with a layer split launches a group while another is in flight on the other stage, which
         //   waits on this thread: a synchronous upload there could wait on that window, so those verifiers publish
         //   every activation instead (set_always_publish; the device table then decides nothing a stale entry breaks).
@@ -12891,7 +12950,7 @@ int main(int argc, char** argv) {
         // pair's driving verifier, so STRATA_ADAPT_LAG / STRATA_ADAPT_NOWAIT are safe there - both cards plan on the device)
         const bool serial_windows = (!pipe || tp_on) && !piped_groups;
         const bool tier_lags = !drive.d.usage.empty() && (adapt_nowait() || adapt_lag() > 1);
-        drive.d.evict_sync = serial_windows && tier_lags && adapt_evict_sync();
+        drive.d.evict_sync = serial_windows && tier_lags && (adapt_evict_sync() || drive.d.fetch_admit > 0);
         if (piped_groups && tier_lags && adapt_evict_sync()) {
             ver.set_always_publish(true);
             for (auto& st : stages) st->ver.set_always_publish(true);
@@ -12909,7 +12968,8 @@ int main(int argc, char** argv) {
         constexpr size_t kResPatchCap = 16384;
         std::vector<int> res_devs{-1};
         for (auto& st : stages) res_devs.push_back(st->dev);
-        int32_t* res_pairs = drive.d.evict_sync ? res_pairs_alloc(kResPatchCap, res_devs) : nullptr;
+        int32_t* res_pairs = (serial_windows && (drive.d.fetch_admit > 0 || drive.d.evict_sync))
+                                 ? res_pairs_alloc(kResPatchCap, res_devs) : nullptr;
         // --pipeline-windows 2 (fix A): while the pipelined loop has windows in flight the tier's changes reached the
         // cards' tables at the drain alone (--adapt-async), or by a synchronous upload beside the windows (the
         // blocking tier), while route_prior_top10 reads them every layer: a bonus for an evicted expert, none for a
@@ -13036,11 +13096,11 @@ int main(int argc, char** argv) {
                 for (int32_t* p : pw_pairs) if (p != nullptr) cudaFreeHost(p);
             }
         } pre_launch_off{ver, stages, drive.d, res_pairs, tp_on ? &tpv[0] : nullptr, ver_b, pw_res_pairs};
-        if (drive.d.evict_sync || res_checking) {
+        if (serial_windows && (drive.d.fetch_admit > 0 || drive.d.evict_sync || res_checking)) {
             ver.set_pre_launch([&](cudaStream_t, std::string& e) { return res_sync(res_checking, e); });
             for (auto& st : stages) st->ver.set_pre_launch([&](cudaStream_t, std::string& e) { return res_sync(false, e); });
             if (tp_on) tpv[0].set_pre_launch([&](cudaStream_t, std::string& e) { return res_sync(false, e); });   // the TP pair's windows
-            if (drive.d.evict_sync)
+            if (drive.d.evict_sync && adapt_evict_sync())
                 std::fprintf(stderr, "strata serve: the adaptive tier's evictions reach the device's table before the next "
                                      "window (STRATA_ADAPT_EVICT_SYNC=0: when its copies land)\n");
         } else if (pw_res_patch) {   // (exclusive: the serial hooks need serial windows, which --pipeline-windows is not)
@@ -13062,6 +13122,10 @@ int main(int argc, char** argv) {
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;   // vict: e | card << 16
             for (int64_t l = 0; l < g.n_layers; ++l) {
+                // STRATA_ADAPT_FETCH=2: where the PCIe share fetched since the last round, its fetchable experts are
+                // the admission's; the tier keeps the rest (no share there, or not pinned)
+                const bool fetched = drive.d.fetch_admit == 2 && !drive.d.fetch_avail.empty() && drive.d.fetch_avail[(size_t) l];
+                if (!drive.d.fetch_avail.empty()) drive.d.fetch_avail[(size_t) l] = 0;
                 cand.clear();
                 vict.clear();
                 const float* u = drive.d.usage.data() + l * g.n_expert;
@@ -13069,7 +13133,7 @@ int main(int argc, char** argv) {
                 const int32_t* r1 = tp2 ? host_res1.data() + l * g.n_expert : nullptr;   // tp2: card 1's table
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0 && (r1 == nullptr || r1[e] < 0)) {
-                        if (u[e] >= adapt_min_use() && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e);
+                        if (u[e] >= adapt_min_use() && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e) && !(fetched && srcp->pinned(l, e))) cand.emplace_back(u[e], e);
                     } else if (r[e] >= 0) vict.emplace_back(u[e], e);
                     else vict.emplace_back(u[e], e | (1 << 16));
                 }
@@ -13213,6 +13277,7 @@ int main(int argc, char** argv) {
                     srcp->prefetch(s.layer, s.out);
                     pending.emplace_back((int32_t) in, slot);
                     pending_card.push_back(s.card);
+                    if (!drive.d.in_flight.empty()) drive.d.in_flight[in] = 1;   // STRATA_ADAPT_FETCH leaves it alone
                     continue;
                 }
                 AdaptSd::Part* sdp = slot >= 0 && b != nullptr ? sd_part_of(s) : nullptr;
@@ -13254,6 +13319,7 @@ int main(int argc, char** argv) {
                     cudaStreamSynchronize(adapt_stream);   // no callback: wait here, the gate opens at once
                     agate.landed.store((int32_t) g.n_layers, std::memory_order_release);
                 }
+                if (!drive.d.in_flight.empty()) drive.d.in_flight[in] = 1;   // STRATA_ADAPT_FETCH leaves it alone
             }
             if (drive.d.evict_sync && !swaps.empty()) {   // the evicted ones are misses now (see the pre-launch hook)
                 for (const Swap& s : swaps) drive.d.res_dirty_idx.push_back((int32_t) (s.layer * g.n_expert + s.out));
@@ -13941,13 +14007,17 @@ int main(int argc, char** argv) {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
-            std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
+            // Strata #5969: tool_name_constraint=<format>: the record version the request key carries (0: not supported, the server
+            // then does not send the key).  The solo decode loop applies it; --batch (no request logit bias here) does not.
+            const int tnc_format = o.batch > 0 ? 0 : 2;
+            std::printf("INFO logit_bias=1 tool_name_constraint=%d context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
                         "tail_role_token=%lld vram_elastic=%d "
                         "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
+                        tnc_format,
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -14023,7 +14093,20 @@ int main(int argc, char** argv) {
                                      launch_blocking() ? "; CUDA_LAUNCH_BLOCKING=1 is set, and no verify window can "
                                                          "finish with it (#1341)" : "");
                         stall_report(stderr, p.ticks.load() - ticks_at);
-                        strata::core::release_gpu_waits(stderr);   // #267: no spin kernel outlives the process
+                        // #267: no spin kernel outlives the process.  #5990: the release is a driver call, and on a
+                        // device that stopped answering it blocks with the device context held - every other thread's
+                        // CUDA call blocks behind it, and this watchdog would never reach its abort().  Give the
+                        // release a bounded chance and end the process either way.
+                        auto released = std::make_shared<std::atomic<bool>>(false);
+                        std::thread([released] {
+                            strata::core::release_gpu_waits(stderr);
+                            released->store(true, std::memory_order_release);
+                        }).detach();
+                        for (int i = 0; i < 50 && !released->load(std::memory_order_acquire); ++i)
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        if (!released->load(std::memory_order_acquire))
+                            std::fprintf(stderr, "strata serve: the GPU waits were not released within 5 s (the device "
+                                                 "stopped answering): ending the process without the release (#5990)\n");
                         std::fflush(stderr);
                         std::abort();
                     }
@@ -15526,6 +15609,8 @@ int main(int argc, char** argv) {
             int req_penalty_last_n = 0;
             std::string req_bias_text;
             bool req_bias_present = false;
+            std::string req_tnc_text;      // Strata #5969: the tool_name_constraint record (serve/tool_name_constraint.py)
+            bool req_tnc_present = false;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
             // logprobs=K (0..20): after each "T id" an "LP logprob id:logprob ..." line.
             // -1 (absent) = no LP lines, so a server that never asks sees today's output.
@@ -15570,6 +15655,7 @@ int main(int argc, char** argv) {
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
+                    else if (key == "tool_name_constraint") { req_tnc_text = tok.substr(eq + 1); req_tnc_present = true; }
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "prefill") req_prefill_only = std::atoi(tok.c_str() + eq + 1) != 0;
@@ -15627,6 +15713,13 @@ int main(int argc, char** argv) {
             if (req_bias_present && (o.batch > 0 ||
                 !strata::core::parse_logit_bias(req_bias_text, (int) n_vocab, req_bias, bias_error))) {
                 std::printf("ERR logit_bias: %s\n", o.batch > 0 ? "continuous batching is not supported" : bias_error.c_str());
+                continue;
+            }
+            strata::core::ToolNameConstraint req_tnc;   // Strata #5969: invalid (off) unless the request sent the key
+            std::string tnc_error;
+            if (req_tnc_present && (o.batch > 0 ||
+                !strata::core::parse_tool_name_constraint(req_tnc_text, (int) n_vocab, req_tnc, tnc_error))) {
+                std::printf("ERR tool_name_constraint: %s\n", o.batch > 0 ? "continuous batching is not supported" : tnc_error.c_str());
                 continue;
             }
             std::string emb_path;
@@ -17988,6 +18081,7 @@ int main(int argc, char** argv) {
             // #4590: where the penalty window may start in `consumed` (see pen_prompt above): the end of the prompt without its
             // last token, which joins the window as the fed-back head `x`.
             const size_t pen_gen0 = strata::kernels::penalty_window_from(consumed.size(), pen_prompt);
+            const size_t tnc_gen0 = consumed.size();   // Strata #5969: the constraint scans the reply only (the prompt's state is `initial`)
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
@@ -18039,7 +18133,8 @@ int main(int argc, char** argv) {
             const char* pl_serial = !pl_want ? nullptr
                                   : hist_n > 0 && pl_pen_env && !pl_pen_shape ? "repeat/frequency penalties"
                                   : hist_n > 0 && !pl_pen ? "repetition penalties (penalty_last_n)"
-                                  : mtp.coupled() ? "coupled draft sampling" : nullptr;
+                                  : mtp.coupled() ? "coupled draft sampling"
+                                  : req_tnc.valid() ? "a tool-name constraint" : nullptr;
             if (dec_timing && pipe && pl_pw >= 2)
                 std::fprintf(stderr, "strata pipeline request: hist_n %lld, coupled draft sampling %d, snapshots %d, pl_pen %d -> %s\n",
                              (long long) hist_n, mtp.coupled() ? 1 : 0, pl_snap_ok ? 1 : 0, pl_pen ? 1 : 0,
@@ -18773,8 +18868,26 @@ int main(int argc, char** argv) {
                 return 1;
             }
             if (tp_on) tr("tp state moved", n);
+            std::vector<float> tnc_mask;   // Strata #5969: the window's bias: the name-trie mask, or the request's static bias (or empty)
+            std::vector<float> tnc_rows;   // a per-row T x n_vocab bias when a name is being written inside the window
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 int T = 1;
+                // Strata #5969 tool-name constrained decoding (opt-in, the tool_name_constraint request key): row 0's mask comes
+                // from update() (the committed reply + the head x); rows 1.. from window_masks() walking a COPY of the state over
+                // the drafts, so a drafted name no tool declares is not its row's pick and the acceptance loop stops there.
+                const bool tnc_on = req_tnc.valid();
+                bool tnc_active = false;
+                if (tnc_on) {
+                    tnc_mask = req_tnc.update(consumed.data() + tnc_gen0, (int64_t) (consumed.size() - tnc_gen0), x, (int) n_vocab);
+                    tnc_active = !tnc_mask.empty();
+                    if (tnc_active) {   // with the request's own static logit_bias: -inf bans, else the static value
+                        for (size_t v = 0; v < tnc_mask.size(); ++v)
+                            tnc_mask[v] = std::isinf(tnc_mask[v]) ? -std::numeric_limits<float>::infinity()
+                                                                  : (req_bias.empty() ? 0.0f : req_bias[v]);
+                    } else {
+                        tnc_mask = req_bias;   // inactive: the request's static bias (or none)
+                    }
+                }
                 policy.set_context(p);
                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
                 bool from_sfx = false;
@@ -18845,6 +18958,35 @@ int main(int argc, char** argv) {
                                          : from_sfx ? sbuf[(size_t) i - 1]
                                                     : drafts[(size_t) i - 1];
                 for (int i = 0; i < chain_n; ++i) window[(size_t) (T_mtp + i)] = cbuf[(size_t) i];
+                if (tnc_on) {   // Strata #5969: the window's logit bias, per row when a name is being written inside it
+                    if (!merged && T > 1) {
+                        auto masks = req_tnc.window_masks(window.data(), T, (int) n_vocab, tnc_mask);
+                        bool any_row = false;
+                        for (int t = 1; t < T; ++t) if (!masks[(size_t) t].empty()) { any_row = true; break; }
+                        // broadcast only when the head is not inside a name (tnc_mask is then position-independent); inside one,
+                        // a name completed at row 1 must not force the later (parameter) rows to the terminator
+                        if (!tnc_active && !any_row) {
+                            if (!dv.set_logit_bias(tnc_mask, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                        } else {
+                            tnc_rows.resize((size_t) T * (size_t) n_vocab);
+                            for (int t = 0; t < T; ++t) {
+                                const std::vector<float>& m = masks[(size_t) t];
+                                float* dst = tnc_rows.data() + (size_t) t * (size_t) n_vocab;
+                                if (m.empty()) {
+                                    if (req_bias.empty()) std::fill(dst, dst + n_vocab, 0.0f);
+                                    else std::copy(req_bias.begin(), req_bias.end(), dst);
+                                } else {
+                                    for (int64_t v = 0; v < (int64_t) n_vocab; ++v)
+                                        dst[v] = std::isinf(m[(size_t) v]) ? -std::numeric_limits<float>::infinity()
+                                                                           : (req_bias.empty() ? 0.0f : req_bias[(size_t) v]);
+                                }
+                            }
+                            if (!dv.set_logit_bias_rows(tnc_rows.data(), T, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                        }
+                    } else if (!dv.set_logit_bias(tnc_mask, err)) {
+                        std::printf("ERR %s\n", err.c_str()); return 1;
+                    }
+                }
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
@@ -20346,9 +20488,37 @@ int main(int argc, char** argv) {
         const uint64_t fbytes0 = src.file_blob_bytes(), fall0 = src.file_read_bytes();
         const double fms0 = src.file_ms();
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        const char* fetch_off = d_res == nullptr ? "no residency table" : o.spec_split ? "--spec-split"
+                              : multi_gpu ? "a layer split" : drive.d.peer != nullptr ? "a peer tier"
+                              : drive.d.remote_count > 0 ? "helper GPUs" : nullptr;
+        if (adapt_fetch() > 0) {   // STRATA_ADAPT_FETCH (opt-in)
+            const char* off = drive.d.usage.empty() ? "the adaptive tier is off" : fetch_off != nullptr ? fetch_off
+                            : o.pcie_mode == "dma" || o.pcie_mode == "direct" ? "--pcie-mode dma / direct"
+                            : drive.d.plan == nullptr ? "no GPU plan"
+                            : drive.d.pcie_num <= 0 ? "no PCIe share"
+                            : src.complement_ready() ? "the resident RAM mode" : nullptr;
+            if (off != nullptr) {
+                if (strata::core::adapt_fetch_is_default())   // the card's default, not the user's setting
+                    std::fprintf(stderr, "strata generate: STRATA_ADAPT_FETCH=2 (the default for this card) is not used in this run (%s)\n", off);
+                else std::fprintf(stderr, "strata generate: STRATA_ADAPT_FETCH is off (%s)\n", off);
+            }
+            else {
+                drive.d.fetch_admit = adapt_fetch();
+                drive.d.res_mut = host_res.data();
+                drive.d.in_flight.assign(host_res.size(), 0);
+                drive.d.fetch_avail.assign((size_t) g.n_layers, 0);
+                if (const char* v = std::getenv("STRATA_ADAPT_FETCH_MIN")) drive.d.fetch_min = (float) std::atof(v);
+                if (const char* v = std::getenv("STRATA_ADAPT_FETCH_MARGIN")) drive.d.fetch_margin = (float) std::atof(v);
+                drive.d.fetch_log_on = std::getenv("STRATA_ADAPT_FETCH_VERIFY") != nullptr;
+                std::fprintf(stderr, "strata generate: STRATA_ADAPT_FETCH=%d: the PCIe share takes each layer's most-routed "
+                                     "misses and admits those routed >= %.2f and %.2f more than a resident one%s\n",
+                             drive.d.fetch_admit, drive.d.fetch_min, drive.d.fetch_margin,
+                             drive.d.fetch_admit == 2 ? "; the tier's own copies are off" : "");
+            }
+        }
         // before every window: the device's table follows the host's (the tier's evictions while its copies are in
-        // flight - see the serve path); the hook's captures live in this block, so it is taken off the verifier when the
-        // block ends
+        // flight, STRATA_ADAPT_FETCH's admissions - see the serve path); the hook's captures live in this block, so it
+        // is taken off the verifier when the block ends
         const bool res_checking = std::getenv("STRATA_ADAPT_CHECKRES") != nullptr && d_res != nullptr;
         std::vector<int32_t> res_back;
         int64_t res_windows = 0, res_bad = 0, res_bad_windows = 0;
@@ -20357,10 +20527,10 @@ int main(int argc, char** argv) {
             drive.d.dres_check = res_back.data();
         }
         drive.d.evict_sync = d_res != nullptr && !drive.d.usage.empty() && (adapt_nowait() || adapt_lag() > 1) &&
-                             adapt_evict_sync();
+                             (adapt_evict_sync() || drive.d.fetch_admit > 0);
         // the changed entries by a kernel on the verifier's stream (see the serve path)
         constexpr size_t kResPatchCap = 16384;
-        int32_t* res_pairs = drive.d.evict_sync ? res_pairs_alloc(kResPatchCap, {-1}) : nullptr;
+        int32_t* res_pairs = (drive.d.fetch_admit > 0 || drive.d.evict_sync) ? res_pairs_alloc(kResPatchCap, {-1}) : nullptr;
         struct PreLaunchOff {
             strata::core::Verifier& v;
             strata::core::ExpertDispatch& d;
@@ -20371,7 +20541,7 @@ int main(int argc, char** argv) {
                 if (pairs != nullptr) cudaFreeHost(pairs);
             }
         } pre_launch_off{ver, drive.d, res_pairs};
-        if (drive.d.evict_sync || res_checking)
+        if (drive.d.fetch_admit > 0 || drive.d.evict_sync || res_checking)
             ver.set_pre_launch([&](cudaStream_t cs, std::string& e) -> bool {
                 if (drive.d.res_dirty) {
                     const int64_t n = res_patch_pairs(drive.d.res_dirty_idx, host_res, res_pairs, kResPatchCap);
@@ -20429,8 +20599,9 @@ int main(int argc, char** argv) {
             for (const auto& [i, slot] : pending) {
                 host_res[(size_t) i] = slot;
                 srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);   // in VRAM now: RAM not needed
+                if (!drive.d.in_flight.empty()) drive.d.in_flight[(size_t) i] = 0;
             }
-            if (drive.d.evict_sync) {   // a failed upload leaves them to the pre-launch hook
+            if (drive.d.evict_sync || drive.d.fetch_admit > 0) {   // a failed upload leaves them to the pre-launch hook
                 for (const auto& pr : pending) drive.d.res_dirty_idx.push_back(pr.first);
                 drive.d.res_dirty = true;
             }
@@ -20462,12 +20633,16 @@ int main(int argc, char** argv) {
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
             for (int64_t l = 0; l < g.n_layers; ++l) {
+                // STRATA_ADAPT_FETCH=2: where the PCIe share fetched since the last round, its fetchable experts are
+                // the admission's; the tier keeps the rest (no share there, or not pinned)
+                const bool fetched = drive.d.fetch_admit == 2 && !drive.d.fetch_avail.empty() && drive.d.fetch_avail[(size_t) l];
+                if (!drive.d.fetch_avail.empty()) drive.d.fetch_avail[(size_t) l] = 0;
                 cand.clear();
                 vict.clear();
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= adapt_min_use() && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
+                    if (r[e] < 0) { if (u[e] >= adapt_min_use() && !helper_holds(l, e) && !(fetched && srcp->pinned(l, e))) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -20523,6 +20698,7 @@ int main(int argc, char** argv) {
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
+                if (!drive.d.in_flight.empty()) drive.d.in_flight[in] = 1;   // STRATA_ADAPT_FETCH leaves it alone
             }
             if (drive.d.evict_sync && !swaps.empty()) {   // the evicted ones are misses now (see the pre-launch hook)
                 for (const Swap& s : swaps) drive.d.res_dirty_idx.push_back((int32_t) (s.layer * g.n_expert + s.out));
@@ -20805,6 +20981,27 @@ int main(int argc, char** argv) {
             // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
             if (adapt_nowait()) apply_pending(false);
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
+            if (!drive.d.fetch_log.empty()) {   // STRATA_ADAPT_FETCH_VERIFY: each admitted slot read back
+                static int64_t checked = 0, bad = 0;
+                cudaDeviceSynchronize();
+                for (const auto& [i, slot] : drive.d.fetch_log) {
+                    std::string verr;
+                    const int64_t l = i / g.n_expert;
+                    const bool same = host_res[(size_t) i] != slot ||   // evicted again since: nothing to check
+                        xcache.verify_slot(slot, srcp->blob_stable(l, i % g.n_expert), verr,
+                                           (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(l));
+                    ++checked;
+                    if (!same) {
+                        ++bad;
+                        std::fprintf(stderr, "strata: FETCH VERIFY layer %lld expert %lld slot %d: %s\n", (long long) l,
+                                     (long long) (i % g.n_expert), (int) slot, verr.c_str());
+                    }
+                }
+                drive.d.fetch_log.clear();
+                if ((checked & 1023) < 64)
+                    std::fprintf(stderr, "strata: fetch verify: %lld admitted slots read back, %lld differ\n",
+                                 (long long) checked, (long long) bad);
+            }
             if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
             else if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
             const auto decode_pool_fn = use_mtp && mtp.prob() ? &drive_pool_multi_invariant : &drive_pool_multi;
@@ -20989,6 +21186,9 @@ int main(int argc, char** argv) {
         if (rounds > 0 && !drive.d.usage.empty())
             std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
                         (long long) swaps_total, o.adapt_every, ms_adapt / rounds);
+        if (rounds > 0 && drive.d.fetch_admit > 0)
+            std::printf("%-24s %lld experts admitted from the PCIe share (%.2f a round)\n", "fetch admission",
+                        (long long) drive.d.fetch_admitted, (double) drive.d.fetch_admitted / (double) rounds);
         if (res_checking)
             std::printf("%-24s %lld windows, %lld with mismatches (%lld entries), %lld layer-windows with CPU experts and "
                         "no activation published\n", "residency check", (long long) res_windows,

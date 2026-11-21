@@ -5,6 +5,7 @@
 #include "strata/core/defaults_026.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/device_lost_exit.hpp"
 #include "strata/core/window_evict.hpp"
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/pin_budget.hpp"
@@ -713,6 +714,13 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
             break;
         }
     }
+    if (release_err_ != cudaSuccess) {
+        // #5990: the device answered an error instead of finishing.  From here on a teardown call (a free of mapped
+        // memory, a stream sync) can block indefinitely with the device context held, taking every other thread's
+        // CUDA call with it, so nothing on this path is guaranteed to run.  Arm the CUDA-free exit; the window's own
+        // error text still reaches the caller and the request, this only guarantees that the process ends.
+        arm_device_lost_exit(std::string("the GPU stopped answering: ") + cudaGetErrorString(release_err_));
+    }
     if (release_err_ == cudaSuccess)
         trace_ev("RELEASE-DRAINED", -1, -1, (int64_t) ms_since(t0));   // aux: ms the GPU took to finish once released
     return true;
@@ -888,14 +896,50 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
         // the draw reads the bias on cs_ (a non-blocking stream): a legacy-stream cudaMemcpy is not ordered with it,
         // so a window still in flight could read a half-written bias.  Upload on cs_ and wait, which also keeps the
         // caller's pageable buffer valid until the copy is done (bias changes only between requests).
+        if (logit_bias_device_ && logit_bias_cap_ < bytes) { cudaFree(logit_bias_device_); logit_bias_device_ = nullptr; logit_bias_cap_ = 0; }
         if ((!logit_bias_device_ && cudaMalloc((void**) &logit_bias_device_, bytes) != cudaSuccess) ||
             cudaMemcpyAsync(logit_bias_device_, bias.data(), bytes, cudaMemcpyHostToDevice, cs_) != cudaSuccess ||
             cudaStreamSynchronize(cs_) != cudaSuccess) {
             err = "cannot upload logit_bias"; return false;
         }
+        logit_bias_cap_ = std::max(logit_bias_cap_, bytes);
     }
     logit_bias_host_ = bias;
+    bias_rows_ = false;
     sampling_.logit_bias = bias.empty() ? nullptr : logit_bias_device_;
+    sampling_.logit_bias_stride = 0;   // a broadcast bias: one row for every token in the window
+    return true;
+}
+
+bool Verifier::set_logit_bias_rows(const float* host, int rows, std::string& err) {   // Strata #5969
+    if (next_ && !next_->set_logit_bias_rows(host, rows, err)) return false;
+    if (le_ < g_->n_layers) return true;
+    const OnDevice on_device(device_);
+    if (rows < 0 || (rows > 0 && host == nullptr)) { err = "set_logit_bias_rows: invalid rows/pointer"; return false; }
+    if (rows == 0) {
+        bias_rows_ = false;
+        logit_bias_host_.clear();
+        sampling_.logit_bias = nullptr;
+        sampling_.logit_bias_stride = 0;
+        return true;
+    }
+    const size_t bytes = (size_t) rows * (size_t) n_vocab_ * sizeof(float);
+    if (logit_bias_device_ == nullptr || logit_bias_cap_ < bytes) {
+        if (logit_bias_device_) cudaFree(logit_bias_device_);
+        logit_bias_device_ = nullptr;
+        logit_bias_cap_ = 0;
+        if (cudaMalloc((void**) &logit_bias_device_, bytes) != cudaSuccess) { err = "cannot allocate per-row logit_bias"; return false; }
+        logit_bias_cap_ = bytes;
+    }
+    // ordered on cs_ (the stream the draw reads it on) and waited, as set_logit_bias does: no window reads a half-written row
+    if (cudaMemcpyAsync(logit_bias_device_, host, bytes, cudaMemcpyHostToDevice, cs_) != cudaSuccess ||
+        cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = "cannot upload per-row logit_bias"; return false;
+    }
+    logit_bias_host_.clear();   // the device now holds per-row data: the next broadcast re-uploads
+    bias_rows_ = true;
+    sampling_.logit_bias = logit_bias_device_;
+    sampling_.logit_bias_stride = (int) n_vocab_;
     return true;
 }
 
@@ -1111,11 +1155,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         bal_->on = true;
     }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
+    // | pad | dst2(kStagingBlobs u64)
     {
         const int64_t cap = (int64_t) (T * K);
         const int64_t i32 = 4 + (cap + 1) + cap + cap;
         const int64_t ptr_off = (i32 + 1) & ~1ll;
-        plan_i32_ = ptr_off + 4 * cap + (cap + 1) + 1;
+        dst2_off_ = (ptr_off + 4 * cap + (cap + 1) + 1 + 1) & ~1ll;
+        plan_i32_ = dst2_off_ + 2 * kStagingBlobs;
         if (!mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_plan_, (void**) &m_plan_)) {
             err = "verify: mapped plan allocation failed " + strata::core::pin_exhausted_hint();
             return false;
@@ -1127,6 +1173,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sink_.ptr = (unsigned long long*) (h_plan_ + ptr_off);
         sink_.ptr2 = sink_.ptr + cap;
         sink_.start2 = h_plan_ + ptr_off + 4 * cap;
+        sink_.dst2 = (unsigned long long*) (h_plan_ + dst2_off_);
         sink_.cap = cap;
         sink_.publish = &Verifier::publish_plan;
         sink_.fetch = &Verifier::fetch_dma;
@@ -2734,8 +2781,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
-                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+                const unsigned long long* p_dst2 = (const unsigned long long*) (pl + dst2_off_);   // STRATA_ADAPT_FETCH
+                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs, p_dst2);
+                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs, p_dst2);
             }
             }
             stamp(l, 21, grp);
@@ -4503,6 +4551,7 @@ void Verifier::set_plan_slot(int grp) {
     sink_.ptr = (unsigned long long*) (base + ptr_off);
     sink_.ptr2 = sink_.ptr + cap;
     sink_.start2 = base + ptr_off + 4 * cap;
+    sink_.dst2 = (unsigned long long*) (base + dst2_off_);
     const int G = last_batch_ ? 1 : (groups_[last_t_] > 0 ? groups_[last_t_] : 1);
     const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
     sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);

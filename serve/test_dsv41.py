@@ -736,8 +736,10 @@ class SmallCap(ApiBase):
     def test_other_families_keep_the_old_behaviour(self):
         self.start_forever()
         self.svc.set_family(None)
-        status, r = self.chat(max_tokens=300)
-        self.assertEqual(len(self.engine.prompts), 1)                       # no wrap-up: Qwen's serving is as it was
+        self.svc.answer_room = False                                        # Speedy 0.5.0: other families now get the
+        status, r = self.chat(max_tokens=300)                               # answer-room reserve too; off = as it was
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.svc.answer_room = True
 
 
 class PickTemplateTests(unittest.TestCase):

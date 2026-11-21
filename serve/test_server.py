@@ -1192,6 +1192,16 @@ class ToolCallRecovery(unittest.TestCase):
             self.check(f"<function={name}>\n{self.PARAMS}\n</tool_call>", [("write", self.CALL)], "")   # stray closer
             self.check(f"<function={name}>\n{self.PARAMS}\nDone.", [("write", self.CALL)], "Done.")
 
+    def test_indented_bare_function_streams_as_it_parses_whole(self):
+        # an opener indented by a space or two is a call when parsed whole; streamed it leaked into the content
+        for indent in (" ", "  ", "\t"):
+            with self.subTest(indent=indent):
+                self.check(f"Ok.\n{indent}<function=write>\n{self.PARAMS}", [("write", self.CALL)], "Ok.")
+                self.check(f"<function=write>\n{self.PARAMS}\n{indent}<function=write>\n{self.PARAMS}",
+                           [("write", self.CALL), ("write", self.CALL)], "")
+        block = f"Example:\n\n    <function=write>\n{self.PARAMS}"      # an indented code block is a quote (#4703)
+        self.check(block, [], block)
+
     def test_two_calls_in_one_wrapper(self):
         # corpus 0912870b / 51b155c9: a batch inside one <tool_call> - the second call's parameters were merged into
         # the first (wrong arguments, one call); also with the second opened as <parameter=NAME> (03a8a851)
@@ -3847,12 +3857,23 @@ class UsageAndStatus(unittest.TestCase):
         self.assertAlmostEqual(last["timings"]["predicted_per_second"], 50.0, delta=0.1)   # 20 ms a token
 
     def test_anthropic(self):
-        u = self.chat("/v1/messages")["usage"]
+        b = self.chat("/v1/messages")
+        u, t = b["usage"], b["timings"]
         self.assertEqual(u["cache_read_input_tokens"], ClockedEngine.REUSED)
         self.assertEqual(u["input_tokens"], 1)                     # what was read now is kept: written to the cache
         self.assertEqual(u["input_tokens"] + u["cache_creation_input_tokens"] + u["cache_read_input_tokens"],
                          len(self.engine.last_prompt))
         self.assertGreater(u["output_tokens"], 0)
+        # the message carries the same top-level timings as the other two dialects' replies
+        self.assertEqual(t["cache_n"], ClockedEngine.REUSED)
+        self.assertEqual(t["predicted_n"], u["output_tokens"])
+        self.assertAlmostEqual(t["predicted_per_second"], 50.0, delta=0.1)            # 20 ms a token
+
+    def test_anthropic_stream(self):
+        # its final message_delta carries them too, as Chat Completions' last chunk does
+        delta = [e for e in self.chat("/v1/messages", stream=True) if e.get("type") == "message_delta"][-1]
+        self.assertEqual(delta["timings"]["predicted_n"], delta["usage"]["output_tokens"])
+        self.assertAlmostEqual(delta["timings"]["predicted_per_second"], 50.0, delta=0.1)
 
     def test_v1_status(self):
         self.chat("/v1/chat/completions")
@@ -4313,7 +4334,7 @@ class ThinkingBudget(unittest.TestCase):
 
     def test_the_answer_room_has_its_limits(self):
         self.engine.THOUGHT = "Let me think step by step about two plus two. " * 40
-        code, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 300,        # below the floor: as before
+        code, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 100,        # below the floor (ANSWER_ROOM_SMALL_MIN): as before
                                                      "messages": [{"role": "user", "content": "2+2?"}]})
         self.assertEqual(b["choices"][0]["finish_reason"], "length")
         self.assertFalse(b["choices"][0]["message"]["content"])
@@ -4710,6 +4731,15 @@ class ForcedToolChoice(unittest.TestCase):
                     opening = "<tool_call>\n" + ("<function=search>\n" if choice == self.NAMED else "")
                     # where the thinking ended, after the blank line the template puts before a call
                     self.assertEqual(second, first + self.tok.encode(CallingEngine.THOUGHT + "</think>\n\n" + opening))
+
+    def test_nudges_keep_the_forced_call(self):
+        # 0.5.0 review: a staged nudge cleared the forced opening, so the reply came back as text
+        self.svc.reasoning_nudge = [0.2, 0.5]
+        for choice in ("required", self.NAMED):
+            with self.subTest(choice=choice):
+                code, b = self.openai(tool_choice=choice, reasoning_budget_tokens=20, max_tokens=4000)
+                finish, calls, _ = self.call_of(code, b, False)
+                self.assertEqual((finish, [c[0] for c in calls]), ("tool_calls", ["search"]), b)
 
     def test_a_thinking_that_ends_right_after_a_quote_opens_the_call(self):
         # #537: that </think> waits for the character after it; the end of the turn makes it the end of the thinking

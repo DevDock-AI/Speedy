@@ -275,7 +275,7 @@ class Served(unittest.TestCase):
         self.assertIn("thinking number 0 ", self.tok.decode(self.engine.last_prompt))
 
     def test_repeat_warning(self):
-        self.start(MockEngine(CallTokenizer(), THINK + "done"), STRATA_REPEAT_WARN="1")
+        self.start(MockEngine(CallTokenizer(), THINK + "done"), STRATA_REPEAT_WARN="1", STRATA_LOOP_BREAKER="0")
         self.post(self.history(2, repeat=True))
         self.assertIn(g.REPEAT_NOTE, self.tok.decode(self.engine.last_prompt))
         self.assertIn("[strata] repeated tool call: bash", self.log)

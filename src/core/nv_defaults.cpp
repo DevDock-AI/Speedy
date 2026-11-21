@@ -16,11 +16,20 @@ bool off(const char* name) {
 }
 }  // namespace
 
+bool adapt_fetch_default_card(int major, int minor, uint64_t vram_bytes) {
+    (void) minor;
+    return strata::cc_major_of(major) == 12 && vram_bytes > 0 && vram_bytes <= kAdaptFetchMaxVramBytes;
+}
+
 std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int minor) {
     return nv_default_env(major, minor, strata::qwen_defaults_026());
 }
 
 std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int minor, bool defaults026) {
+    return nv_default_env(major, minor, defaults026, 0);
+}
+
+std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int minor, bool defaults026, uint64_t main_vram_bytes) {
     std::vector<std::pair<std::string, std::string>> t;
     const int mj = strata::cc_major_of(major), mn = strata::cc_minor_of(minor);
     if (mj == 8 && mn == 6) {
@@ -56,8 +65,11 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
         // the same path is the measured default on GB10 (row below).  STRATA_NVFP4_PROMPT=0 (or STRATA_DEFAULTS=026)
         // leaves the W4A8 default; it only touches NVFP4 experts, and a build without a 120a image falls back to W4A8
         // at run time (fp4_activations).  No other architecture reads STRATA_NVFP4_PROMPT.
-        if (off("STRATA_NVFP4_PROMPT") || defaults026) return t;
-        t = {{"STRATA_PREFILL_NVFP4", "w4a4"}};
+        if (off("STRATA_SM120_PERF") || defaults026) return t;
+        if (!off("STRATA_NVFP4_PROMPT")) t = {{"STRATA_PREFILL_NVFP4", "w4a4"}};
+        // upstream v0.2.17 (ca99e886f): a card of 16 GiB or less also gets STRATA_ADAPT_FETCH=2 - the PCIe share fills the expert cache
+        // (not bit-exact: which experts the GPU rounds follows the fetches).  STRATA_ADAPT_FETCH=0 is the way back.
+        if (adapt_fetch_default_card(major, minor, main_vram_bytes)) t.push_back({"STRATA_ADAPT_FETCH", "2"});
     } else if (mj == 12 && mn == 1) {
         // GB10 (NVIDIA DGX Spark, 48 SMs, unified memory): only what was measured on that part goes in.  New in 0.2.7.1, so
         // STRATA_DEFAULTS=026 (the master switch of everything since 0.2.6) leaves the table out, like STRATA_SM121_PERF=0.
@@ -83,14 +95,17 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             // It only changes which drafts are attempted, and every draft is verified, so the answers cannot drift.
             {"STRATA_SPEC_COST", "1"},
         };
+        // a 12.1 part reports its unified memory, far above 16 GiB, so this stays off there; the rule is the same as for 12.0
+        if (adapt_fetch_default_card(major, minor, main_vram_bytes)) t.push_back({"STRATA_ADAPT_FETCH", "2"});
     }
     return t;
 }
 
-std::vector<std::string> apply_nv_defaults(int major, int minor) {
+std::vector<std::string> apply_nv_defaults(int major, int minor, uint64_t main_vram_bytes) {
     const int mj = strata::cc_major_of(major), mn = strata::cc_minor_of(minor);
     std::vector<std::string> set;
-    for (const auto& kv : nv_default_env(major, minor)) {
+    bool fetch_set = false;
+    for (const auto& kv : nv_default_env(major, minor, strata::qwen_defaults_026(), main_vram_bytes)) {
         if (std::getenv(kv.first.c_str()) != nullptr) continue;   // the user's setting wins, whatever it is
 #if defined(_WIN32)
         _putenv_s(kv.first.c_str(), kv.second.c_str());
@@ -98,7 +113,9 @@ std::vector<std::string> apply_nv_defaults(int major, int minor) {
         setenv(kv.first.c_str(), kv.second.c_str(), 0);
 #endif
         set.push_back(kv.first);
+        if (kv.first == "STRATA_ADAPT_FETCH") fetch_set = true;
     }
+    adapt_fetch_default_flag() = fetch_set;
     if (!set.empty()) {
         const bool sm86 = mj == 8;
         const bool sm121 = mj == 12 && mn == 1;
@@ -108,8 +125,9 @@ std::vector<std::string> apply_nv_defaults(int major, int minor) {
         std::fprintf(stderr, "strata: %s: %zu %sspeed switches on by default (%s=0 turns them off%s; a switch you set is kept): ",
                      sm86 ? "sm_86 (Ampere)" : sm121 ? "sm_121 (GB10)" : sm120 ? "sm_120 (RTX 50, experimental)" : "sm_60 (Pascal)",
                      set.size(), (sm121 || sm120) ? "" : "exact ",
-                     sm86 ? "STRATA_SM86_PERF" : sm121 ? "STRATA_SM121_PERF" : sm120 ? "STRATA_NVFP4_PROMPT" : "STRATA_SM60_PERF",
+                     sm86 ? "STRATA_SM86_PERF" : sm121 ? "STRATA_SM121_PERF" : sm120 ? "STRATA_SM120_PERF" : "STRATA_SM60_PERF",
                      (sm121 || sm120) ? ", as does STRATA_DEFAULTS=026" : "");
+        if (fetch_set) std::fprintf(stderr, "[ADAPT_FETCH=2: this card has 16 GiB or less; not bit-exact; STRATA_ADAPT_FETCH=0 turns it off] ");
         for (size_t i = 0; i < set.size(); ++i) std::fprintf(stderr, "%s%s", i ? " " : "", set[i].c_str() + 7);
         std::fprintf(stderr, "\n");
     }

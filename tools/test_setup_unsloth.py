@@ -54,13 +54,33 @@ class Pins(unittest.TestCase):
 
 
 class Budget(unittest.TestCase):
-    def test_ram_less_24(self):
-        self.assertEqual(setup.resident_budget_gib(M, 63.7), 40)       # this PC (64 GB): the measured setting
-        self.assertEqual(setup.resident_budget_gib(M, 47.8), 24)
+    def test_ram_less_17(self):
+        """upstream Strata v0.2.17 (8780e9fdc, c8d70bbcd): RAM less 17 on a discrete card (was 24), the reading rounded up to the PC's size.
+        Speedy 0.5.0: only from 64 GB (nominal) up; below it the old rule (the reading less 24) stays."""
+        self.assertEqual(setup.resident_budget_gib(M, 63.7), 47)       # 64 GB: 47 (was 40)
+        self.assertEqual(setup.resident_budget_gib(M, 63.1), 47)       # a 64 GB Windows PC reads 63.1: the same as Linux
+        self.assertEqual(setup.resident_budget_gib(M, 60), 36)         # really 60 GB: not counted as 64, so the old rule
+        self.assertEqual(setup.resident_budget_gib(M, 47.8), 24)       # 48 GB: old rule (below 64)
+        self.assertEqual(setup.resident_budget_gib(M, 31.9), 8)        # 32 GB: old rule, the floor 8
         self.assertEqual(setup.resident_budget_gib(M, 96), 71)         # at most all of the experts (77 GB = 71.7 GiB)
         self.assertEqual(setup.resident_budget_gib(M, 256), 71)
         self.assertEqual(setup.resident_budget_gib(M, 20), 8)          # the floor
-        self.assertEqual(setup.resident_budget_gib(M, 63.7, 1.7), 38)  # a KV cache streamed to RAM comes out of it
+        self.assertEqual(setup.resident_budget_gib(M, 63.7, 1.7), 45)  # a KV cache streamed to RAM comes out of it
+
+    def test_unified_memory_keeps_24(self):
+        self.assertEqual(setup.resident_budget_gib(M, 63.7, uma=True), 40)
+        self.assertEqual(setup.resident_budget_gib(M, 127.8, uma=True), 71)
+        self.assertEqual(setup.resident_budget_gib(M, 47.8, uma=True), 24)
+
+    def test_nominal_ram(self):
+        self.assertEqual(setup.nominal_ram_gb(63.1), 64.0)
+        self.assertEqual(setup.nominal_ram_gb(62.5), 64.0)
+        self.assertEqual(setup.nominal_ram_gb(60.0), 60.0)
+        self.assertEqual(setup.nominal_ram_gb(31.3), 32.0)
+        self.assertEqual(setup.nominal_ram_gb(125.6), 128.0)
+        self.assertEqual(setup.nominal_ram_gb(141.5), 141.5)           # our 144 GB box reads ~141.5: not a sold size, unchanged
+        self.assertEqual(setup.nominal_ram_gb(280.0), 280.0)
+        self.assertEqual(setup.nominal_ram_gb(302.0), 304.0)
 
 
 def quiet(fn, *args):
@@ -144,6 +164,7 @@ class Base(unittest.TestCase):
         (self.t / "data" / "mtp" / "rt").mkdir(parents=True)
         (self.t / "data" / "mtp" / "rt" / "experts.bin").write_bytes(b"")
         self.downloads, self.runs, self.verified = [], [], []
+        self.mtp_downloads = []
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -167,7 +188,10 @@ class Base(unittest.TestCase):
                  for i in range(n_gpus)]
 
         def fake_download(url, dst, what=None):
-            self.downloads.append(url)
+            if url == setup.MTP_TUNED["url"]:          # Speedy 0.5.0: the tuned drafter (an empty fake: stock is kept)
+                self.mtp_downloads.append(url)
+            else:
+                self.downloads.append(url)
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(b"")
             setup.mark(dst)
@@ -235,7 +259,7 @@ class Main(Base):
         self.assertNotIn("--experts-bin", packs[0])
         self.assertTrue(packs[0][packs[0].index("--gguf") + 1].endswith("UD-Q4_K_XL-00001-of-00004.gguf"))
         args = cfg["args"]
-        self.assertEqual(args[args.index("--resident-budget-gib") + 1], "40")
+        self.assertEqual(args[args.index("--resident-budget-gib") + 1], "47")
         self.assertTrue(args[args.index("--native") + 1].endswith("-00001-of-00004.gguf"))
         for flag in ("--ple-gguf", "--mmap-experts", "--resident-experts", "--control-vector-scaled",
                      "--kv-resident"):
@@ -261,7 +285,7 @@ class Main(Base):
         args = cfg["args"]
         self.assertIn("--kv-resident", args)
         kv_gb = 131072 * 13 * 1056 / 1e9
-        self.assertEqual(args[args.index("--resident-budget-gib") + 1], str(40 - int(-(-kv_gb // 1))))
+        self.assertEqual(args[args.index("--resident-budget-gib") + 1], str(47 - int(-(-kv_gb // 1))))
 
     def test_old_engine_stops_before_the_download(self):
         code, out, cfg = self.main(["--context", "8192"], version="0.1.31")
@@ -285,7 +309,7 @@ class Main(Base):
         with mock.patch.object(setup, "get_prebuilt_hip", lambda *a, **k: self.t / "engine"),                 mock.patch.object(setup, "build_engine_hip", lambda *a, **k: self.t / "engine"):
             code, out, cfg = self.main(["--context", "8192", "--backend", "hip", "--vision", "no"], amd=r9700)
         self.assertNotIn("has not been run on AMD cards yet", out)
-        self.assertIn("RAM budget: 40 GiB of UD-Q4_K_XL's experts", out)
+        self.assertIn("RAM budget: 47 GiB of UD-Q4_K_XL's experts", out)
 
     def test_resumed_download_needs_room_for_the_rest_only(self):
         """#425: the disk check counts the finished shards and .part files already there (sizes scaled down: a
@@ -329,19 +353,19 @@ class Main(Base):
         code, out, cfg = self.main(["--context", "8192", "--resident-budget-gib", "48"])
         self.assertEqual(code, 0, out)
         self.assertEqual(cfg["args"][cfg["args"].index("--resident-budget-gib") + 1], "48")
-        self.assertIn("more than setup recommends for this PC (40 GiB", out)
+        self.assertIn("more than setup recommends for this PC (47 GiB", out)
         self.assertIn("Kept as you chose", out)
         code, out, cfg = self.main(["--context", "8192", "--resident-budget-gib", "32.5"])
         self.assertEqual(cfg["args"][cfg["args"].index("--resident-budget-gib") + 1], "32.5")
         self.assertNotIn("more than setup recommends", out)
 
     def test_budget_flag_with_kv_streaming_is_kept(self):
-        code, out, cfg = self.main(["--context", "131072", "--resident-budget-gib", "40"])
+        code, out, cfg = self.main(["--context", "131072", "--resident-budget-gib", "47"])
         self.assertEqual(code, 0, out)
         args = cfg["args"]
         self.assertIn("--kv-resident", args)
-        self.assertEqual(args[args.index("--resident-budget-gib") + 1], "40")      # not 38: the user's number
-        self.assertIn("come on top of your 40 GiB RAM budget", out)
+        self.assertEqual(args[args.index("--resident-budget-gib") + 1], "47")      # not 45: the user's number
+        self.assertIn("come on top of your 47 GiB RAM budget", out)
 
     def test_budget_flag_needs_a_positive_number(self):
         with contextlib.redirect_stderr(io.StringIO()):
@@ -412,11 +436,11 @@ class Main(Base):
             self.assertEqual(code, 0, out)
             self.assertEqual(cfg["gpu"], [0, 1])
             self.assertEqual(cfg["layer_split"], "auto")
-            self.assertEqual(cfg["args"][cfg["args"].index("--resident-budget-gib") + 1], "40")
+            self.assertEqual(cfg["args"][cfg["args"].index("--resident-budget-gib") + 1], "47")
             for flag in ("--mmap-experts", "--resident-experts"):
                 self.assertNotIn(flag, cfg["args"])
             self.assertIn("as you chose (--gpus), with its RAM budget", out)
-            self.assertIn("RAM budget: 40 GiB", out)
+            self.assertIn("RAM budget: 47 GiB", out)
             self.assertNotIn("worst case", out)
             code, out, cfg = self.main(["--context", "8192", "--gpus", "0,1", "--resident-budget-gib", "30"], n_gpus=2)
             self.assertEqual(code, 0, out)                                                  # an explicit budget too
@@ -475,7 +499,7 @@ class IQ4XS(Base):
         self.assertEqual(setup.budget_model({"args": []}), M)
 
     def test_budget(self):
-        self.assertEqual(setup.resident_budget_gib(X, 63.7), 40)
+        self.assertEqual(setup.resident_budget_gib(X, 63.7), 47)
         self.assertEqual(setup.resident_budget_gib(X, 95.8), 55)              # at most all of them (59.5 GB)
         self.assertAlmostEqual(setup.unsloth_split_need_gb(X), 93.7 + setup.UNSLOTH_RAM_LEFT_GB)
 
@@ -493,7 +517,7 @@ class IQ4XS(Base):
         self.assertNotIn("--experts-bin", packs[0])
         self.assertTrue(packs[0][packs[0].index("--gguf") + 1].endswith("UD-IQ4_XS-00001-of-00003.gguf"))
         args = cfg["args"]
-        self.assertEqual(args[args.index("--resident-budget-gib") + 1], "40")
+        self.assertEqual(args[args.index("--resident-budget-gib") + 1], "47")
         self.assertTrue(args[args.index("--native") + 1].endswith("UD-IQ4_XS-00001-of-00003.gguf"))
         for flag in ("--ple-gguf", "--mmap-experts", "--resident-experts"):
             self.assertNotIn(flag, args)
@@ -551,7 +575,7 @@ class IQ4XS(Base):
         code, out, _ = self.main(["--check"], m=X)
         self.assertEqual(code, 0, out)
         line = next(ln for ln in out.splitlines() if ln.strip().startswith(X))
-        self.assertIn("fits with 40 GiB of its experts in RAM", line)
+        self.assertIn("fits with 47 GiB of its experts in RAM", line)
         self.assertNotIn("EXPERIMENTAL", line)
         self.assertNotIn("EXPERIMENTAL", next(ln for ln in out.splitlines() if ln.strip().startswith(M)))
 
@@ -577,7 +601,7 @@ class IQ4XS(Base):
                 mock.patch.object(setup, "build_engine_hip", lambda *a, **k: self.t / "engine"):  # Linux compiles it
             code, out, cfg = self.main(["--context", "8192", "--backend", "hip"], version="0.1.38", amd=r9700, m=X)
         self.assertNotIn("has not been run on AMD cards yet", out)
-        self.assertIn("RAM budget: 40 GiB of UD-IQ4_XS's experts", out)
+        self.assertIn("RAM budget: 47 GiB of UD-IQ4_XS's experts", out)
 
 
 class StrixHaloCache(Base):
@@ -771,8 +795,8 @@ class Resident(Base):
             with self.subTest(m):
                 code, out, cfg = self.main(["--context", "8192"], ram=63.7, version=ver, m=m)
                 self.assertEqual(code, 0, out)
-                self.assertEqual(cfg["args"][cfg["args"].index("--resident-budget-gib") + 1], "40")
-                self.assertIn(f"RAM budget: 40 GiB of {m}'s experts in RAM", out)
+                self.assertEqual(cfg["args"][cfg["args"].index("--resident-budget-gib") + 1], "47")
+                self.assertIn(f"RAM budget: 47 GiB of {m}'s experts in RAM", out)
 
     def test_an_asked_budget_is_kept(self):
         code, out, cfg = self.main(["--context", "8192", "--resident-budget-gib", "40"], ram=127.8)
@@ -783,7 +807,7 @@ class Resident(Base):
     def test_the_menu_and_check_say_so(self):
         code, out, _ = self.main(["--check"], ram=127.8)
         for m, verdict in ((X, "fits (all of its experts in RAM)"), (M, "fits (all of its experts in RAM)"),
-                           (Q5, "fits (all of its experts in RAM)"), (Q8, "slow here: 104 GiB of its 119 GiB")):
+                           (Q5, "fits (all of its experts in RAM)"), (Q8, "slow here: 111 GiB of its 119 GiB")):
             line = next(ln for ln in out.splitlines() if ln.strip().startswith(m + " "))
             self.assertIn(verdict, line)
 
@@ -856,7 +880,7 @@ class BigFiles(Base):
         self.assertEqual(self.downloads, [])
         code, out, cfg = self.main(["--context", "8192"], ram=127.8, version="0.1.44", m=Q8)   # --model + --yes
         self.assertEqual(code, 0, out)
-        self.assertEqual(cfg["args"][cfg["args"].index("--resident-budget-gib") + 1], "104")
+        self.assertEqual(cfg["args"][cfg["args"].index("--resident-budget-gib") + 1], "111")
 
     def test_q5_q6_need_the_q6k_engine(self):
         for m in (Q5, Q6):

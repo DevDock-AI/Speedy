@@ -3,6 +3,11 @@
 Share measurements from your own hardware so other users can judge how Strata
 might run on a similar machine. This guide suggests a report format and a pull
 request workflow; a single model, GPU, or context length is enough to contribute.
+**Speedy:** the engine binary has no `bench` command (`strata bench ...` below is the upstream Strata Terminal CLI, not
+shipped in Speedy). Measure with [`bench/speedbench.py`](../bench/speedbench.py) against your running server
+(`python3 bench/speedbench.py <label> <engine_log> --url http://127.0.0.1:8080`, see its header for the flags), or
+`./bench.sh` / `BENCH.bat` for the quick report; paste the speedbench JSON in a perf report.
+
 There are two ways to measure. For results other people can compare with, run the **standard benchmark**: `strata bench run`
 follows the draft protocol in [BENCHMARK_PROTOCOL.md](BENCHMARK_PROTOCOL.md) (fixed prompts, thinking on, the model card's
 sampling, twelve sanity checks, about 2 to 4 minutes after the model has loaded on a fast card, more on a slow one) and writes `results.json` with
@@ -75,6 +80,8 @@ and their limits. Report what you actually measured and label estimates separate
   the gfx1103 port (native dot4, the gfx11 WMMA kernels, the exact speed switches and a calibrated hipBLASLt table), hand-built on ROCm 10.1, Q2_0 + MTP at 32K: prompts 90 tok/s plain, 186 with the table, 277 with the WMMA opt-ins (4K), decode 13.1 -> 14.3 tok/s; zero GPU resets.
 
 ## Run the standard benchmark
+
+(Upstream Strata Terminal only; on Speedy use `bench/speedbench.py`, see the note at the top.)
 
 ```sh
 strata bench run --profile NAME --track default --track-notes "release 0.2.1, setup defaults"

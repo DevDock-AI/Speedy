@@ -27,7 +27,7 @@ import json
 import time
 import uuid
 
-from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs
+from serve.frontend import CallList, Event, _late_system_to_user, _parts_of, effort_kwargs
 
 ENCRYPTED_PREFIX = "strata.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -229,8 +229,9 @@ def _order_tool_results(messages):
         i = j
     for m in messages:
         m.pop("_call_id", None)
-        for c in m.get("tool_calls") or []:
-            c.pop("_call_id", None)
+        ids = [c.pop("_call_id", None) for c in m.get("tool_calls") or []]
+        if any(isinstance(cid, str) and cid for cid in ids):
+            m["tool_calls"] = CallList(m["tool_calls"], ids)   # the ids, for the reasoning restore only
 
 
 def request_tools(req: dict):
