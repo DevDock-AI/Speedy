@@ -832,3 +832,107 @@ class StatedTool(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             svc._toolguard_prompt(m, None, [{"type": "function", "function": {"name": n}} for n in DECL])
         self.assertNotIn("Note", m[-1]["content"])
+
+
+# ------------------------------------------------------------------ 0.5.4: polling gets the note but never the mask
+POLL = ("bash", {"command": "sleep 30; tail -n 20 build.log"}, "[ 42%] Building CXX object src/foo.o")
+
+
+class PollExempt(unittest.TestCase):
+    def test_is_poll(self):
+        sig = lambda c, n="bash": (n, json.dumps({"command": c}))
+        for c in ("sleep 30", "wait", "tail -n 20 build.log", "tail -f out.log", "sleep 5; tail -n 50 /tmp/b.log",
+                  "git status", "ps aux", "pgrep -f server", "jobs", "kill -0 1234", "sleep 10 && ps aux | grep make",
+                  "sleep 2; cat out.txt | wc -l"):
+            self.assertTrue(g.is_poll(sig(c)), c)
+        for c in ("python3 run_tests.py", "sleep 5; make", "tail -n 5 a > b", "sleep 1; rm x", "make; sleep 5",
+                  "cat build.log", "sleep 1; tee x", "git status; git checkout .", "sleep 1; $(rm x)", ""):
+            self.assertFalse(g.is_poll(sig(c)), c)
+        self.assertFalse(g.is_poll(("read", json.dumps({"command": "sleep 30"}))))
+
+    def test_three_polls_note_no_mask(self):
+        m = chain([POLL, POLL, POLL])
+        reps = g.mark_loops(m)
+        self.assertEqual([(r["poll"], r["streak"]) for r in reps], [(True, 0)])
+        self.assertEqual(g.masked_names(reps), [])
+        self.assertIn(g.LOOP_NOTE, m[-1]["content"])
+        self.assertIn(g.LOOP_NOTE, m[4]["content"])
+
+    def test_build_poll_fixture(self):
+        # an agent polls a long build: the same poll, mostly the same tail, 12 times; never masked
+        steps = [("bash", {"command": "cmake --build build -j8 > build.log 2>&1 &"}, "")]
+        steps += [POLL] * 12
+        steps += [("bash", {"command": "sleep 30; tail -n 20 build.log"}, "[100%] Built target app")]
+        for n in range(2, len(steps) + 1):
+            self.assertEqual(g.masked_names(g.mark_loops(chain(steps[:n]))), [], n)
+
+    def test_poll_and_real_rep_same_turn_masks(self):
+        msgs = [{"role": "user", "content": "go"}]
+        for i in range(3):
+            msgs.append({"role": "assistant", "content": "", "tool_calls": [
+                call("bash", 2 * i, command="sleep 30; tail -n 20 build.log"),
+                call("bash", 2 * i + 1, command="python3 run_tests.py")]})
+            msgs.append({"role": "tool", "tool_call_id": f"c{2 * i}", "content": POLL[2]})
+            msgs.append({"role": "tool", "tool_call_id": f"c{2 * i + 1}", "content": "1 failed"})
+        reps = g.mark_loops(msgs)
+        self.assertEqual(g.masked_names(reps), ["bash"])
+
+    def test_switch_off_old_behaviour(self):
+        m = chain([POLL, POLL, POLL])
+        reps = g.mark_loops(m, poll_exempt=False)
+        self.assertEqual(g.masked_names(reps), ["bash"])
+        self.assertFalse(reps[0]["poll"])
+
+    def test_placeholder_loop_still_masked(self):
+        reps = g.mark_loops(chain_ids([("edit", edit_args(i), FAIL) for i in range(10)]))
+        self.assertEqual(g.masked_names(reps), ["edit"])
+
+    def test_git_status_after_write_new_epoch(self):
+        gs = ("bash", {"command": "git status"}, "M a.py")
+        w = ("edit", {"filePath": "a.py", "oldString": "x", "newString": "y"}, OK)
+        self.assertEqual(g.mark_loops(chain([gs, w, gs])), [])
+
+    def test_backstop_poll_note(self):
+        # identical poll, result changes (no loop): the backstop note at 3, with the loop note text for a poll
+        steps = [("bash", {"command": "sleep 30; tail -n 20 build.log"}, f"[{k}0%]") for k in range(3)]
+        m = chain(steps)
+        g.mark_repeats(m, min_times=3, skip_noted=True, poll_note=g.LOOP_NOTE)
+        self.assertIn(g.LOOP_NOTE, m[6]["content"])
+        self.assertNotIn("Do something different", m[6]["content"])
+        m = chain(steps)
+        g.mark_repeats(m, min_times=3, skip_noted=True)
+        self.assertIn(g.REPEAT_NOTE, m[6]["content"])
+
+    def test_server_switch_and_log(self):
+        import io
+        import contextlib
+        svc = Service(RecordingEngine(Tokenizer(), ['x']), Tokenizer(), None)
+        svc.configure_toolguard({})
+        self.assertTrue(svc.loop_poll_exempt)
+        m = chain([POLL, POLL, POLL])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            svc._toolguard_prompt(m)
+        self.assertIn("poll-exempt", out.getvalue())
+        self.assertEqual(svc.totals.get("loop_poll_exempt"), 1)
+        steps = [("bash", {"command": "sleep 30; tail -n 20 build.log"}, f"[{k}0%]") for k in range(3)]
+        m = chain(steps)
+        svc._toolguard_prompt(m)
+        self.assertNotIn(g.REPEAT_NOTE, m[6]["content"])
+        svc.configure_toolguard({"STRATA_LOOP_BREAKER_POLL_EXEMPT": "0"})
+        self.assertFalse(svc.loop_poll_exempt)
+        m = chain(steps)
+        svc._toolguard_prompt(m)
+        self.assertIn(g.REPEAT_NOTE, m[6]["content"])
+
+    def test_poll_not_other_work_in_cycle(self):
+        a, b = mark(" ", "x"), mark("x", " ")
+        loop = [a, b, a, b]
+        st, _ = cyc(loop + [POLL])
+        self.assertEqual(st["hold"], 2)                         # a poll does not count toward releasing the hold
+        st, _ = cyc(loop + [("bash", {"command": "make step1"}, "built")])
+        self.assertEqual(st["hold"], 1)
+        m = chain_ids(loop + [POLL])
+        self.assertEqual(g.mark_cycles(m, poll_exempt=False)["hold"], 1)     # switch off: old behaviour
+        st, _ = cyc([a, POLL, b, POLL, a, POLL, b])             # polls between cycle edits: the cycle is still caught
+        self.assertEqual(st["mask"], ["edit"])

@@ -5162,7 +5162,10 @@ class Service:
 
     def with_shared(self, req: dict, api: str) -> dict:
         """The request with the shared thinking level and max tokens filled in where it has none of its own, then the
-        reasoning effort floor."""
+        reasoning effort floor.  A client that turns thinking off itself (#30) keeps it off: the floor covers requests
+        that name no level, or a level above off."""
+        if client_thinking_off(req, api):
+            return self._with_shared(req, api)
         return self.with_effort_floor(self._with_shared(req, api), api)
 
     def _with_shared(self, req: dict, api: str) -> dict:
@@ -5867,6 +5870,10 @@ class Service:
         # with the loop breaker unless STRATA_LOOP_BREAKER_CYCLE is 0 / false / off
         lc = g.env_value("STRATA_LOOP_BREAKER_CYCLE", cfg_env)
         self.loop_cycle = True if lc is None or str(lc).strip() == "" else g.flag(lc)
+        # 0.5.4: polls (sleep / wait / tail / git status / ps ...) get the note but never the mask, unless
+        # STRATA_LOOP_BREAKER_POLL_EXEMPT is 0 / false / off
+        lp = g.env_value("STRATA_LOOP_BREAKER_POLL_EXEMPT", cfg_env)
+        self.loop_poll_exempt = True if lp is None or str(lp).strip() == "" else g.flag(lp)
         self.think_floor_cap = g.int_setting(g.env_value("STRATA_THINK_FLOOR_CAP", cfg_env), 0)
         self.tool_step_think_cap = g.int_setting(g.env_value("STRATA_TOOL_STEP_THINK_CAP", cfg_env),
                                                   g.TOOL_STEP_THINK_CAP)
@@ -5885,7 +5892,8 @@ class Service:
         Both are functions of the history alone, so a conversation's prefix renders the same on every request."""
         if getattr(self, "loop_breaker", False):
             try:
-                loops = toolguard.mark_loops(messages, self.repeat_window, getattr(self, "loop_note", toolguard.LOOP_NOTE))
+                loops = toolguard.mark_loops(messages, self.repeat_window, getattr(self, "loop_note", toolguard.LOOP_NOTE),
+                                             poll_exempt=getattr(self, "loop_poll_exempt", True))
             except Exception as e:              # noqa: BLE001 - a guard never fails a request
                 loops = []
                 print(f"[strata] loop breaker skipped: {e}", flush=True)
@@ -5894,7 +5902,9 @@ class Service:
                 # 0.5.3: edit cycles, after the loop notes (a turn that is both keeps the loop's note, never two)
                 try:
                     can_mask = getattr(self, "loop_mask", False) and tnc_api.engine_supports(self.engine)
-                    cycle = toolguard.mark_cycles(messages) if can_mask else toolguard.mark_cycles(messages, paused="")
+                    pe = getattr(self, "loop_poll_exempt", True)
+                    cycle = toolguard.mark_cycles(messages, poll_exempt=pe) if can_mask else \
+                        toolguard.mark_cycles(messages, paused="", poll_exempt=pe)
                 except Exception as e:          # noqa: BLE001 - a guard never fails a request
                     cycle = None
                     print(f"[strata] loop breaker (edit cycle) skipped: {e}", flush=True)
@@ -5912,15 +5922,20 @@ class Service:
             for r in loops:
                 with self.status_lock:
                     self.totals["tool_call_repeats"] = self.totals.get("tool_call_repeats", 0) + 1
-                print(f"[strata] loop breaker: {r['name']} same call + same result (streak {r['streak']}): note added",
-                      flush=True)
+                if r.get("poll"):
+                    with self.status_lock:
+                        self.totals["loop_poll_exempt"] = self.totals.get("loop_poll_exempt", 0) + 1
+                print(f"[strata] loop breaker: {r['name']} same call + same result (streak {r['streak']})"
+                      f"{' poll-exempt, no mask' if r.get('poll') else ''}: note added", flush=True)
         if getattr(self, "loop_breaker", False) or getattr(self, "repeat_warn", False):
             # 0.5.1: with the loop breaker on, the plain repeat note stays as a backstop for a call made 3+ times
             # (turns the loop breaker already noted get no second note)
             lb_on = getattr(self, "loop_breaker", False)
             try:
                 reps = toolguard.mark_repeats(messages, self.repeat_window,
-                                              min_times=toolguard.REPEAT_BACKSTOP if lb_on else 2, skip_noted=lb_on)
+                                              min_times=toolguard.REPEAT_BACKSTOP if lb_on else 2, skip_noted=lb_on,
+                                              poll_note=(getattr(self, "loop_note", toolguard.LOOP_NOTE)
+                                                         if lb_on and getattr(self, "loop_poll_exempt", True) else None))
             except Exception as e:              # noqa: BLE001 - a guard never fails a request
                 reps = []
                 print(f"[strata] repeat warning skipped: {e}", flush=True)
@@ -5928,7 +5943,8 @@ class Service:
                 with self.status_lock:
                     self.totals["tool_call_repeats"] = self.totals.get("tool_call_repeats", 0) + 1
                 print(f"[strata] repeated tool call: {r['name']} (same arguments as one of the last "
-                      f"{self.repeat_window} calls, {r['times']} times in the conversation): note added", flush=True)
+                      f"{self.repeat_window} calls, {r['times']} times in the conversation)"
+                      f"{' poll-exempt' if r.get('poll') else ''}: note added", flush=True)
                 log_toolcall_failure({
                     "ts": round(time.time(), 3), "model": getattr(self, "model", None),
                     "preset": os.path.basename(str(getattr(self, "config_path", "") or "")) or None,
@@ -9305,6 +9321,7 @@ def make_handler(svc: Service):
             effort = (req.get("reasoning") or {}).get("effort") if isinstance(req.get("reasoning"), dict) else None
             effort = svc.effort_default() if effort is None else effort
             if effort_below_floor(effort, getattr(svc, "effort_floor", None)) and \
+                    not client_thinking_off(req, "responses") and \
                     svc.floor_applies(req, tools, req.get("instructions"), messages):
                 svc.note_floor(effort, "responses", "tools" if tools else "long prompt")
                 req = {**req, "reasoning": {**(req.get("reasoning") or {}), "effort": svc.effort_floor}}
@@ -9660,6 +9677,31 @@ def open_server_warning(port, public=False, tools=False) -> str:
     if public:
         msg += " This address is on the public internet, so anyone who finds it can use it."
     return msg + " Add an API key to keep others out."
+
+
+def read_api_key_file(path) -> str:
+    """--api-key-file / "api_key_file": the key (or comma-separated keys) from a file, read once at start; surrounding
+    whitespace and the trailing newline are dropped.  A missing, unreadable or empty file is a clear start error."""
+    p = Path(os.path.expanduser(str(path)))
+    try:
+        text = p.read_text(encoding="utf-8-sig")
+    except OSError as e:
+        raise ValueError(f"cannot read the API key file {p}: {e.strerror or e}") from None
+    key = text.strip()
+    if not key:
+        raise ValueError(f"the API key file {p} is empty: put the key in it, or leave api_key_file out")
+    return key
+
+
+def configured_api_key(cli_key, cli_key_file, cfg: dict):
+    """The raw key setting: --api-key / $STRATA_API_KEY first, then --api-key-file, then the config's "api_key_file",
+    then its "api_key"."""
+    if cli_key:
+        return cli_key
+    key_file = cli_key_file or cfg.get("api_key_file")
+    if key_file:
+        return read_api_key_file(key_file)
+    return cfg.get("api_key", "")
 
 
 def api_key_of(value):
@@ -10144,6 +10186,24 @@ def estimate_prompt_tokens(*parts) -> int:
     return len(json.dumps(parts, ensure_ascii=False, default=str)) // 4
 
 
+def client_thinking_off(req: dict, api: str) -> bool:
+    """The request itself turns thinking off (#30): reasoning_effort none/off (top level, reasoning.effort or
+    chat_template_kwargs), chat_template_kwargs enable_thinking false, or an Anthropic thinking disabled."""
+    if not isinstance(req, dict):
+        return False
+    off = ("none", "off")
+    if api == "anthropic":
+        th = req.get("thinking") if isinstance(req.get("thinking"), dict) else {}
+        oc = req.get("output_config") if isinstance(req.get("output_config"), dict) else {}
+        return th.get("type") == "disabled" or str(oc.get("effort") or "").lower() in off
+    ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
+    rsn = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
+    for e in (req.get("reasoning_effort"), rsn.get("effort"), ctk.get("reasoning_effort")):
+        if e not in (None, ""):
+            return str(e).lower() in off
+    return ctk.get("enable_thinking") is False or rsn.get("enabled") is False
+
+
 def effort_below_floor(effort, floor) -> bool:
     """True when the named level (none/off counts as none) is below the floor; an unknown or absent level is not."""
     if not floor or effort is None:
@@ -10551,6 +10611,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY. "
                          "Several keys: separate them with commas (key1,key2), as llama.cpp does")
+    ap.add_argument("--api-key-file", default=None,
+                    help="read the API key from this file (first line, trailing newline dropped), so the key is not "
+                         "in the process list; also \"api_key_file\" in the config. --api-key wins when both are given")
     ap.add_argument("--no-api-key", action="store_true",
                     help="serve on the network without an API key (anyone who can reach the port can use the model; "
                          "also \"api_key\": \"none\" in the config). Warns once, never refuses")
@@ -10671,7 +10734,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                 x.strip() == "--api-key=" for i, x in enumerate(supplied_args)):
         print("[strata] an API key was given but it is empty: set a key, or leave it out", file=sys.stderr)
         return 2
-    raw_key = a.api_key or cfg.get("api_key", "")
+    try:
+        raw_key = configured_api_key(a.api_key, getattr(a, "api_key_file", None), cfg)
+    except ValueError as e:
+        print(f"[strata] {e}", file=sys.stderr)
+        return 2
     no_key_chosen = bool(getattr(a, "no_api_key", False)) or explicit_no_key(raw_key)
     if explicit_no_key(raw_key):
         raw_key = ""

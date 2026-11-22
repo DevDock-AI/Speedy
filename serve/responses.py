@@ -455,7 +455,10 @@ def check_request(req: dict) -> None:
 
 
 def template_kwargs(req: dict, shared: dict) -> dict:
-    effort = (req.get("reasoning") or {}).get("effort")
+    reasoning = req.get("reasoning") or {}
+    effort = reasoning.get("effort")
+    if effort is None and reasoning.get("enabled") is False:
+        effort = False                               # {"enabled": false} with no level = thinking off, as on chat
     if effort is None:
         effort = shared.get("reasoning_effort")      # the Chat settings shared with apps, as on the chat path
     try:

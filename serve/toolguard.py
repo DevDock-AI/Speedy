@@ -50,6 +50,16 @@ _VOLATILE = re.compile(r"\bcall_[0-9A-Za-z_]+|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]
                        r"\b\d+(?:\.\d+)?\s*(?:ns|us|µs|ms|s|sec|secs|seconds|m|min|minutes)\b", re.I)
 NEAR_STREAK = 3                # same tool name + same normalized result this many calls in a row: a loop (args may vary)
 NEAR_ARGS_RATIO = 0.85        # "near-identical" arguments (difflib ratio) for a near repeat whose result is not a failure
+# 0.5.4: polling (STRATA_LOOP_BREAKER_POLL_EXEMPT=0 turns it off): a shell call that only waits or looks (sleep N,
+# wait, tail of a file, git status, ps / pgrep / jobs / kill -0, "sleep N; <read-only command>") gets the loop note
+# but never starts or extends a mask streak, and is not "other work" for edit cycles.
+POLL_EXEMPT = True
+_POLL_READ = re.compile(r"(?:sleep\s+\d+(?:\.\d+)?[smh]?|wait(?:\s+%?\d+)*|jobs(?:\s+-\w+)*|kill\s+-0\s+[%$\w]+|"
+                        r"git\s+status(?:\s+-[-\w]+)*|ps(?:\s+[-\w]+)*|pgrep(?:\s+-\w+)*(?:\s+\S+)?|"
+                        r"(?:tail|head|cat|wc|ls|grep)(?:\s+\S+)*)")
+_POLL_HEAD = re.compile(r"(?:sleep\s+\d+(?:\.\d+)?[smh]?|wait(?:\s+%?\d+)*|jobs(?:\s+-\w+)*|kill\s+-0\s+[%$\w]+|"
+                        r"git\s+status(?:\s+-[-\w]+)*|ps(?:\s+[-\w]+)*|pgrep(?:\s+-\w+)*(?:\s+\S+)?|"
+                        r"tail(?:\s+(?:-n\s*\d+|-\d+|-[fF]|-n\s*\+\d+))*\s+[^\s;|&]+)")
 REPEAT_BACKSTOP = 3            # with the loop breaker on, a name+args repeat seen this many times still gets the repeat note
 # 0.5.3 edit cycles (STRATA_LOOP_BREAKER_CYCLE=0 turns them off): successful edits that go back and forth on one file
 # with no other work between them (TB2: PLAN.md checkboxes "[ ]" -> "[~]" -> "[x]" -> "[ ]" for 400-990 requests; every
@@ -340,13 +350,15 @@ def _append_note(msg: dict, note: str) -> None:
 
 
 def mark_repeats(messages, window: int = REPEAT_WINDOW, note: str = REPEAT_NOTE, min_times: int = 2,
-                 skip_noted: bool = False) -> list[dict]:
+                 skip_noted: bool = False, poll_note: str | None = None) -> list[dict]:
     """Every assistant tool call identical to one of the `window` calls before it gets `note` after its result (the
     last tool message that follows that turn).  It is a function of the history alone, so the same turns get the same
     note on every request and the prompt prefix stays stable.  Returns the repeats of the latest assistant turn (the
     ones a caller logs: earlier ones were logged when they were the latest) as {"name", "arguments", "times"}.
     `min_times`: only a call seen at least this often in the conversation counts.  `skip_noted`: a turn whose last result
-    already ends with a note (the loop breaker's) gets no second one (0.5.1 backstop)."""
+    already ends with a note (the loop breaker's) gets no second one (0.5.1 backstop).  `poll_note`: a turn whose
+    repeats are all polls (is_poll) gets this note instead (0.5.4: waiting again is no reason to "do something
+    different")."""
     window = max(1, int(window))
     history: list[tuple[str, str]] = []
     latest: list[dict] = []
@@ -360,7 +372,8 @@ def mark_repeats(messages, window: int = REPEAT_WINDOW, note: str = REPEAT_NOTE,
             if sig is None:
                 continue
             if sig in history[-window:] and history.count(sig) + 1 >= min_times:
-                reps.append({"name": sig[0], "arguments": sig[1], "times": history.count(sig) + 1})
+                reps.append({"name": sig[0], "arguments": sig[1], "times": history.count(sig) + 1,
+                             "poll": poll_note is not None and is_poll(sig)})
             history.append(sig)
         if not reps:
             continue
@@ -371,7 +384,7 @@ def mark_repeats(messages, window: int = REPEAT_WINDOW, note: str = REPEAT_NOTE,
             continue                                # no result yet: nothing to put the note after
         if skip_noted and _NOTE_TAIL.search(_raw_text(messages[j - 1])):
             continue
-        _append_note(messages[j - 1], note)
+        _append_note(messages[j - 1], poll_note if all(r["poll"] for r in reps) else note)
         if i == last_asst and all(messages[k].get("role") == "tool" for k in range(i + 1, len(messages))):
             latest = reps
     return latest
@@ -427,14 +440,43 @@ def is_write(sig: tuple[str, str]) -> bool:
     return False
 
 
-def mark_loops(messages, window: int = REPEAT_WINDOW, note: str = LOOP_NOTE) -> list[dict]:
+def is_poll(sig: tuple[str, str]) -> bool:
+    """A shell call that only waits or looks: its command is `sleep N`, `wait`, `tail [-n N|-f] <file>`, `git status`,
+    `ps`, `pgrep`, `jobs`, `kill -0 PID`, or `sleep N; <read-only command>` (tail / head / cat / wc / ls / grep / one
+    of the above, pipes allowed).  Never a command that _WRITE_CMD matches."""
+    name, args = sig
+    if not _RUN_TOOL.search(name):
+        return False
+    try:
+        a = json.loads(args)
+    except ValueError:
+        return False
+    cmd = a.get("command", a.get("cmd")) if isinstance(a, dict) else None
+    if isinstance(cmd, list):
+        cmd = " ".join(str(c) for c in cmd)
+    if not isinstance(cmd, str) or not cmd.strip() or _WRITE_CMD.search(cmd) or re.search(r"[`$]\(|`", cmd):
+        return False
+    parts = [p.strip() for p in re.split(r";|&&|\n", cmd) if p.strip()]
+    if not parts:
+        return False
+    sleep_first = re.fullmatch(r"sleep\s+\d+(?:\.\d+)?[smh]?", parts[0]) is not None
+    if len(parts) == 1:
+        return bool(_POLL_HEAD.fullmatch(parts[0]))
+    if not sleep_first:
+        return False
+    return all(all(_POLL_READ.fullmatch(q.strip()) for q in p.split("|")) for p in parts[1:])
+
+
+def mark_loops(messages, window: int = REPEAT_WINDOW, note: str = LOOP_NOTE,
+               poll_exempt: bool = POLL_EXEMPT) -> list[dict]:
     """Like mark_repeats, stricter: a call is a loop repeat when one of the `window` calls before it has the same name
     and arguments AND the same result text (volatile ids/timestamps/durations normalized), with no successful write
     (is_write, result not a failure) between the two; or the same tool name returned the same result NEAR_STREAK calls
     in a row (arguments may differ).  Such a call's turn gets `note`
     after its last tool result.  A function of the history alone (cache-stable).  Returns the loop repeats of the latest
     assistant turn (when only tool results follow it) as {"name", "arguments", "times", "streak"}; streak = how many
-    consecutive assistant turns, up to this one, held a loop repeat of that name."""
+    consecutive assistant turns, up to this one, held a loop repeat of that name.  With `poll_exempt` a repeat whose
+    call is a poll (is_poll) gets "poll": True and does not add to the streak (it still gets the note)."""
     window = max(1, int(window))
     history: list[tuple[tuple[str, str], str, int]] = []
     epoch = 0
@@ -473,14 +515,17 @@ def mark_loops(messages, window: int = REPEAT_WINDOW, note: str = LOOP_NOTE) -> 
             exact = res is not None and any(h[0] == sig and h[1] == res and h[2] == epoch for h in history[-window:])
             near = run_n >= NEAR_STREAK
             if exact or near:
-                names_now.add(sig[0])
-                reps.append({"name": sig[0], "arguments": sig[1], "times": sum(1 for h in history if h[0] == sig) + 1})
+                poll = poll_exempt and is_poll(sig)
+                if not poll:
+                    names_now.add(sig[0])
+                reps.append({"name": sig[0], "arguments": sig[1], "times": sum(1 for h in history if h[0] == sig) + 1,
+                             "poll": poll})
             history.append((sig, res, epoch))
             if wrote:
                 epoch += 1
         streak = {n: streak.get(n, 0) + 1 for n in names_now}
         for r in reps:
-            r["streak"] = streak[r["name"]]
+            r["streak"] = streak.get(r["name"], 0)
         if not reps or not results:
             continue
         _append_note(messages[j - 1], note)
@@ -491,7 +536,7 @@ def mark_loops(messages, window: int = REPEAT_WINDOW, note: str = LOOP_NOTE) -> 
 
 def masked_names(reps, min_streak: int = 2) -> list[str]:
     """Tier 2: the tool names to keep out of the next reply (a loop repeat seen on `min_streak` consecutive turns)."""
-    return sorted({r["name"] for r in reps or () if r.get("streak", 0) >= min_streak})
+    return sorted({r["name"] for r in reps or () if r.get("streak", 0) >= min_streak and not r.get("poll")})
 
 
 # ------------------------------------------------------------------------------------------------ 5: edit cycles (0.5.3)
@@ -697,7 +742,7 @@ def _period(seq: list, wrote: list) -> int:
     return 0
 
 
-def mark_cycles(messages, paused: str = CYCLE_PAUSED) -> dict:
+def mark_cycles(messages, paused: str = CYCLE_PAUSED, poll_exempt: bool = POLL_EXEMPT) -> dict:
     """Edit cycles: successful edits that go back and forth on one file while nothing else gets done.  "Other work" is
     any answered call that is not an edit, and a successful edit of another real file (running or reading a code file
     between its edits is other work: edit -> test cycles are not judged here).  For the session plan / todo list a call that names the file
@@ -784,7 +829,8 @@ def mark_cycles(messages, paused: str = CYCLE_PAUSED) -> dict:
             edits.append(op is not None)
             kind, target = None, None
             if op is None:
-                if not failed:                          # other work: every file starts over (the plan: unless named)
+                if not failed and not (poll_exempt and is_poll(sig)):
+                    # other work (0.5.4: a poll is not): every file starts over (the plan: unless named)
                     good_calls += 1
                     for path in [p for p in files if not (files[p]["book"] and named(p, sig[1]))]:
                         del files[path]

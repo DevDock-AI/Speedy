@@ -11,8 +11,10 @@ are not guessed.
     python -m unittest serve.test_tool_name_alias -v
 """
 import json
+import os
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -255,6 +257,80 @@ class CollapsedUnderscoreNames(unittest.TestCase):
                     self.assertEqual([e for e in evs if e.kind == "tool_call"], [])
                     self.assertEqual(text_of(evs), raw)                                    # the text is exactly what the model wrote
                     self.assertEqual((parser.unread, parser.unread_names), (1, [written]))
+
+
+class McpPrefixDrift(unittest.TestCase):
+    """#6486: a client that declares MCP tools as `mcp__server__tool` beside plain tools.  Qwen3.8-Flash-Next carries the
+    `mcp__` over to a plain tool (`mcp__web_fetch` for `web_fetch`), drops it from an MCP tool (`files__read_file`), or
+    keeps it and drops the server (`mcp__read_file`).  Each is a spelling of one declared tool; a different server name
+    or an ambiguous spelling stays text and is named for the client."""
+    TOOLS = [plain_tool("web_fetch"), plain_tool("memory"), plain_tool("mcp__files__read_file"),
+             plain_tool("mcp__files__list_dir")]
+
+    def calls(self, written, tools=None, width=0):
+        evs, parser = run_parser("Fetching it.\n" + call_text(written), tools or self.TOOLS, width)
+        return [e.call for e in evs if e.kind == "tool_call"], evs, parser
+
+    def test_the_prefix_on_a_plain_tool_is_that_tool(self):
+        for written, declared in (("mcp__web_fetch", "web_fetch"), ("mcp__memory", "memory")):
+            for width in (0, 1, 5):
+                with self.subTest(written=written, width=width):
+                    found, evs, parser = self.calls(written, width=width)
+                    self.assertEqual([c.name for c in found], [declared])
+                    self.assertEqual(found[0].arguments, {"url": "https://example.com"})
+                    self.assertEqual(text_of(evs).strip(), "Fetching it.")
+                    self.assertEqual((parser.unread, parser.unread_names), (0, []))
+
+    def test_an_mcp_tool_without_its_prefix_or_server_is_that_tool(self):
+        for written in ("files__read_file", "mcp__read_file"):
+            for width in (0, 3):
+                with self.subTest(written=written, width=width):
+                    found, _evs, _parser = self.calls(written, width=width)
+                    self.assertEqual([c.name for c in found], ["mcp__files__read_file"])
+
+    def test_a_declared_name_wins(self):
+        tools = self.TOOLS + [plain_tool("mcp__web_fetch")]
+        found, _evs, _parser = self.calls("mcp__web_fetch", tools)
+        self.assertEqual([c.name for c in found], ["mcp__web_fetch"])
+
+    def test_a_plain_tool_and_an_mcp_member_of_the_same_name_are_not_guessed(self):
+        tools = self.TOOLS + [plain_tool("read_file")]
+        found, evs, parser = self.calls("mcp__read_file", tools)
+        self.assertEqual(found, [])
+        self.assertIn("mcp__read_file", text_of(evs))
+        self.assertEqual(parser.unread_names, ["mcp__read_file"])
+
+    def test_a_different_server_name_stays_text(self):
+        for written in ("mcp__flies__read_file", "mcp__serevr__read_file"):
+            with self.subTest(written=written):
+                found, evs, parser = self.calls(written)
+                self.assertEqual(found, [])
+                self.assertEqual(parser.unread_names, [written])
+        # another case of the declared server is that tool (the case-insensitive rule of _Aliases), not a new guess
+        found, _evs, _parser = self.calls("mcp__Files__read_file")
+        self.assertEqual([c.name for c in found], ["mcp__files__read_file"])
+
+    def test_the_streamed_start_names_the_declared_tool(self):
+        for width in (1, 4):
+            with self.subTest(width=width):
+                _found, evs, _parser = self.calls("mcp__web_fetch", width=width)
+                self.assertEqual([e.call.name for e in evs if e.kind == "tool_start"], ["web_fetch"])
+
+    def test_two_servers_with_the_same_member_are_not_guessed(self):
+        tools = [plain_tool("mcp__a__search"), plain_tool("mcp__b__search")]
+        found, _evs, parser = self.calls("mcp__search", tools)
+        self.assertEqual(found, [])
+        self.assertEqual(parser.unread_names, ["mcp__search"])
+        found, _evs, _parser = self.calls("a__search", tools)            # with its server it is still one tool
+        self.assertEqual([c.name for c in found], ["mcp__a__search"])
+
+    def test_the_switch_off_keeps_the_old_behaviour(self):
+        with mock.patch.dict(os.environ, {"STRATA_TOOL_ALIAS_MCP": "0"}):
+            for written in ("mcp__web_fetch", "files__read_file", "mcp__read_file"):
+                with self.subTest(written=written):
+                    found, _evs, parser = self.calls(written)
+                    self.assertEqual(found, [])
+                    self.assertEqual(parser.unread_names, [written])
 
 
 if __name__ == "__main__":
