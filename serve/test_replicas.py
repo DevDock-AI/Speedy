@@ -85,6 +85,32 @@ class FakeEngine:
         yield 7
 
 
+class EarlyStop(unittest.TestCase):
+    """edge0 #318: a reply stopped early must stop and drain its engine before the replica lock goes free."""
+
+    def test_engine_generator_closed_before_lock_release(self):
+        seen = []
+
+        class Serial(FakeEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                try:
+                    for t in range(100):
+                        yield t
+                finally:
+                    seen.append((rep.run_locks[0].locked(), rep.run_locks[1].locked(), list(rep.inflight)))
+
+        rep = ReplicaEngine([Serial(0), Serial(0)])
+        g = rep.generate([1, 2, 3], 50, {}, None)
+        self.assertEqual(next(g), 0)
+        self.assertEqual(next(g), 1)
+        g.close()                                   # the client stopped reading (stop string / disconnect)
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0][0] or seen[0][1])   # the engine drained while its lock was still held
+        self.assertEqual(sum(seen[0][2]), 1)        # and still counted as in flight
+        self.assertFalse(rep.run_locks[0].locked() or rep.run_locks[1].locked())
+        self.assertEqual(rep.inflight, [0, 0])
+
+
 class RouteChoice(unittest.TestCase):
     def test_least_loaded_then_affinity(self):
         e = ReplicaEngine([FakeEngine(), FakeEngine()], load_tokens=3000)

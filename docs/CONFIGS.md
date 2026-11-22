@@ -73,10 +73,12 @@ come before the server default.
 ## Reasoning effort floor
 
 `"reasoning_effort_floor"` (top level, like `default_reasoning_effort`; env `STRATA_REASONING_EFFORT_FLOOR` wins):
-`low` (default), `medium`, `high` or `off`. A request that offers tools and asks for a lower thinking level (`none`,
-`enable_thinking: false`, Anthropic `thinking: disabled`, or a server default of `none`) gets the floor instead, since
-effort `none` showed a quality drop on agent/tool requests at long context. Requests with no level of their own, with
-their own reasoning budget or without tools are left alone. `"reasoning_effort_floor_ctx_tokens"` (env
+`low` (default), `medium`, `high` or `off`. A request that offers tools and runs below the floor because of the
+server default (`default_reasoning_effort: none`) or asks for a level above off but below the floor (`low` under a
+`medium` floor) gets the floor instead, since effort `none` showed a quality drop on agent/tool requests at long
+context. A client that turns thinking off itself (`reasoning_effort: none`, `reasoning: {"effort": "none"}` or
+`{"enabled": false}`, `chat_template_kwargs: {"enable_thinking": false}`, Anthropic `thinking: disabled`) keeps it off.
+Requests with their own reasoning budget or without tools are left alone. `"reasoning_effort_floor_ctx_tokens"` (env
 `STRATA_REASONING_EFFORT_FLOOR_CTX_TOKENS`, default `0` = off) also applies the floor to requests without tools whose
 prompt is estimated (about 4 characters per token) above that many tokens. Each raised request logs one
 `[strata] effort floor` line.

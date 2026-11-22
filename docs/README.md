@@ -45,6 +45,7 @@ Use the guide for your GPU and operating system. Model and feature support can d
 - [Verified facts, model availability and API reference](AI_REFERENCE.md)
 - [Articles and videos](MEDIA_KIT.md)
 - [Repository instructions for agents](../AGENTS.md)
+- [Coding agents on Speedy: AGENTS.md template, OpenCode permissions](CODING_AGENTS.md)
 
 ## Which instructions apply?
 

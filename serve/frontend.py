@@ -38,6 +38,20 @@ class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
     client gets a 400 with the template's message instead of a dropped connection (#365)."""
 
 
+_BROKEN_PRESERVE_THINKING = "preserve_thinking is defined and preserve_thinking is true"
+_FIXED_PRESERVE_THINKING = "preserve_thinking is undefined or preserve_thinking is true"
+
+
+def normalize_baked_chat_template(source: str) -> str:
+    """#6481: an older or third-party pack bakes the Qwen template whose think-block predicate reads `preserve_thinking
+    is defined and ...`, so with the flag unset the earlier assistant turns lose their (empty) think block and the
+    rendered history no longer matches what the model wrote: the conversation cache cannot reuse it.  Our template
+    (serve/chat_template.jinja) and our packs already have the fixed predicate; any other text is left as it is."""
+    if _BROKEN_PRESERVE_THINKING not in source:
+        return source
+    return source.replace(_BROKEN_PRESERVE_THINKING, _FIXED_PRESERVE_THINKING)
+
+
 class ChatTemplate:
     """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template."""
 
@@ -51,7 +65,7 @@ class ChatTemplate:
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
-        self.source = Path(path).read_text(encoding="utf-8")
+        self.source = normalize_baked_chat_template(Path(path).read_text(encoding="utf-8"))
         self.template = env.from_string(self.source)
         # opt-in (the server sets it from STRATA_SKIP_EMPTY_THINK): a history turn without thinking renders no
         # thinking block instead of an empty one (a template that does not know the variable ignores it)
@@ -685,7 +699,12 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
     given = req.get("reasoning_effort")
     # `false` is a level (thinking off, effort_kwargs): an `or` between the two fields dropped it
-    kwargs.update(effort_kwargs(given if given is not None and given != "" else reasoning.get("effort")))
+    effort = given if given is not None and given != "" else reasoning.get("effort")
+    # OpenRouter style {"reasoning": {"enabled": false}} with no level given is thinking off (#30 already skips the
+    # effort floor for it); an explicit level beside it wins
+    if (effort is None or effort == "") and reasoning.get("enabled") is False:
+        effort = False
+    kwargs.update(effort_kwargs(effort))
     # the vLLM / llama.cpp convention: {"chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"}}
     for k, v in (req.get("chat_template_kwargs") or {}).items():
         if k == "enable_thinking" and not v:
@@ -1006,6 +1025,11 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
     return -1 if held < 0 else held if final else -2
 
 
+def _lost_gt(opener: str) -> bool:
+    """A parameter opener that lost its `>` (`<parameter=NAME\nVALUE\n</parameter`), up to the close's `>`."""
+    return "\n" in opener and opener.rstrip().endswith(PARAM_END[:-1])
+
+
 def _ends_call(text: str, final: bool) -> bool:
     """#4078: whether `text`, what follows a value's PARAM_END, is only the rest of the call - parameters, FUNC_END,
     CALL_END and nothing after them but the next call; before `final` (the output may still go on) a start of that
@@ -1019,6 +1043,9 @@ def _ends_call(text: str, final: bool) -> bool:
             gt = text.find(">", pos)
             if gt < 0:
                 return not final
+            if _lost_gt(text[pos:gt]):
+                pos = gt + 1
+                continue
             end = param_end(text[gt + 1:], final, text[pos:gt].split("=", 1)[1].strip(), allow_reopen=True, held_ok=False)
             if end < 0:
                 return not final
@@ -1055,6 +1082,9 @@ def call_end(text: str, final: bool = False, hold: bool = True) -> int:
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
+            if _lost_gt(text[pos:gt]):          # `<parameter=NAME\nVALUE\n</parameter>`, whole already
+                pos = gt + 1
+                continue
             end = param_end(text[gt + 1:], final, text[pos:gt].split("=", 1)[1].strip(), hold, allow_reopen=True)
             if end < 0:
                 return -1
@@ -1492,6 +1522,18 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
         pname = rest[:rest.index(">")]
         rest = rest[rest.index(">") + 1:]
+        if _lost_gt(pname):
+            # an opener that lost its `>` (`<parameter=replace_all\nfalse\n</parameter>`): the first word is
+            # the name, the rest up to the close its value; a parameter given once already keeps its first value
+            head, _, value = pname.rstrip()[:-len(PARAM_END) + 1].partition("\n")
+            key = head.strip()
+            if key and key not in args and (not props or key in props):
+                v = coerce_value(value.strip("\n"), (props.get(key) or {}).get("type"), notes)
+                if v is not _SKIP:
+                    args[key] = v
+            if notes is not None:
+                notes.append(f"a parameter opener without its '>' was read ({key})")
+            continue
         declared = (props.get(pname) or {}).get("type")
         end = param_end(rest, final=True, name=pname.strip(), allow_reopen=(declared == "string" or declared is None))
         value = rest[:end] if end >= 0 else rest
@@ -1534,6 +1576,10 @@ class _Aliases(dict):
 
     def __contains__(self, key):
         return dict.__contains__(self, key) or self.get(key) is not None
+
+
+_CLOSE_QUOTES = "\"'`\u201d\u2019"   # quotes that may close a sentence before `</think>`
+_SENTENCE_END = ".!?\u2026\u3002\uff01\uff1f"   # sentence punctuation right before such a quote
 
 
 class OutputParser:
@@ -1588,6 +1634,21 @@ class OutputParser:
             if isinstance(name, str) and name:
                 for prefix in ("tools.", "functions.", "default_api."):
                     aliases.setdefault(prefix + name, set()).add(name)
+        # #6486: a client that declares MCP tools as `mcp__server__tool` next to plain tools (`web_fetch`, `memory`): Qwen carries
+        # the prefix over to a plain tool (`mcp__web_fetch`), drops it from an MCP tool (`server__tool`), or keeps it and drops the
+        # server (`mcp__tool`, the #5281 last segment with its prefix).  Spellings of a declared name, under the same
+        # unambiguous-alias rule; a server name that differs (`mcp__serevr__tool`) is not guessed.  STRATA_TOOL_ALIAS_MCP=0 turns it off.
+        if os.environ.get("STRATA_TOOL_ALIAS_MCP", "1") != "0":
+            for name in self.schemas:
+                if not isinstance(name, str) or not name or "." in name:
+                    continue
+                if name.startswith("mcp__"):
+                    rest = name[len("mcp__"):]
+                    if "__" in rest:
+                        aliases.setdefault(rest, set()).add(name)
+                        aliases.setdefault("mcp__" + rest.rsplit("__", 1)[1], set()).add(name)
+                elif "__" not in name:
+                    aliases.setdefault("mcp__" + name, set()).add(name)
         self.aliases = _Aliases({alias: next(iter(names)) for alias, names in aliases.items()
                                  if len(names) == 1 and alias not in self.schemas})
         # A declared tool written in another case (`Bash` for OpenCode's `bash`) is that tool, when exactly one declared name (or one
@@ -1843,7 +1904,10 @@ class OutputParser:
         or "</think>...".  The end of the thinking is followed by a line break.  None while the character after the
         tag has not arrived.
         Also quoted: the escaped form, a typed `\\n` right before the tag with a quote or backtick at most four
-        characters back, as in `\\n</think>\\n\\n`: the model writes about its own tag there."""
+        characters back, as in `\\n</think>\\n\\n`: the model writes about its own tag there.
+        Not quoted: a quote that closes a sentence, `."</think>The answer` (sentence punctuation right before the
+        quote), unless a quote or backtick follows the tag as well (a pair around it).  STRATA_THINK_CLOSE_QUOTE=0
+        turns that exception off."""
         context = self.buf[:i] if i >= 4 else self.line[-4:] + self.buf[:i]
         before = context[-1:]
         if before not in ('"', "'", "`") and not (context[-2:] == "\\n" and any(q in context[-4:] for q in "\"'`")):
@@ -1851,7 +1915,12 @@ class OutputParser:
         after = self.buf[i + len(THINK_END):]
         if not after:
             return None
-        return after[0] not in "\r\n"
+        if after[0] in "\r\n":
+            return False
+        if (before in _CLOSE_QUOTES and context[-2:-1] in _SENTENCE_END and after[0] not in _CLOSE_QUOTES
+                and os.environ.get("STRATA_THINK_CLOSE_QUOTE", "1") != "0"):
+            return False                     # the quote closes a sentence: the thinking ends here
+        return True
 
     def _stray_think_at(self) -> int:
         """#4077: where self.buf has a `</think>` at the start of a line, in the answer of a turn whose reasoning

@@ -391,6 +391,7 @@ class ReplicaEngine:
         produced: list[int] = []
         held = False
         nonfinite = False
+        gen = None
         try:
             selected = getattr(cancel, "_strata_replica_selected", None)
             if selected is not None:
@@ -414,6 +415,15 @@ class ReplicaEngine:
             nonfinite = True
             raise
         finally:
+            # close the engine generator BEFORE the lock goes: its own finally
+            # stops the engine and drains it to DONE. Left to GC, that runs
+            # after the next request already reads the stream (stale lines,
+            # 0-token "length" replies, foreign tokens).
+            if gen is not None:
+                try:
+                    gen.close()
+                except Exception:               # noqa: BLE001
+                    pass
             if held:
                 self.run_locks[k].release()
             with self.lock:

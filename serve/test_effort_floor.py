@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from serve.server import Service, effort_below_floor, resolve_effort_floor  # noqa: E402
+from serve.server import Service, client_thinking_off, effort_below_floor, resolve_effort_floor  # noqa: E402
 
 TOOLS = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
 MSG = [{"role": "user", "content": "hi"}]
@@ -51,6 +51,17 @@ class Resolve(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 resolve_effort_floor(bad, {})
 
+    def test_client_thinking_off(self):
+        self.assertTrue(client_thinking_off({"reasoning_effort": "none"}, "openai"))
+        self.assertTrue(client_thinking_off({"chat_template_kwargs": {"enable_thinking": False}}, "openai"))
+        self.assertTrue(client_thinking_off({"reasoning": {"effort": "none"}}, "responses"))
+        self.assertTrue(client_thinking_off({"thinking": {"type": "disabled"}}, "anthropic"))
+        self.assertFalse(client_thinking_off({}, "openai"))
+        self.assertFalse(client_thinking_off({"reasoning_effort": "low"}, "openai"))
+        self.assertFalse(client_thinking_off({"reasoning_effort": "low",
+                                              "chat_template_kwargs": {"enable_thinking": False}}, "openai"))
+        self.assertFalse(client_thinking_off({"thinking": {"type": "enabled"}}, "anthropic"))
+
     def test_order_of_levels(self):
         self.assertTrue(effort_below_floor("none", "low"))
         self.assertTrue(effort_below_floor("off", "low"))
@@ -62,16 +73,22 @@ class Resolve(unittest.TestCase):
 
 
 class Apply(unittest.TestCase):
-    def test_tools_none_raised(self):
-        r, log = run(fake(), {"messages": MSG, "tools": TOOLS, "reasoning_effort": "none"})
-        self.assertEqual(r["reasoning_effort"], "low")
-        self.assertEqual(log.count("effort floor"), 1)
+    def test_client_off_respected(self):
+        # #30: a client that turns thinking off itself keeps it off, tools or not
+        for req in ({"messages": MSG, "tools": TOOLS, "reasoning_effort": "none"},
+                    {"messages": MSG, "tools": TOOLS, "reasoning": {"effort": "none"}},
+                    {"messages": MSG, "tools": TOOLS, "reasoning": {"enabled": False}},
+                    {"messages": MSG, "tools": TOOLS, "chat_template_kwargs": {"enable_thinking": False}},
+                    {"messages": MSG, "tools": TOOLS, "chat_template_kwargs": {"reasoning_effort": "off"}}):
+            r, log = run(fake("medium"), req)
+            self.assertEqual(r.get("reasoning_effort"), req.get("reasoning_effort"), req)
+            self.assertEqual(r.get("chat_template_kwargs"), req.get("chat_template_kwargs"), req)
+            self.assertEqual(log, "", req)
 
-    def test_template_kwargs_off_raised(self):
-        r, _ = run(fake("medium"), {"messages": MSG, "tools": TOOLS,
-                                    "chat_template_kwargs": {"enable_thinking": False}})
+    def test_client_level_below_floor_raised(self):
+        r, log = run(fake("medium"), {"messages": MSG, "tools": TOOLS, "reasoning_effort": "low"})
         self.assertEqual(r["reasoning_effort"], "medium")
-        self.assertNotIn("enable_thinking", r["chat_template_kwargs"])
+        self.assertEqual(log.count("effort floor"), 1)
 
     def test_left_alone(self):
         svc = fake()
@@ -93,8 +110,11 @@ class Apply(unittest.TestCase):
     def test_anthropic(self):
         r, _ = run(fake(), {"messages": MSG, "tools": [{"name": "f", "input_schema": {}}],
                             "thinking": {"type": "disabled"}}, "anthropic")
-        self.assertNotIn("thinking", r)
-        self.assertEqual(r["output_config"], {"effort": "low"})
+        self.assertEqual(r["thinking"], {"type": "disabled"})                         # #30: client off kept
+        self.assertNotIn("output_config", r)
+        r, _ = run(fake("medium"), {"messages": MSG, "tools": [{"name": "f", "input_schema": {}}],
+                                    "output_config": {"effort": "low"}}, "anthropic")
+        self.assertEqual(r["output_config"], {"effort": "medium"})
         r, _ = run(fake(), {"messages": MSG, "thinking": {"type": "disabled"}}, "anthropic")
         self.assertEqual(r["thinking"], {"type": "disabled"})
 
@@ -102,7 +122,9 @@ class Apply(unittest.TestCase):
         long = [{"role": "user", "content": "x" * 40000}]                               # ~10K tokens
         r, _ = run(fake(ctx=0), {"messages": long, "reasoning_effort": "none"})
         self.assertEqual(r["reasoning_effort"], "none")
-        r, log = run(fake(ctx=5000), {"messages": long, "reasoning_effort": "none"})
+        r, _ = run(fake(ctx=5000), {"messages": long, "reasoning_effort": "none"})   # #30: client off kept
+        self.assertEqual(r["reasoning_effort"], "none")
+        r, log = run(fake(ctx=5000, effort="none"), {"messages": long})                # server default none raised
         self.assertEqual(r["reasoning_effort"], "low")
         self.assertIn("long prompt", log)
         r, _ = run(fake(ctx=50000), {"messages": long, "reasoning_effort": "none"})
