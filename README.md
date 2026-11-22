@@ -80,7 +80,7 @@ models need less ([docs/MODELS.md](docs/MODELS.md)).
 - 🎯 **Finishes real coding tasks.** A loop breaker notices an agent repeating a call or editing in circles, tells it the next step, and pauses the editing tools if it keeps going.
 - 🔧 **Reliable tool calls.** Tool names are checked against what the client declared, malformed calls are repaired, and a call that contradicts what the model just said it would do is picked again.
 - 🧠 **Thinks, then answers.** Medium reasoning with a 32K-token thinking budget by default, reminders at 60 % and 80 % of it so the model wraps up, and room reserved so a reply is never cut off before the answer.
-- ⚡ **Fast.** 115-168 tokens/s on one RTX 3080 20 GB and 155-216 with a second card, depending on the model file size ([Speed](#speed)). A follow-up turn in a long conversation is read from cache instead of from the start.
+- ⚡ **Fast.** 110-168 tokens/s on one RTX 3080 20 GB and 155-216 with a second card, depending on the model file size ([Speed](#speed)). A follow-up turn in a long conversation is read from cache instead of from the start.
 - 📚 **Long context.** 229K tokens as the model ships, and the same config grows to 1M.
 - 🔌 **Drop-in API.** OpenAI- and Anthropic-compatible. Images in chat are supported.
 
