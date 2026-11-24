@@ -3950,7 +3950,7 @@ MTP_TUNED = {"url": "https://github.com/DevDock-AI/Speedy/releases/download/v0.5
 # the repository's SHA256SUMS (the sums below are that file's).  It is tried first; the release asset above is the
 # fallback, the stock drafter the last one.  STRATA_MTP_HF=0 skips Hugging Face (the release asset is used).
 MTP_HF_REPO = "DevDock-AI/Qwen3.8-Flash-Next-Speedy-MTP"
-MTP_HF_REVISION = None   # TODO(after upload): the repository's 40-hex commit sha; None = not published, not tried
+MTP_HF_REVISION = "193618d85352548981709da69c18e22178ae42f5"   # pinned HF commit of DevDock-AI/Qwen3.8-Flash-Next-Speedy-MTP v1.0
 MTP_HF_FILES = {"dense.bin": (116099072, "d7a2c4a32148c2276ee18418941e157ee691d7032bf6e553f035d8bf5b9b01e0")}
 MTP_TUNED_SUFFIX = "-tuned"
 MTP_DRAFTERS = ("tuned", "stock")
