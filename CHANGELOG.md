@@ -1,5 +1,13 @@
 # Changelog
 
+## Speedy 0.5.5 (2026-11-24)
+- **New coding-tuned MTP drafter, downloaded from Hugging Face**: setup and updates now fetch the draft head's `dense.bin` from [DevDock-AI/Qwen3.8-Flash-Next-Speedy-MTP](https://huggingface.co/DevDock-AI/Qwen3.8-Flash-Next-Speedy-MTP), pinned to a fixed commit and checked by size and sha256. Measured against the stock draft head (same engine, back-to-back runs): about +10% decode on Signal AP-Q4_K_XL and +4% on UD-Q4_K_XL. Existing installs switch to it on their next update.
+- If Hugging Face cannot be reached or a file does not match, setup falls back to the previous drafter (GitHub release asset), then to the stock one; setup never fails because of it. The download goes to a temporary file and replaces the old one only after it checks out. `HF_ENDPOINT` mirrors work. `STRATA_MTP_HF=0` skips Hugging Face; `--mtp-drafter stock` / `STRATA_MTP_DRAFTER=stock` still keep the stock drafter.
+- **Fresh installs get the whole drafter from Hugging Face** (~700 MB: `dense.txt`, `experts.bin`, `draft_vocab.bin` and the tuned `dense.bin`, same pinned commit, each sha256-checked) instead of downloading ~5 GB of MTP tensors from the Qwen checkpoint and packing them. It lands in `mtp/rt-tuned`; a download resumes, and every `--draft-vocab` subset still works. If Hugging Face fails, a file does not match, `STRATA_MTP_HF=0` is set, or the stock drafter is chosen (`--mtp-drafter stock` / `STRATA_MTP_DRAFTER=stock`; the stock `dense.bin` is not on Hugging Face), setup uses the Qwen download as before.
+- **Signal-3.8-Flash-Next configs count as Qwen3.8-Flash-Next for the drafter**: a config whose model name or GGUF path contains `Signal-3.8-Flash-Next` gets its `--mtp` switched to the tuned drafter on update. Nothing else in such a config is changed.
+- README: Signal AP-Q4_K_XL speed rows (one RTX 3080 20 GB and 20 GB + 10 GB, with the Speedy drafter), clearer benchmark setups, quick start near the top.
+- serve/version.py -> 0.5.5.
+
 ## Speedy 0.5.4 (2026-11-22)
 - **A client's own "thinking off" is respected** (#30): `reasoning_effort: none`, `reasoning: {"effort": "none"}` / `{"enabled": false}`, `chat_template_kwargs: {"enable_thinking": false}` and Anthropic `thinking: disabled` are no longer raised to the reasoning effort floor on tool requests (seen with Open WebUI, which sends `enable_thinking: false` and still got thinking). The floor still covers requests that name no level (server default `none`) and explicit levels above off but below it.
 - **`reasoning: {"enabled": false}` is thinking off** (Chat Completions and Responses) when no level is given; an explicit level beside it wins. Before, the server rendered its default level for it.

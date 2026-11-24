@@ -125,6 +125,26 @@ class Upgrade052(unittest.TestCase):
             self.assertFalse((self.d / "strata-x.json.bak-0.5.2").exists())
         self.assertEqual(self.calls, 0)
 
+    def test_signal_config_switched_only_drafter(self):
+        cfg = self.old_cfg(model_name="signal-ap-q4_k_xl")
+        cfg["args"] += ["--native", "/m/signal/AP-Q4_K_XL/Signal-3.8-Flash-Next-AP-Q4_K_XL.gguf"]
+        p, ch = self.run_up(cfg)
+        out = json.loads(p.read_text())
+        self.assertEqual(out["args"][out["args"].index("--mtp") + 1], str(self.tuned))
+        self.assertEqual(len(ch), 1)                              # the drafter only: the rest stays as written
+        self.assertEqual(out["reasoning_budget_tokens"], 16384)
+        self.assertEqual(out["env"], {"STRATA_HC_Q8": "1"})
+        self.assertNotIn("--adapt-swaps", out["args"])
+        self.assertEqual(out["args"][out["args"].index("--prefill") + 1], "auto")
+
+    def test_non_flash_next_untouched(self):
+        cfg = self.old_cfg(model_name="some-other-model")
+        cfg["args"] += ["--native", "/m/other.gguf"]
+        p, ch = self.run_up(cfg)
+        self.assertEqual(ch, [])
+        self.assertEqual(json.loads(p.read_text())["args"][5], str(self.rt))
+        self.assertEqual(self.calls, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

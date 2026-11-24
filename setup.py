@@ -3946,8 +3946,75 @@ def speedy_profile(profile: str, family: str, model: str, hip: bool, multi: bool
 # The stock drafter: setup --mtp-drafter stock, or "mtp_drafter": "stock" (STRATA_MTP_DRAFTER=stock) in the config.
 MTP_TUNED = {"url": "https://github.com/DevDock-AI/Speedy/releases/download/v0.5.0/mtp-tuned-dense.bin",
              "size": 116099072, "sha256": "dfe18647e0c95d05302907be88f021590119645a1567fcd770c8d309df852d75"}
+# The tuned drafter's own Hugging Face repository (public, no token): dense.bin from a pinned commit, checked against
+# the repository's SHA256SUMS (the sums below are that file's).  It is tried first; the release asset above is the
+# fallback, the stock drafter the last one.  STRATA_MTP_HF=0 skips Hugging Face (the release asset is used).
+MTP_HF_REPO = "DevDock-AI/Qwen3.8-Flash-Next-Speedy-MTP"
+MTP_HF_REVISION = "193618d85352548981709da69c18e22178ae42f5"   # pinned HF commit of DevDock-AI/Qwen3.8-Flash-Next-Speedy-MTP v1.0
+MTP_HF_FILES = {"dense.bin": (116099072, "d7a2c4a32148c2276ee18418941e157ee691d7032bf6e553f035d8bf5b9b01e0"),
+                "dense.txt": (1880, "8773c81ebb0986e37fe94a8a9933e87be48b1fabc6889a0106bcdab179d1c2ac"),
+                "experts.bin": (707788800, "09398406be61f1f54c93861f449e48b8df0bfccbc9ec9b2b7636775a6ea9244f"),
+                "draft_vocab.bin": (162100, "369151522226a5edaa5f12cfd1e2ae7db8f4fbdbd222f3dcf327dced9597fb25")}
 MTP_TUNED_SUFFIX = "-tuned"
 MTP_DRAFTERS = ("tuned", "stock")
+
+
+def mtp_hf_on() -> bool:
+    """Hugging Face is tried for the drafter: a pinned revision, and STRATA_MTP_HF not switched off."""
+    return bool(MTP_HF_REVISION) and os.environ.get("STRATA_MTP_HF", "1").strip().lower() not in ("0", "off", "no", "false")
+
+
+def mtp_dense_sources(url: str | None = None) -> list:
+    """(url, size, sha256) of the tuned dense.bin, best first: an explicit url, else Hugging Face at its pinned
+    revision (when published and not switched off), then the release asset."""
+    if url:
+        return [(url, MTP_TUNED["size"], MTP_TUNED["sha256"])]
+    out = []
+    if mtp_hf_on():
+        size, sha = MTP_HF_FILES["dense.bin"]
+        out.append((f"{hf_endpoint()}/{MTP_HF_REPO}/resolve/{MTP_HF_REVISION}/dense.bin", size, sha))
+    return out + [(MTP_TUNED["url"], MTP_TUNED["size"], MTP_TUNED["sha256"])]
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 22), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def fetch_tuned_dense(dense: Path, url: str | None = None) -> None:
+    """dense.bin of the tuned drafter: kept when it is already the best source's file, else downloaded from each source
+    in turn (resumable, SHA-256 checked; a wrong file is deleted).  When every download fails, a file that is one of
+    the known ones is kept.  Raises when there is none."""
+    sources = mtp_dense_sources(url)
+    have = _sha256(dense) if dense.exists() else None
+    if have == sources[0][2]:
+        return                                        # cache hit: no network
+    errors = []
+    for src, size, sha in sources:
+        if have == sha:
+            return                                    # a later source's file is already here: nothing to fetch
+        tmp = dense.with_name(dense.name + ".new")    # the old file stays until the new one is checked
+        for p in (tmp, tmp.with_name(tmp.name + ".done")):   # a .part stays: the download resumes it
+            p.unlink(missing_ok=True)
+        try:
+            download(src, tmp, f"the tuned MTP drafter ({size // 1000000} MB)")
+            if tmp.stat().st_size != size or _sha256(tmp) != sha:
+                raise ValueError("its SHA-256 does not match")
+            os.replace(tmp, dense)
+            return
+        except (SystemExit, Exception) as e:      # noqa: BLE001 - try the next source
+            tmp.with_name(tmp.name + ".part").unlink(missing_ok=True)
+            errors.append(f"{src.split('/')[2]}: {e}")
+        finally:
+            for p in (tmp, tmp.with_name(tmp.name + ".done")):
+                p.unlink(missing_ok=True)
+    if have is not None and have in {s[2] for s in sources}:
+        return
+    dense.unlink(missing_ok=True)
+    raise ValueError("; ".join(errors) or "no source")
 
 
 def tuned_mtp_dir(rt: Path, url: str | None = None) -> Path | None:
@@ -3957,16 +4024,7 @@ def tuned_mtp_dir(rt: Path, url: str | None = None) -> Path | None:
     out = rt.parent / (rt.name + MTP_TUNED_SUFFIX)
     try:
         out.mkdir(parents=True, exist_ok=True)
-        dense = out / "dense.bin"
-        if not (dense.exists() and dense.stat().st_size == MTP_TUNED["size"]):
-            download(url or MTP_TUNED["url"], dense, "the tuned MTP drafter (116 MB)")
-        h = hashlib.sha256()
-        with open(dense, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 22), b""):
-                h.update(chunk)
-        if h.hexdigest() != MTP_TUNED["sha256"]:
-            dense.unlink(missing_ok=True)
-            raise ValueError("the tuned MTP drafter's SHA-256 does not match")
+        fetch_tuned_dense(out / "dense.bin", url)
         for name in ("dense.txt", "experts.bin"):     # draft_vocab.bin: copied by the caller (it is refreshed)
             src, dst = rt / name, out / name
             if src.exists() and not dst.exists():
@@ -3981,6 +4039,75 @@ def tuned_mtp_dir(rt: Path, url: str | None = None) -> Path | None:
     except (SystemExit, Exception) as e:          # noqa: BLE001 - the stock drafter always works
         warn(f"the tuned MTP drafter could not be set up ({e}); the stock drafter is used")
         return None
+
+
+def hf_mtp_runtime(rt: Path) -> Path | None:
+    """Speedy 0.5.5: the whole tuned drafter (dense.bin, dense.txt, experts.bin, draft_vocab.bin, ~700 MB) from its
+    Hugging Face repository at the pinned revision, into <rt>-tuned, in place of the ~5 GB Qwen MTP download + pack.
+    Each file: kept when its size and SHA-256 already match, else downloaded to <name>.new (resumable via .new.part),
+    checked, and renamed over.  The stock directory <rt> is not made (the stock dense.bin is not on Hugging Face): a
+    later --mtp-drafter stock builds it the old way.  None when Hugging Face is off or any file cannot be had: the
+    caller takes the old path (setup never fails because of it)."""
+    if not mtp_hf_on():
+        return None
+    out = rt.parent / (rt.name + MTP_TUNED_SUFFIX)
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        for name in ("dense.txt", "experts.bin", "draft_vocab.bin", "dense.bin"):
+            size, sha = MTP_HF_FILES[name]
+            dst = out / name
+            if dst.exists() and dst.stat().st_size == size and _sha256(dst) == sha:
+                continue
+            if name == "draft_vocab.bin" and dst.exists():
+                continue                              # a subset refresh_draft_vocab put there: kept
+            tmp = dst.with_name(name + ".new")
+            for p in (tmp, tmp.with_name(tmp.name + ".done")):   # a .part stays: the download resumes it
+                p.unlink(missing_ok=True)
+            try:
+                download(f"{hf_endpoint()}/{MTP_HF_REPO}/resolve/{MTP_HF_REVISION}/{name}", tmp,
+                         f"the MTP drafter's {name} ({max(1, size // 1000000)} MB)")
+                if tmp.stat().st_size != size or _sha256(tmp) != sha:
+                    tmp.with_name(tmp.name + ".part").unlink(missing_ok=True)
+                    raise ValueError(f"{name}: its SHA-256 does not match")
+                os.replace(tmp, dst)
+            finally:
+                for p in (tmp, tmp.with_name(tmp.name + ".done")):
+                    p.unlink(missing_ok=True)
+        lic = ROOT / "licenses" / "Qwen-Community-License-1.0.txt"
+        if lic.exists():
+            shutil.copy2(lic, out / "LICENSE-Qwen-Community-License-1.0.txt")
+        return out
+    except (SystemExit, Exception) as e:          # noqa: BLE001 - the Qwen download is the fallback
+        warn(f"the MTP drafter could not be downloaded from Hugging Face ({e}); it is built from the Qwen checkpoint")
+        return None
+
+
+def fetch_mtp_layer(mtp: Path, rt: Path, env: dict, a, corrupt: bool) -> Path | None:
+    """Step 6's MTP draft layer when it is missing (or corrupt, #327).  0.5.5: with no stock draft layer yet and the
+    tuned drafter wanted, the whole drafter comes from Hugging Face (~700 MB, hf_mtp_runtime) and its directory is
+    returned.  Otherwise - Hugging Face off or failing, the stock drafter chosen, a corrupt stock layer - the ~5 GB of
+    MTP tensors from the Qwen checkpoint, packed into <rt> as before (None)."""
+    want_stock = getattr(a, "mtp_drafter", "tuned") == "stock" or \
+        os.environ.get("STRATA_MTP_DRAFTER", "").strip().lower() == "stock"
+    if a.mtp == "off" and not (rt / "experts.bin").exists():
+        rtt = rt.parent / (rt.name + MTP_TUNED_SUFFIX)
+        if not want_stock and all((rtt / n).exists() for n in ("dense.bin", "dense.txt", "experts.bin")):
+            return rtt                                 # an earlier Hugging Face download: there, so used
+        ok("the draft layer (MTP) is off: its ~5 GB are not downloaded (`--mtp on` fetches it later)")   # round 8, N3
+        return None
+    if not corrupt and not (rt / "experts.bin").exists() and not want_stock and \
+            (hf_rt := hf_mtp_runtime(rt)) is not None:
+        ok(f"MTP draft layer downloaded from Hugging Face ({MTP_HF_REPO})")
+        return hf_rt
+    if corrupt or not (rt / "experts.bin").exists():
+        say("  The MTP draft layer (speculative decoding, ~2x faster output) comes from the original Qwen checkpoint:")
+        say("  only its ~5 GB of MTP tensors are downloaded.")
+        fetch_mtp(mtp, env)
+        run([sys.executable, str(ROOT / "tools" / "mtp_pack.py"), "--src", str(mtp), "--experts", "q2_0",
+             "--out", str(mtp / "mtp-q2_0.gguf")], env=env)
+        run([sys.executable, str(ROOT / "tools" / "mtp_rt.py"), "--gguf", str(mtp / "mtp-q2_0.gguf"), "--out", str(rt)],
+            env=env)
+    return None
 
 
 def menu_families(hip: bool) -> list:
@@ -7041,15 +7168,32 @@ def _env_says_stock(cfg: dict) -> bool:
     return str(cfg.get("mtp_drafter", "")).lower() == "stock" or str(env.get("STRATA_MTP_DRAFTER", "")).lower() == "stock"
 
 
-def flash_next_config(cfg: dict) -> bool:
-    """A config of a Qwen3.8-Flash-Next family (FAMILIES): the ones fresh setup gives the tuned drafter and profile.
-    Not Qwen3.6 (own path), DeepSeek-V4.1-Flash (its own MTP) or the Mac build."""
+SIGNAL_NAME = "signal-3.8-flash-next"   # agentionai/Signal-3.8-Flash-Next-GGUF: a Qwen3.8-Flash-Next fine-tune
+
+
+def family_config(cfg: dict) -> bool:
+    """A config setup wrote for a Qwen3.8-Flash-Next family (FAMILIES).  Not Qwen3.6 (own path), DeepSeek-V4.1-Flash
+    (its own MTP) or the Mac build."""
     if own_path_config(cfg) or cfg.get("backend") == "metal":
         return False
     name = str(cfg.get("model_name") or "")
     if any(name.startswith(d["name"]) for d in MULTI_FILE_FAMILIES.values()):
         return False
     return any(name.startswith(d["name"]) for d in FAMILIES.values())
+
+
+def signal_config(cfg: dict) -> bool:
+    """A hand-made config of Signal-3.8-Flash-Next (its model name or a file it names): same architecture and draft
+    head as Qwen3.8-Flash-Next, so it takes the tuned drafter too."""
+    if own_path_config(cfg) or cfg.get("backend") == "metal":
+        return False
+    args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
+    return any(SIGNAL_NAME in str(v).lower() for v in [cfg.get("model_name") or "", *args])
+
+
+def flash_next_config(cfg: dict) -> bool:
+    """A Qwen3.8-Flash-Next config: a setup family's, or a Signal-3.8-Flash-Next one (the tuned drafter only)."""
+    return family_config(cfg) or signal_config(cfg)
 
 
 def upgrade_to_052(cfg_path: Path, cfg: dict, a=None, tuned_cache: dict | None = None, gpu: dict | None = None) -> list:
@@ -7080,8 +7224,9 @@ def upgrade_to_052(cfg_path: Path, cfg: dict, a=None, tuned_cache: dict | None =
                 args[i] = str(rtt)
                 changes.append("MTP drafter: the tuned one (revert: \"mtp_drafter\": \"stock\" in the config, "
                                "or setup --mtp-drafter stock)")
-    # 2. the thinking budget and level our old presets wrote
-    b = cfg.get("reasoning_budget_tokens")
+    # 2. the thinking budget and level our old presets wrote (a Signal config made by hand: only the drafter above)
+    full = family_config(cfg)
+    b = cfg.get("reasoning_budget_tokens") if full else None
     if isinstance(b, int) and not isinstance(b, bool) and b in OLD_SETUP_BUDGETS:
         if b == 4096 and cfg.get("reasoning_effort") == "low":     # the old Q2_0 "low" preset's pair
             cfg.pop("reasoning_effort")
@@ -7092,7 +7237,7 @@ def upgrade_to_052(cfg_path: Path, cfg: dict, a=None, tuned_cache: dict | None =
                        f"(revert: \"reasoning_budget_tokens\": {b})")
     # 3. the Speedy profile (tool-call env everywhere; the 1-GPU speed profile on one NVIDIA card with a UD-* file)
     profile = cfg.get("speedy_profile") or ("upstream" if getattr(a, "speedy_profile", "tuned") == "upstream" else None)
-    if profile != "upstream":
+    if profile != "upstream" and full:
         name = str(cfg.get("model_name") or "")
         unsloth = FAMILIES["unsloth"]["name"] + "-"
         model = name[len(unsloth):].upper() if name.startswith(unsloth) else ""
@@ -9979,7 +10124,8 @@ def main() -> int:
     # conversion, or the low-RAM mode's copy) and an existing MTP draft layer need no new room
     pack_now = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
     pack_bin = ready or ((pack_now / "experts.bin").exists() and (pack_now / "index.txt").exists())   # ready: in the download
-    mtp_have = find_in(roots, "mtp/rt/experts.bin") is not None
+    mtp_have = find_in(roots, "mtp/rt/experts.bin") is not None or \
+        find_in(roots, "mtp/rt" + MTP_TUNED_SUFFIX + "/experts.bin") is not None
     q2_avx = model == "Q2_0" and avx512 and family == "qwen"
     prep_gb = MODELS[model].get("prepare_gb", 0.0) if ready and MODELS[model].get("prepare") and \
         not prepared_done(model, models_dir) else 0.0
@@ -10118,22 +10264,14 @@ def main() -> int:
              "--experts-bin", *fam.get("pack_args", [])], env=env)       # #3193: Gyro needs --compat-bf16 here too
     ok(f"model prepared: {pack}")
     mtp = ready_paths(model, models_dir)["mtp"] if prepared else \
-        (find_in(roots, "mtp/rt/experts.bin") or data / "mtp/rt/experts.bin").parent.parent
+        (find_in(roots, "mtp/rt/experts.bin") or find_in(roots, "mtp/rt" + MTP_TUNED_SUFFIX + "/experts.bin")
+         or data / "mtp/rt/experts.bin").parent.parent
     rt = mtp / "rt"
     corrupt = (rt / "experts.bin").exists() and not prepared and mtp_corrupt(mtp, env)
     if corrupt:
         warn("some MTP tensors are not the checkpoint's (a download mirror that ignored range requests, #327): "
              "fetching them again and rebuilding the draft layer")
-    if a.mtp == "off" and not (rt / "experts.bin").exists():
-        ok("the draft layer (MTP) is off: its ~5 GB are not downloaded (`--mtp on` fetches it later)")   # round 8, N3
-    elif corrupt or not (rt / "experts.bin").exists():
-        say("  The MTP draft layer (speculative decoding, ~2x faster output) comes from the original Qwen checkpoint:")
-        say("  only its ~5 GB of MTP tensors are downloaded.")
-        fetch_mtp(mtp, env)
-        run([sys.executable, str(ROOT / "tools" / "mtp_pack.py"), "--src", str(mtp), "--experts", "q2_0",
-             "--out", str(mtp / "mtp-q2_0.gguf")], env=env)
-        run([sys.executable, str(ROOT / "tools" / "mtp_rt.py"), "--gguf", str(mtp / "mtp-q2_0.gguf"), "--out", str(rt)],
-            env=env)
+    hf_rt = fetch_mtp_layer(mtp, rt, env, a, corrupt)
     # a setup run again without --draft-vocab keeps the subset this model's config chose before (cyrillic, fr, en)
     draft_vocab = a.draft_vocab or saved_draft_vocab(home() / f"strata-{tag.lower()}.json")
     if (rt / "experts.bin").exists():
@@ -10146,6 +10284,10 @@ def main() -> int:
             ok(f"MTP draft layer: {rt} (tuned drafter, Qwen Community License 1.0; --mtp-drafter stock for the stock one)")
         else:
             ok(f"MTP draft layer: {rt}")
+    elif hf_rt is not None:                            # the shipped subsets are all in data/: any --draft-vocab works
+        refresh_draft_vocab(hf_rt, draft_vocab or "cjk")
+        rt = hf_rt
+        ok(f"MTP draft layer: {rt} (tuned drafter, Qwen Community License 1.0; --mtp-drafter stock for the stock one)")
     for line in draft_vocab_note(gpu.get("vram_gb", 0.0), draft_vocab):   # #474: a recommendation, nothing changes
         say("  " + line)
 

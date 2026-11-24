@@ -188,7 +188,7 @@ class Base(unittest.TestCase):
                  for i in range(n_gpus)]
 
         def fake_download(url, dst, what=None):
-            if url == setup.MTP_TUNED["url"]:          # Speedy 0.5.0: the tuned drafter (an empty fake: stock is kept)
+            if url == setup.MTP_TUNED["url"] or setup.MTP_HF_REPO in url:          # Speedy 0.5.0: the tuned drafter (release asset or HF repo; an empty fake: stock is kept)
                 self.mtp_downloads.append(url)
             else:
                 self.downloads.append(url)
