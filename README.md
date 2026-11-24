@@ -170,7 +170,7 @@ tests: coding suite 24 of 24, recall 48 of 48, tool calls 24 of 24. Licence: Qwe
 ```
 
 Then, in a copy of your UD-Q4_K_XL config, point `--native` at the Signal GGUF and `--pack` at `packs/signal-xl`; keep
-everything else, including `--mtp`, which already points at the Speedy drafter (`mtp/rt-tuned`). The GGUF is about 101 GB and the experts are read from it, so keep it on a fast SSD.
+everything else, including `--mtp`, which already points at the Speedy drafter (`mtp/rt-tuned`; an update also switches a Signal config's `--mtp` to it). The GGUF is about 101 GB and the experts are read from it, so keep it on a fast SSD.
 
 Test machine: Linux, Threadripper PRO 5975WX, 144 GB RAM, cards limited to 240 W (20 GB) and 280 W (10 GB), with the
 optional [gpu-unlock](docs/GPU-UNLOCK.md) module; without it expect lower prefill and the same decode. Other GPUs, the

@@ -115,5 +115,116 @@ class MtpHf(unittest.TestCase):
         self.assertFalse(setup.flash_next_config({"model_name": "qwen3.6-35b-a3b", "arch": "qwen35moe"}))
 
 
+class MtpHfFull(unittest.TestCase):
+    """0.5.5: the whole drafter from Hugging Face on a fresh install, the Qwen download + pack as the fallback."""
+    FILES = {"dense.txt": b"index", "experts.bin": b"experts" * 9, "draft_vocab.bin": b"vocab", "dense.bin": b"tuned"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.mtp = Path(self.tmp.name) / "mtp"
+        self.rt = self.mtp / "rt"
+        self.urls, self.ran, self.fetched = [], [], []
+        self.serve = dict(self.FILES)
+        self.patches = [mock.patch.object(setup, "MTP_HF_REVISION", REV),
+                        mock.patch.dict(setup.MTP_HF_FILES, {n: pin(b) for n, b in self.FILES.items()}),
+                        mock.patch.object(setup, "download", self.fake_download),
+                        mock.patch.object(setup, "fetch_mtp", lambda mtp, env: self.fetched.append(mtp)),
+                        mock.patch.object(setup, "run", lambda cmd, **k: self.ran.append(Path(str(cmd[1])).name)),
+                        mock.patch.object(setup, "warn", lambda *a, **k: None),
+                        mock.patch.object(setup, "ok", lambda *a, **k: None),
+                        mock.patch.object(setup, "say", lambda *a, **k: None),
+                        mock.patch.dict(os.environ, {"STRATA_MTP_HF": "", "HF_ENDPOINT": "", "STRATA_MTP_DRAFTER": ""})]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    def fake_download(self, url, dst, what=None):
+        self.urls.append(url)
+        body = self.serve.get(url.rsplit("/", 1)[1])
+        if body is None:
+            raise SystemExit("cannot reach huggingface.co")
+        dst.write_bytes(body)
+
+    def layer(self, drafter="tuned", corrupt=False, mtp="on"):
+        a = mock.Mock(mtp=mtp, mtp_drafter=drafter)
+        return setup.fetch_mtp_layer(self.mtp, self.rt, {}, a, corrupt)
+
+    def old_path_used(self):
+        self.assertEqual(self.fetched, [self.mtp])
+        self.assertEqual(self.ran, ["mtp_pack.py", "mtp_rt.py"])
+
+    def test_fresh_install_hf_full_skips_mtp_fetch(self):
+        out = self.layer()
+        self.assertEqual(out, self.mtp / "rt-tuned")
+        for n, b in self.FILES.items():
+            self.assertEqual((out / n).read_bytes(), b)
+        self.assertEqual((self.fetched, self.ran), ([], []))
+        self.assertTrue(all(f"/{setup.MTP_HF_REPO}/resolve/{REV}/" in u for u in self.urls))
+        self.assertFalse(any(p.name.endswith((".new", ".part")) for p in out.iterdir()))
+        self.urls.clear()
+        self.assertEqual(self.layer(), out)                # cached: no network the second time
+        self.assertEqual(self.urls, [])
+        self.assertEqual(self.layer(mtp="off"), out)       # --mtp off keeps a drafter that is already there
+
+    def test_hf_mirror(self):
+        with mock.patch.dict(os.environ, {"HF_ENDPOINT": "https://hf-mirror.com"}):
+            self.layer()
+        self.assertTrue(all(u.startswith("https://hf-mirror.com/") for u in self.urls))
+
+    def test_hf_failure_old_path(self):
+        self.serve.pop("experts.bin")
+        self.assertIsNone(self.layer())
+        self.old_path_used()
+
+    def test_sha_mismatch_old_path(self):
+        self.serve["experts.bin"] = b"tampered"
+        self.assertIsNone(self.layer())
+        self.old_path_used()
+        self.assertFalse((self.mtp / "rt-tuned" / "experts.bin").exists())
+        self.assertFalse((self.mtp / "rt-tuned" / "experts.bin.new.part").exists())
+
+    def test_stock_choice_old_path(self):
+        self.assertIsNone(self.layer("stock"))
+        self.old_path_used()
+        self.assertEqual(self.urls, [])
+
+    def test_stock_env_old_path(self):
+        with mock.patch.dict(os.environ, {"STRATA_MTP_DRAFTER": "stock"}):
+            self.assertIsNone(self.layer())
+        self.old_path_used()
+
+    def test_hf_off_old_path(self):
+        with mock.patch.dict(os.environ, {"STRATA_MTP_HF": "0"}):
+            self.assertIsNone(self.layer())
+        self.old_path_used()
+        self.assertEqual(self.urls, [])
+
+    def test_existing_stock_layer_untouched(self):
+        self.rt.mkdir(parents=True)
+        (self.rt / "experts.bin").write_bytes(b"stock")
+        self.assertIsNone(self.layer())
+        self.assertEqual((self.urls, self.fetched, self.ran), ([], [], []))
+
+    def test_any_draft_vocab_from_hf_files(self):
+        out = self.layer()
+        (out / "draft_vocab.bin").write_bytes((ROOT / "data" / "draft_vocab_en.bin").read_bytes())
+        setup.refresh_draft_vocab(out, "cyrillic")
+        self.assertEqual((out / "draft_vocab.bin").read_bytes(),
+                         (ROOT / "data" / "draft_vocab_cyrillic.bin").read_bytes())
+
+
+class SignalConfig(unittest.TestCase):
+    def test_signal_detected(self):
+        cfg = {"model_name": "signal-xl", "args": ["--native", "/m/Signal-3.8-Flash-Next-AP-Q4_K_XL.gguf"]}
+        self.assertTrue(setup.flash_next_config(cfg))
+        self.assertTrue(setup.flash_next_config({"model_name": "Signal-3.8-Flash-Next-AP-Q4_K_XL"}))
+        self.assertFalse(setup.flash_next_config({"model_name": "other", "args": ["--native", "/m/x.gguf"]}))
+        self.assertFalse(setup.flash_next_config({"model_name": "signal-3.8-flash-next", "backend": "metal"}))
+
+
 if __name__ == "__main__":
     unittest.main()
