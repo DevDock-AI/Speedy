@@ -3946,8 +3946,67 @@ def speedy_profile(profile: str, family: str, model: str, hip: bool, multi: bool
 # The stock drafter: setup --mtp-drafter stock, or "mtp_drafter": "stock" (STRATA_MTP_DRAFTER=stock) in the config.
 MTP_TUNED = {"url": "https://github.com/DevDock-AI/Speedy/releases/download/v0.5.0/mtp-tuned-dense.bin",
              "size": 116099072, "sha256": "dfe18647e0c95d05302907be88f021590119645a1567fcd770c8d309df852d75"}
+# The tuned drafter's own Hugging Face repository (public, no token): dense.bin from a pinned commit, checked against
+# the repository's SHA256SUMS (the sums below are that file's).  It is tried first; the release asset above is the
+# fallback, the stock drafter the last one.  STRATA_MTP_HF=0 skips Hugging Face (the release asset is used).
+MTP_HF_REPO = "DevDock-AI/Qwen3.8-Flash-Next-Speedy-MTP"
+MTP_HF_REVISION = None   # TODO(after upload): the repository's 40-hex commit sha; None = not published, not tried
+MTP_HF_FILES = {"dense.bin": (116099072, "d7a2c4a32148c2276ee18418941e157ee691d7032bf6e553f035d8bf5b9b01e0")}
 MTP_TUNED_SUFFIX = "-tuned"
 MTP_DRAFTERS = ("tuned", "stock")
+
+
+def mtp_dense_sources(url: str | None = None) -> list:
+    """(url, size, sha256) of the tuned dense.bin, best first: an explicit url, else Hugging Face at its pinned
+    revision (when published and not switched off), then the release asset."""
+    if url:
+        return [(url, MTP_TUNED["size"], MTP_TUNED["sha256"])]
+    out = []
+    if MTP_HF_REVISION and os.environ.get("STRATA_MTP_HF", "1").strip().lower() not in ("0", "off", "no", "false"):
+        size, sha = MTP_HF_FILES["dense.bin"]
+        out.append((f"{hf_endpoint()}/{MTP_HF_REPO}/resolve/{MTP_HF_REVISION}/dense.bin", size, sha))
+    return out + [(MTP_TUNED["url"], MTP_TUNED["size"], MTP_TUNED["sha256"])]
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 22), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def fetch_tuned_dense(dense: Path, url: str | None = None) -> None:
+    """dense.bin of the tuned drafter: kept when it is already the best source's file, else downloaded from each source
+    in turn (resumable, SHA-256 checked; a wrong file is deleted).  When every download fails, a file that is one of
+    the known ones is kept.  Raises when there is none."""
+    sources = mtp_dense_sources(url)
+    have = _sha256(dense) if dense.exists() else None
+    if have == sources[0][2]:
+        return                                        # cache hit: no network
+    errors = []
+    for src, size, sha in sources:
+        if have == sha:
+            return                                    # a later source's file is already here: nothing to fetch
+        tmp = dense.with_name(dense.name + ".new")    # the old file stays until the new one is checked
+        for p in (tmp, tmp.with_name(tmp.name + ".done")):   # a .part stays: the download resumes it
+            p.unlink(missing_ok=True)
+        try:
+            download(src, tmp, f"the tuned MTP drafter ({size // 1000000} MB)")
+            if tmp.stat().st_size != size or _sha256(tmp) != sha:
+                raise ValueError("its SHA-256 does not match")
+            os.replace(tmp, dense)
+            return
+        except (SystemExit, Exception) as e:      # noqa: BLE001 - try the next source
+            tmp.with_name(tmp.name + ".part").unlink(missing_ok=True)
+            errors.append(f"{src.split('/')[2]}: {e}")
+        finally:
+            for p in (tmp, tmp.with_name(tmp.name + ".done")):
+                p.unlink(missing_ok=True)
+    if have is not None and have in {s[2] for s in sources}:
+        return
+    dense.unlink(missing_ok=True)
+    raise ValueError("; ".join(errors) or "no source")
 
 
 def tuned_mtp_dir(rt: Path, url: str | None = None) -> Path | None:
@@ -3957,16 +4016,7 @@ def tuned_mtp_dir(rt: Path, url: str | None = None) -> Path | None:
     out = rt.parent / (rt.name + MTP_TUNED_SUFFIX)
     try:
         out.mkdir(parents=True, exist_ok=True)
-        dense = out / "dense.bin"
-        if not (dense.exists() and dense.stat().st_size == MTP_TUNED["size"]):
-            download(url or MTP_TUNED["url"], dense, "the tuned MTP drafter (116 MB)")
-        h = hashlib.sha256()
-        with open(dense, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 22), b""):
-                h.update(chunk)
-        if h.hexdigest() != MTP_TUNED["sha256"]:
-            dense.unlink(missing_ok=True)
-            raise ValueError("the tuned MTP drafter's SHA-256 does not match")
+        fetch_tuned_dense(out / "dense.bin", url)
         for name in ("dense.txt", "experts.bin"):     # draft_vocab.bin: copied by the caller (it is refreshed)
             src, dst = rt / name, out / name
             if src.exists() and not dst.exists():
