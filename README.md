@@ -137,9 +137,9 @@ about that many tokens. Rows are model file sizes, from smallest to largest; lar
 | **UD-IQ3_XXS** | **139** | **151** | **142** | **134** | 968 | 603 | 2,725 | 2,489 |
 | **UD-IQ4_XS** <sub>good balance</sub> | **142** | **142** | **129** | **125** | 929 | 474 | 2,725 | 2,477 |
 | **UD-Q4_K_XL** <sub>best quality</sub> | **122** | **121** | **122** | **115** | 729 | 346 | 2,409 | 2,200 |
-| **Signal AP-Q4_K_XL** <sub>faster drop-in, see below</sub> | **TBD-signal** | **TBD-signal** | **TBD-signal** | **TBD-signal** | TBD-signal | TBD-signal | TBD-signal | TBD-signal |
+| **Signal AP-Q4_K_XL** <sub>faster drop-in, see below</sub> | **136** | **148** | **138** | **127** | 860 | 440 | 2,414 | 2,216 |
 
-<sub>Speedy 0.4.8 engine, mean of 2 runs. \* one run; the other measured 28 tokens/s (a measurement fault) and is left out. Configs: [`configs/cards/rtx3080-20gb/1x/`](configs/cards/rtx3080-20gb/1x/).</sub>
+<sub>Speedy 0.4.8 engine, mean of 2 runs. \* one run; the other measured 28 tokens/s (a measurement fault) and is left out. Configs: [`configs/cards/rtx3080-20gb/1x/`](configs/cards/rtx3080-20gb/1x/). Signal row: Speedy 0.5.4 with the Speedy MTP drafter, measured back to back with UD-Q4_K_XL on the stock drafter, which gave 114 / 112 / 113 / 114 decode in that run.</sub>
 
 **RTX 3080 20 GB + RTX 3080 10 GB** (the model's layers are split across the two cards)
 
@@ -150,14 +150,16 @@ about that many tokens. Rows are model file sizes, from smallest to largest; lar
 | **UD-IQ3_XXS** | **197** | **210** | **204** | **180** | 1,590 | 1,710 | 3,679 | 3,957 |
 | **UD-IQ4_XS** <sub>good balance</sub> | **184** | **211** | **180** | **176** | 1,536 | 1,629 | 3,607 | 3,728 |
 | **UD-Q4_K_XL** <sub>best quality</sub> | **168** | **170** | **161** | **155** | 1,226 | 1,300 | 2,950 | 3,150 |
-| **Signal AP-Q4_K_XL** <sub>faster drop-in, see below</sub> | **TBD-signal** | **TBD-signal** | **TBD-signal** | **TBD-signal** | TBD-signal | TBD-signal | TBD-signal | TBD-signal |
+| **Signal AP-Q4_K_XL** <sub>faster drop-in, see below</sub> | **187** | **218** | **176** | **145** | 804 | 452 | 3,134 | 3,006 |
 
-<sub>Speedy 0.4.6 engine, a short screen of 1-2 runs per cell, so single cells can be off by a few percent. Configs: [`configs/cards/rtx3080-20gb/2x/`](configs/cards/rtx3080-20gb/2x/).</sub>
+<sub>Speedy 0.4.6 engine, a short screen of 1-2 runs per cell, so single cells can be off by a few percent. Configs: [`configs/cards/rtx3080-20gb/2x/`](configs/cards/rtx3080-20gb/2x/). Signal row: Speedy 0.5.4 with the Speedy MTP drafter, measured back to back with UD-Q4_K_XL on the stock drafter, which gave 154 / 174 / 162 / 138 decode in that run.</sub>
 
 **Signal (faster drop-in).** [Signal-3.8-Flash-Next](https://huggingface.co/agentionai/Signal-3.8-Flash-Next-GGUF) by
 agentionai is a light fine-tune of Qwen3.8-Flash-Next: same 125B size, same architecture, vision encoder and draft head,
 and the same quality tier as UD-Q4_K_XL. It is trained to write more directly, with shorter reasoning, so the draft
-head's guesses are accepted more often. The draft head itself is unchanged. On the 20 GB + 10 GB pair (Speedy 0.5.4,
+head's guesses are accepted more often. Speedy pairs it with its own coding-tuned draft head,
+[Qwen3.8-Flash-Next-Speedy-MTP](https://huggingface.co/DevDock-AI/Qwen3.8-Flash-Next-Speedy-MTP), which `setup.sh` downloads with every Qwen3.8-Flash-Next install
+(about 10% more decode speed than the stock draft head on Signal). With the stock draft head on both, on the 20 GB + 10 GB pair (Speedy 0.5.4,
 1M config, back-to-back runs) it decoded about 15% faster than UD-Q4_K_XL (prefill +1-2%) and scored the same on our
 tests: coding suite 24 of 24, recall 48 of 48, tool calls 24 of 24. Licence: Qwen Community License (the model's own).
 `setup.sh` does not download it yet; to try it by hand:
@@ -168,7 +170,7 @@ tests: coding suite 24 of 24, recall 48 of 48, tool calls 24 of 24. Licence: Qwe
 ```
 
 Then, in a copy of your UD-Q4_K_XL config, point `--native` at the Signal GGUF and `--pack` at `packs/signal-xl`; keep
-everything else. The GGUF is about 101 GB and the experts are read from it, so keep it on a fast SSD.
+everything else, including `--mtp`, which already points at the Speedy drafter (`mtp/rt-tuned`). The GGUF is about 101 GB and the experts are read from it, so keep it on a fast SSD.
 
 Test machine: Linux, Threadripper PRO 5975WX, 144 GB RAM, cards limited to 240 W (20 GB) and 280 W (10 GB), with the
 optional [gpu-unlock](docs/GPU-UNLOCK.md) module; without it expect lower prefill and the same decode. Other GPUs, the
